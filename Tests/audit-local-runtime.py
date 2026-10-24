@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOURCES = ("LocalRuntime", "LocalPOSIX", "LocalMach", "SimSyscallHelpers", "MainThreadBootstrap", "SharedCacheHandoff")
+SOURCES = ("LocalRuntime", "LocalPOSIX", "LocalMach", "SimSyscallHelpers", "MainThreadBootstrap", "CompactImageInfo", "DebuggerBridge", "SharedCacheHandoff")
 
 
 def output(*args):

@@ -24,9 +24,11 @@
 // Modified 2026-10-23: adapt shared-region removal to executable-local arm64 syscalls and simulator handoff.
 // Modified 2026-10-24: switch to app-owned main-thread storage before cache removal and restore host TLS on failure.
 // Modified 2026-10-24: invoke the prepared simulator main wrapper and preserve its return status without host cleanup.
+// Modified 2026-10-24: transfer debugger notifications and preserve registered image metadata across cache removal.
 // Shared-region removal follows Apple's deallocateExistingSharedCache() at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/SharedCacheRuntime.cpp#L1230-L1243
 #include "SharedCacheHandoff.h"
+#include "DebuggerBridge.h"
 
 #include <errno.h>
 #include <sys/syscall.h>
@@ -68,18 +70,25 @@ __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(con
     if (error && error != EINVAL && error != ENOMEM) return error;
     bool hasCache = !error;
 
+    error = lsb::beginDebuggerHandoff();
+    if (error) return error;
+
     // From this switch onward, even a mapped host libSystem cannot safely use our fresh pthread state.
     if (!lsb::setTSDBase(launch->thread.simulatorTSD)) {
         if (!lsb::setTSDBase(launch->thread.hostTSD)) exitProcess(127);
+        lsb::cancelDebuggerHandoff();
         return EIO;
     }
     if (hasCache) {
         error = sharedRegionCheck(nullptr);
         if (error) {
             if (!lsb::setTSDBase(launch->thread.hostTSD)) exitProcess(127);
+            lsb::cancelDebuggerHandoff();
             return error;
         }
     }
+
+    if (lsb::finishDebuggerHandoff(hasCache)) exitProcess(126);
 
     // All instructions in this function live in the executable. No host library may be called after the detach succeeds.
     uintptr_t startGlue = 0;

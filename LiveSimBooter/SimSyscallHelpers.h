@@ -21,6 +21,7 @@
  */
 
 // Modified 2026-10-23: extract the version 18 callback ABI for LiveSimBooter and add layout checks.
+// Modified 2026-10-24: expose the app-resident debugger notifier and relocated process-info selection.
 #pragma once
 
 // ABI adapted from dyldSyscallInterface.h at apple-oss-distributions/dyld fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
@@ -32,6 +33,7 @@
 #include <dirent.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld_images.h>
 #include <mach-o/loader.h>
 #include <pthread.h>
 #include <sys/attr.h>
@@ -43,8 +45,6 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
-
-struct dyld_all_image_infos;
 
 struct SimSyscallHelpers {
     uintptr_t version;
@@ -141,5 +141,9 @@ static_assert(offsetof(SimSyscallHelpers, sysctlbyname) == 67 * sizeof(uintptr_t
 
 const SimSyscallHelpers *LSBGetSimSyscallHelpers();
 
-// Call once before entering dyld_sim. It receives its own persistent process-info state, never the host dyld's writable state.
+// Call once before entering dyld_sim. The debugger bridge publishes this state or recreates the kernel-registered metadata pages after detachment.
 bool LSBInitializeSimProcessInfo(const mach_header *dyldHeader, const char *dyldPath);
+
+// Switch to persistent writable metadata after debugger publication. The caller supplies a non-null, initialized structure.
+void LSBSetSimProcessInfo(dyld_all_image_infos *info);
+extern "C" void LSBDebuggerImageNotification(dyld_image_mode mode, uint32_t count, const dyld_image_info *images);

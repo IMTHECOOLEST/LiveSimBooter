@@ -14,12 +14,13 @@ static void check(bool condition, const char *message) {
     if (!condition) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
-enum class Event { ReadTSD, Query, Switch, Detach, Restore, Entry, Main, Exit };
+enum class Event { ReadTSD, Query, DebugBegin, Switch, Detach, Restore, DebugFinish, DebugCancel, Entry, Main, Exit };
 static std::vector<Event> events;
 static constexpr uintptr_t hostTSD = 0x100020e0, simulatorTSD = 0x140000e0;
 static uintptr_t currentTSD;
 static jmp_buf exitJump;
 static int queryError, detachError, queryCalls, detachCalls, switchCalls, restoreCalls, entryCalls, mainCalls, mainStatus, exitStatus;
+static int debugBeginError, debugFinishError, debugBeginCalls, debugFinishCalls, debugCancelCalls;
 static uintptr_t returnedStartGlue;
 static bool returnMain, failSwitch, failRestore;
 static const LSBDyldSimLaunch *expected;
@@ -31,6 +32,35 @@ static void expectEvents(std::initializer_list<Event> sequence) {
 }
 
 namespace lsb {
+int beginDebuggerHandoff() {
+    events.push_back(Event::DebugBegin);
+    ++debugBeginCalls;
+    check(currentTSD == hostTSD, "debugger handoff begins with host TLS still installed");
+    check(queryCalls == 1 && switchCalls == 0 && detachCalls == 0 && entryCalls == 0,
+          "debugger publication begins after cache query and before TLS switch, detach or simulator entry");
+    check(queryError == 0 || queryError == EINVAL || queryError == ENOMEM, "fatal cache query errors never publish debugger handoff");
+    return debugBeginError;
+}
+
+int finishDebuggerHandoff(bool cacheDetached) {
+    events.push_back(Event::DebugFinish);
+    ++debugFinishCalls;
+    check(currentTSD == simulatorTSD && switchCalls == 1, "debugger handoff finishes using simulator TLS");
+    check(debugBeginCalls == 1 && !debugBeginError && !failSwitch && !detachError, "only successful cache handling finishes debugger handoff");
+    check(cacheDetached == !queryError && detachCalls == (cacheDetached ? 1 : 0), "debugger finish receives the actual cache detachment state");
+    check(restoreCalls == 0 && debugCancelCalls == 0 && entryCalls == 0, "debugger finish precedes simulator entry without rollback");
+    return debugFinishError;
+}
+
+void cancelDebuggerHandoff() {
+    events.push_back(Event::DebugCancel);
+    ++debugCancelCalls;
+    check(currentTSD == hostTSD && restoreCalls == 1 && !failRestore, "debugger handoff cancellation requires successful host TLS restoration");
+    check(debugBeginCalls == 1 && !debugBeginError && debugFinishCalls == 0 && entryCalls == 0,
+          "only a begun, unfinished debugger handoff may be cancelled before simulator entry");
+    check(failSwitch || detachError, "debugger rollback happens only after a TLS switch or cache detachment failure");
+}
+
 uintptr_t currentTSDBase() {
     events.push_back(Event::ReadTSD);
     return currentTSD;
@@ -41,6 +71,7 @@ bool setTSDBase(uintptr_t address) {
         events.push_back(Event::Switch);
         ++switchCalls;
         check(queryCalls == 1 && detachCalls == 0 && entryCalls == 0, "TLS switches after query and before detach or entry");
+        check(debugBeginCalls == 1 && !debugBeginError, "TLS switches only after debugger handoff begins successfully");
         check(currentTSD == hostTSD, "simulator TLS switch starts from host TLS");
         // Even a failed switch may have changed kernel state; callers must explicitly restore host TLS.
         currentTSD = simulatorTSD;
@@ -76,6 +107,11 @@ int LSBTestSharedRegionCheck(uint64_t *address) {
     events.push_back(Event::Exit);
     if (failRestore) {
         check(status == 127 && restoreCalls == 1 && entryCalls == 0, "failed host TLS restoration exits before simulator entry");
+        check(debugCancelCalls == 0 && debugFinishCalls == 0, "failed TLS restoration neither cancels nor finishes debugger handoff");
+    } else if (debugFinishError) {
+        check(status == 126 && debugFinishCalls == 1 && currentTSD == simulatorTSD, "failed debugger finish exits fatally with simulator TLS");
+        check(entryCalls == 0 && mainCalls == 0 && restoreCalls == 0 && debugCancelCalls == 0,
+              "failed debugger finish never enters simulator or attempts host rollback");
     } else {
         check(entryCalls == 1 && currentTSD == simulatorTSD, "normal raw exit follows entry using simulator TLS");
     }
@@ -102,6 +138,8 @@ static LSBDyldSimLaunch::Main fakeEntry(int argc, const char *const argv[], cons
     check(currentTSD == simulatorTSD && switchCalls == 1 && restoreCalls == 0, "simulator entry uses fresh TLS without rollback");
     check(queryCalls == 1 && detachCalls == (queryError ? 0 : 1), "entry follows completed cache handling");
     check(!detachError && !failSwitch, "failed detach or TLS switch never enters dyld_sim");
+    check(debugBeginCalls == 1 && debugFinishCalls == 1 && !debugFinishError && debugCancelCalls == 0,
+          "entry follows a completed debugger handoff without cancellation");
     check(argc == expected->argc && argv == expected->argv && envp == expected->envp && apple == expected->apple,
           "entry receives original argument vectors");
     check(executable == expected->executable && dyld == expected->dyld && slide == expected->slide && helpers == expected->helpers,
@@ -121,6 +159,7 @@ static void reset(int query = 0, int detach = 0, bool hasMain = true) {
     returnedStartGlue = 1;
     failSwitch = failRestore = false;
     queryCalls = detachCalls = switchCalls = restoreCalls = entryCalls = mainCalls = 0;
+    debugBeginError = debugFinishError = debugBeginCalls = debugFinishCalls = debugCancelCalls = 0;
     exitStatus = -1;
 }
 
@@ -128,7 +167,7 @@ static void expectExit(const LSBDyldSimLaunch &launch, int status, int entries =
     expected = &launch;
     if (setjmp(exitJump) == 0) {
         LSBDetachHostCacheAndEnter(&launch);
-        check(false, "successful entry or failed TLS rollback must never return to host code");
+        check(false, "successful entry, failed TLS rollback or failed debugger finish must never return to host code");
     }
     check(exitStatus == status, "expected raw exit status");
     check(entryCalls == entries && mainCalls == mains, "expected prepare and returned main invocation counts");
@@ -151,29 +190,48 @@ int main() {
         reset();
         mainStatus = status;
         expectExit(launch, status);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Detach, Event::Entry, Event::Main, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::DebugFinish, Event::Entry, Event::Main, Event::Exit});
     }
     for (uintptr_t startGlue : {uintptr_t(0), uintptr_t(1), uintptr_t(0x12345678)}) {
         reset(0, 0, false);
         returnedStartGlue = startGlue;
         expectExit(launch, 1, 1, 0);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Detach, Event::Entry, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::DebugFinish, Event::Entry, Event::Exit});
     }
     for (uintptr_t startGlue : {uintptr_t(0), uintptr_t(0x12345678)}) {
         reset();
         returnedStartGlue = startGlue;
         expectExit(launch, 126, 1, 0);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Detach, Event::Entry, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::DebugFinish, Event::Entry, Event::Exit});
     }
     for (int noCache : {EINVAL, ENOMEM}) {
         reset(noCache);
         expectExit(launch, 0);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Entry, Event::Main, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::DebugFinish, Event::Entry, Event::Main, Event::Exit});
     }
     for (int error : {EIO, EPERM}) {
         reset(error);
         expectReturn(&launch, error);
         expectEvents({Event::ReadTSD, Event::Query});
+    }
+    for (int query : {0, EINVAL, ENOMEM}) {
+        for (int error : {EIO, EPERM}) {
+            reset(query);
+            debugBeginError = error;
+            expectReturn(&launch, error);
+            check(switchCalls == 0 && detachCalls == 0 && restoreCalls == 0, "failed debugger begin leaves host TLS and cache untouched");
+            check(debugFinishCalls == 0 && debugCancelCalls == 0, "failed debugger begin neither finishes nor cancels handoff");
+            expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin});
+
+            reset(query);
+            debugFinishError = error;
+            expectExit(launch, 126, 0, 0);
+            if (!query) {
+                expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::DebugFinish, Event::Exit});
+            } else {
+                expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::DebugFinish, Event::Exit});
+            }
+        }
     }
 
     reset();
@@ -197,22 +255,22 @@ int main() {
         reset(query);
         failSwitch = true;
         expectReturn(&launch, EIO);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Restore});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Restore, Event::DebugCancel});
 
         reset(query);
         failSwitch = failRestore = true;
         expectExit(launch, 127, 0, 0);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Restore, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Restore, Event::Exit});
     }
     for (int error : {EPERM, EIO}) {
         reset(0, error);
         expectReturn(&launch, error);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Detach, Event::Restore});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::Restore, Event::DebugCancel});
 
         reset(0, error);
         failRestore = true;
         expectExit(launch, 127, 0, 0);
-        expectEvents({Event::ReadTSD, Event::Query, Event::Switch, Event::Detach, Event::Restore, Event::Exit});
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Detach, Event::Restore, Event::Exit});
     }
     printf("Shared cache handoff: %u checks passed\n", checks);
 }

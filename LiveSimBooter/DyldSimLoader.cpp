@@ -24,7 +24,7 @@
 
 // Modified 2026-10-23: adapt simulator image mapping, validation and launch arguments for an iPhone app.
 // Modified 2026-10-24: accept MH_DYLIB signing variants while retaining validation for each image's launch role.
-// Modified 2026-10-24: replace the consumed host ptr_munge token with fresh, writable simulator startup data.
+// Modified 2026-10-24: refresh ptr_munge in writable startup data and prepare debugger metadata before host-cache removal.
 // Mapping sequence based on Apple's prepareSim(), dyldMain.cpp:300-469 at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp
 
@@ -402,6 +402,11 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     int threadError = LSBPrepareHostMainThread(&thread);
     if (threadError) {
         fprintf(stderr, "Cannot prepare simulator main thread: %s\n", strerror(threadError));
+        return 1;
+    }
+    int debuggerError = LSBPrepareHostDebugger(executable, executablePath);
+    if (debuggerError) {
+        fprintf(stderr, "Cannot prepare debugger image metadata: %s\n", strerror(debuggerError));
         return 1;
     }
     const SimSyscallHelpers *helpers = LSBGetSimSyscallHelpers();

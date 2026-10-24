@@ -16,8 +16,8 @@ in universal binaries. It registers each embedded signature with `F_ADDFILESIGS_
 maps its segments, and handles zero-fill. The executable's `__PAGEZERO` is excluded from that reservation. Signing remains your responsibility.
 
 The entry receives df's mapped header, a persistent kernel-style argument block, and the version 18 syscall helper
-table from the pinned Apple ABI. Tracing and monitor callbacks are disabled while preserving their ABI slots. The simulator gets
-separate process-info storage. `DYLD_ROOT_PATH` points to `Documents/RuntimeRoot`, and
+table from the pinned Apple ABI. Tracing and external Mach monitor callbacks are disabled while preserving their ABI slots.
+Image changes publish debugger metadata and call an app-resident notification function. `DYLD_ROOT_PATH` points to `Documents/RuntimeRoot`, and
 `DYLD_SHARED_CACHE_DIR` points to its `System/Library/Caches/com.apple.dyld` directory. Adjust that directory for a different runtime layout.
 `argv[0]` and the apple vector's `executable_path` identify the actual df file, with no additional arguments. The host's
 `executable_file` metadata is removed so it cannot override df's path. dyld_sim handles df's fixups and dependencies.
@@ -26,7 +26,7 @@ is writable because simulator libpthread consumes and erases that value; the ori
 
 Immediately before entry, the loader follows Apple's shared-region query and `__shared_region_check_np(NULL)` detach sequence.
 The destructive syscall runs from the app's own arm64 code, so it does not return into an unmapped libSystem stub. Arguments,
-helpers, main-thread bootstrap storage and the AMFI policy snapshot are prepared first. After successful detachment, the handoff does not return to
+helpers, debugger metadata, main-thread bootstrap storage and the AMFI policy snapshot are prepared first. After successful detachment, the handoff does not return to
 host cleanup. The returned `start_sim` wrapper receives the same argc, argv, environment and apple vectors; it calls df's main
 and then simulator `exit()`. If the wrapper returns, a raw exit syscall preserves its status without host cleanup. A null
 entry result exits with status 1; unsupported legacy startup glue exits with status 126. A pre-entry detach failure is reported
@@ -49,16 +49,30 @@ The callback returns that saved result for identical flags; other inputs return 
 and no policy permissions are fabricated. Signing and kernel restrictions still apply.
 
 The simulator df now runs on the tested iPhone. This remains an initial runtime handoff rather than a complete simulator boot.
-LLDB verified actual host-cache removal, inaccessible old TSD storage, readable app-owned thread storage, and successful
+LLDB verified actual host-cache removal, inaccessible native dyld code, readable app-owned thread storage, and successful
 dyld_sim preparation. Execution reached df's exact `LC_MAIN` entry through `start_sim`, printed the iPhone filesystem table,
 and exited with status 0. Malloc reported that its nano zone could not reserve VM space; df still completed successfully.
 This test used the matching iOS 26 dyld_sim/df/runtime set and the three locally signed macOS support dylibs marked as iOS Simulator.
 
-LLDB does not automatically discover the simulator images yet. In this run the app-owned process-info array contained 46
-images, while LLDB retained 80 host modules and showed no RuntimeRoot modules. The private metadata is not published through
-`TASK_DYLD_INFO`, and image-change notifications remain stubbed. Address breakpoints and direct memory inspection work;
-symbolication currently uses exact local binaries and their load addresses. The iPhone target also rejects manually adding
-iOS Simulator modules, a separate issue from publishing the image list.
+`DebuggerBridge.cpp` transfers LLDB from the native dyld notifier to `LSBDebuggerImageNotification` and publishes simulator
+metadata through `TASK_DYLD_INFO`. The kernel permits only one relocation of that pointer, which native startup may already
+have consumed. In that case, after detaching the cache, the bridge maps fresh anonymous pages at the original metadata
+address and places simulator state there. Only those metadata pages become readable; the old cache code stays inaccessible.
+The image list retains the host app for source breakpoints and includes df before dyld_sim adds its dependencies.
+
+Recent debugserver versions read dyld's compact image snapshot instead of the legacy image array. Without that snapshot,
+their fallback finds executable/dyld images but leaves dynamically loaded libraries unnamed. `CompactImageInfo.cpp` writes
+an AppleArchive containing `process.plist`, paths, UUIDs, load addresses, segment metadata and a CRC, without calling host
+libraries, before each image notification. Startup callbacks also advance the published process state and timestamp.
+This preserves the binaries' iOS Simulator platform and the debugger's iPhone connection.
+The writer uses bounded app-owned storage for up to 1024 images. Its two snapshot buffers support inspection while LLDB
+has stopped the process; external asynchronous process monitors remain unsupported.
+
+On the tested iOS 27 device, LLDB automatically lists 49 named modules: the host app and 48 RuntimeRoot images, including
+dyld_sim, df and its 46 dylibs. Module-scoped breakpoints hit `libsystem_pthread.dylib::__pthread_init` and
+`libsystem_c.dylib::getmntinfo`; backtraces identify dyld_sim's `start_sim` and preserve host-app source frames.
+The debugger reports `dyld_process_state_program_running`, native dyld code remains inaccessible, and df exits with status 0.
+No manual module injection or platform changes in LLDB are needed. Symbols stripped from the supplied binaries remain unavailable.
 
 macOS's simulator launch [keeps bootstrap dyld outside the shared cache](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp#L1191-L1195).
 Its handoff does not reset TLS. Simulator libpthread [adopts the existing main pthread](https://github.com/apple-oss-distributions/libpthread/blob/42d026df5b07825070f60134b980a1ec2552dfee/src/pthread.c#L2086-L2096),
@@ -84,6 +98,8 @@ Cache detachment follows [deallocateExistingSharedCache](https://github.com/appl
 Run `sh Tests/run.sh` on an Apple Silicon Mac for loader and callback tests. Mapping/handoff tests use synthetic Mach-O images,
 stub signature registration, a fake entry and mocked cache syscalls. Safe live callback tests exercise local syscalls, owned
 VM/ports, directory reads, clocks, locks and errno, and check every helper pointer belongs to the executable.
+Debugger tests cover metadata relocation and rollback, image notifications, startup state, and compact archives decoded
+independently by CoreFoundation, including malformed input and publication failure cases.
 They never detach the test process's cache or execute a simulator runtime, and do not validate iPhone code-signing acceptance.
 
 Run `python3 Tests/audit-local-runtime.py` to compile the callback/handoff code for iPhone arm64 at `-O0` and `-O2` and reject
@@ -100,6 +116,7 @@ The following Apple-derived files and their modifications remain under the [Appl
 - `LiveSimBooter/DyldSimLoader.cpp` — adapted simulator mapping and launch flow.
 - `LiveSimBooter/SharedCacheHandoff.cpp` — adapted shared-region removal flow.
 - `LiveSimBooter/SimSyscallHelpers.h` and `LiveSimBooter/SimSyscallHelpers.cpp` — adapted syscall-helper ABI and table.
+- `LiveSimBooter/CompactImageInfo.cpp` — adapted compact image snapshot format.
 
 Their Apple copyright/license notices and dated modification notices are retained. The source is in this repository at those
 paths; upstream is [Apple dyld at fd8d0c4d52320ebf64db34f3cb280310d905c5ae](https://github.com/apple-oss-distributions/dyld/tree/fd8d0c4d52320ebf64db34f3cb280310d905c5ae).

@@ -19,6 +19,8 @@
 		E19AD562308A56D300634F93 /* Exceptions for "LiveSimBooter" folder in "LiveSimBooter" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			additionalCompilerFlagsByRelativePath = {
+				CompactImageInfo.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				DebuggerBridge.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
 				LocalMach.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
 				LocalPOSIX.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
 				LocalRuntime.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";

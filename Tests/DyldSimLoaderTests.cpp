@@ -353,6 +353,13 @@ static void executableMapping(const Bytes &bytes, uint64_t sliceOffset) {
 
 static SimSyscallHelpers fakeHelpers = {};
 void LSBPrepareHostPolicy() {}
+static const mach_header *debuggerExecutable;
+static std::string debuggerExecutablePath;
+int LSBPrepareHostDebugger(const mach_header *executable, const char *executablePath) {
+    debuggerExecutable = executable;
+    debuggerExecutablePath = executablePath;
+    return 0;
+}
 int LSBPrepareHostMainThread(lsb::MainThreadBootstrap *bootstrap) {
     *bootstrap = {0x1000, 0x2000};
     return 0;
@@ -402,6 +409,7 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
     check(ptrMungeTokens == 1 && randomCalls == 2, "all inherited tokens are replaced and zero random values are retried");
     check(executable == &fakeExecutable && dyld == &fakeDyld && slide == 42 && helpers == &fakeHelpers, "entry ABI image and helper arguments");
     check(initializedHeader == dyld && initializedPath == "/RuntimeRoot/usr/lib/dyld_sim", "process info initialized before entry");
+    check(debuggerExecutable == executable && debuggerExecutablePath == "/RuntimeRoot/bin/df", "debugger metadata receives mapped executable and path");
     check(startGlue && *startGlue == 0, "start glue output initialized");
     *startGlue = 123;
     return fakeMain;

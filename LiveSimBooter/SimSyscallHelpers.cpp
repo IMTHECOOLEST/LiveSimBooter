@@ -21,8 +21,11 @@
  */
 
 // Modified 2026-10-23: replace host-cache callbacks with app-local runtime, BSD syscall and Mach implementations.
+// Modified 2026-10-24: forward simulator image notifications to an app-resident debugger hook and support relocated process info.
+// Modified 2026-10-24: publish compact image snapshots before notifying debuggers using modern dyld introspection.
 // Helper-table ordering adapted from dyldMain.cpp at apple-oss-distributions/dyld fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 #include "SimSyscallHelpers.h"
+#include "CompactImageInfo.h"
 #include "LocalRuntime.h"
 #include "LocalPOSIX.h"
 #include "LocalMach.h"
@@ -31,9 +34,23 @@
 #include <limits.h>
 #include <mach-o/dyld_images.h>
 
+#if defined(LSB_DEBUGGER_NOTIFICATION_TESTING)
+void LSBTestDebuggerNotification(dyld_image_mode mode, uint32_t count, const dyld_image_info *images);
+#endif
+
+extern "C" __attribute__((noinline, used, visibility("default")))
+void LSBDebuggerImageNotification(dyld_image_mode mode, uint32_t count, const dyld_image_info *images) {
+    // LLDB reads these arguments at the function entry. Keep the call and its ABI observable in optimized builds.
+    __asm volatile("" : : "r"(mode), "r"(count), "r"(images) : "memory");
+#if defined(LSB_DEBUGGER_NOTIFICATION_TESTING)
+    LSBTestDebuggerNotification(mode, count, images);
+#endif
+}
+
 namespace {
 
 dyld_all_image_infos sProcessInfo = {};
+dyld_all_image_infos *sActiveProcessInfo = &sProcessInfo;
 char sDyldPath[PATH_MAX] = {};
 bool sProcessInfoInitialized = false;
 
@@ -42,13 +59,34 @@ bool compareAndSwapPointer(void *oldValue, void *newValue, void *volatile *addre
 }
 
 void memoryBarrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-dyld_all_image_infos *getProcessInfo() { return &sProcessInfo; }
+dyld_all_image_infos *getProcessInfo() { return sActiveProcessInfo; }
 
-// Keep ABI slots for disabled tracing and debugger notifications without depending on host libraries.
-void imageNotification(dyld_image_mode, uint32_t, const dyld_image_info *) {}
+// Keep ABI slots for disabled tracing and publish debugger state without depending on host libraries.
 void coreSymbolicationNotification(void *, uint64_t, const char *, const mach_header *) {}
-void notifyMonitor() {}
-void notifyImageChanges(bool, unsigned, const mach_header *[], const char *[]) {}
+void publishDebuggerSnapshot(uint64_t state = 0) {
+    if (lsb::publishCompactImageInfo(sActiveProcessInfo, state)) {
+        static constexpr char message[] = "[dyld_sim] Cannot publish debugger image snapshot.\n";
+        lsb::write(2, message, sizeof(message) - 1);
+        lsb::exitProcess(126);
+    }
+}
+void notifyMainCalled() { publishDebuggerSnapshot(0x50); }
+void notifyBeforeInitializers() { publishDebuggerSnapshot(0x40); }
+void notifyImageChanges(bool unloading, unsigned count, const mach_header *headers[], const char *paths[]) {
+    // Version 18 delegates breakpoint notifications here. dyld_sim has already updated the canonical image list.
+    if (!count) return;
+    publishDebuggerSnapshot();
+    dyld_image_info images[64];
+    for (unsigned offset = 0; offset < count;) {
+        unsigned chunk = count - offset;
+        if (chunk > 64) chunk = 64;
+        for (unsigned index = 0; index < chunk; ++index) {
+            images[index] = { headers[offset + index], paths[offset + index], 0 };
+        }
+        LSBDebuggerImageNotification(unloading ? dyld_image_removing : dyld_image_adding, chunk, images);
+        offset += chunk;
+    }
+}
 bool tracingEnabled(uint32_t) { return false; }
 int trace(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
 uint64_t traceString(uint32_t, uint64_t, const char *) { return 0; }
@@ -108,7 +146,7 @@ const SimSyscallHelpers sHelpers = {
     &trace,
     &traceString,
     &lsb::amfi_check_dyld_policy_self,
-    &notifyMonitor,
+    &notifyMainCalled,
     &notifyImageChanges,
     &lsb::mach_msg_destroy,
     &lsb::mach_port_construct,
@@ -120,13 +158,15 @@ const SimSyscallHelpers sHelpers = {
     &lsb::getattrlistbulk,
     &lsb::getattrlist,
     &lsb::getfsstat,
-    &notifyMonitor,
+    &notifyBeforeInitializers,
     &lsb::sysctlbyname,
 };
 
 } // namespace
 
 const SimSyscallHelpers *LSBGetSimSyscallHelpers() { return &sHelpers; }
+
+void LSBSetSimProcessInfo(dyld_all_image_infos *info) { sActiveProcessInfo = info; }
 
 bool LSBInitializeSimProcessInfo(const mach_header *dyldHeader, const char *dyldPath) {
     if (sProcessInfoInitialized) { *lsb::errnoAddress() = EBUSY; return false; }
@@ -136,7 +176,7 @@ bool LSBInitializeSimProcessInfo(const mach_header *dyldHeader, const char *dyld
         return false;
     }
     sProcessInfo.version = 17;
-    sProcessInfo.notification = &imageNotification;
+    sProcessInfo.notification = &LSBDebuggerImageNotification;
     sProcessInfo.processDetachedFromSharedRegion = true;
     sProcessInfo.dyldImageLoadAddress = dyldHeader;
     sProcessInfo.dyldVersion = "dyld_sim (LiveSimBooter)";
