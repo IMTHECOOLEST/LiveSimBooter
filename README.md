@@ -74,6 +74,52 @@ dyld_sim, df and its 46 dylibs. Module-scoped breakpoints hit `libsystem_pthread
 The debugger reports `dyld_process_state_program_running`, native dyld code remains inaccessible, and df exits with status 0.
 No manual module injection or platform changes in LLDB are needed. Symbols stripped from the supplied binaries remain unavailable.
 
+The snapshot writer also accepts cache images packed on 4 KiB boundaries and uses each cached `__TEXT.vmaddr` as its preferred
+address. It describes loaded cache images individually, including their actual segment coordinates. Cache-specific Atlas APIs
+and the cache image bitmap are not implemented; dyld_sim still owns the legacy shared-cache address, slide and UUID fields.
+
+The shared-cache experiment on 2026-10-24 built a matching iOS 26 cache containing 219 dylibs, using the runtime's
+`update_dyld_sim_shared_cache`. The single signed file is 292,749,312 bytes. On the tested iPhone, a genuinely signed cache
+with CodeDirectory v0x20400, no scatter table, 16 KiB SHA-256 pages, the app identifier/team, and no entitlements passes
+`F_ADDFILESIGS_RETURN` and the executable first-page mapping. Its complete 187,645,952-byte TEXT mapping also receives `r-x`
+at `0x120000000`, verified under LLDB without adding execute permission afterward. This establishes executable mapping of a
+signed cache; it does not establish execution of the cache at a relocated address.
+
+The stock simulator mapping at `0x180000000` instead receives `r--` despite requesting `r-x`. Execution then faults at the
+cached libSystem initializer. TXM logs `selector: 38 | 23`. The supplied TXM 182.0 binary identifies this as a registered code
+region overlap: nesting inserts the full shared-region interval into the parent, and ordinary VM unmapping does not remove
+that registration. Its selectors match the observed operations, although that supplied binary predates the device OS.
+This accounts for the different results inside and outside the former host shared region. Changing the cache header alone
+cannot relocate it: simulator caches have no slide information, and both the builder and dyld_sim mapper hardcode the base.
+A complete cache-backed launch therefore needs a rebuilt or fully relocated cache and matching mapper using an available address outside that interval.
+
+The installed iOS 27 runtime's arm64 cache consists of the main file and `.01`, with 11 mappings and 1,826 cached images.
+Its declared region runs from `0x1c0000000` to `0x2abccc000`. All mapping slide-info offsets/sizes and both `maxSlide` fields are zero;
+none of its images retain chained fixups, dyld rebase streams, split-segment information or section/local/external relocations.
+Moving both files by the same 16 KiB-aligned delta preserves internal PC-relative instructions and relative metadata, but absolute
+pointers and address-bearing headers still need adjustment. The surviving v4 symbol patch tables can help identify some pointer
+sites; they are not a complete rebase inventory. Relocating this cache without the original dylibs is therefore a reconstruction
+task, not just an instruction or header patch. The smaller cache's successful mapping at `0x120000000` does not establish a usable
+address range for this much larger layout.
+
+Ordinary embedded `codesign` signing adds a scatter table that this TXM rejects (`0x70 | 0x28 | 1`). Its DSC writer also leaves
+`codeSignatureSize` stale when the signature grows. The header must contain `file size - codeSignatureOffset` before the final
+page hashes and signature are generated, matching the purpose of this
+[signature-size fixup](https://github.com/zhuowei/iOS-run-macOS-executables-tools/blob/main/resign_dyld_cache/fixup_signature_size.py).
+Plain detached signing avoids scatter but emits v0x20200, rejected by this iPhone as an unsupported signature version.
+`Tools/sign-dyld-cache.py` handles the header, contiguous 16 KiB hashes and v0x20400 signature with the selected keychain identity:
+
+```sh
+python3 Tools/sign-dyld-cache.py UNSIGNED_CACHE SIGNED_CACHE \
+  --identity D7610EDC80D34A9B1A3D3C8563D66A5CD4716293 --identifier com.kdt.LiveSimBooter --team UU7W52U79B
+```
+
+The tool uses `codesign` for the initial identity/requirements, then signs the adjusted CodeDirectory through Security.framework
+without exporting a private key. It checks the page hashes and final signature. It does not relocate the cache or change device
+policy. Runtime/cache binaries remain outside Git. The experimental device cache is retained as
+`dyld_sim_shared_cache_arm64.test-disabled`; with it disabled, the existing loose-library df launch still exits with status 0.
+The existing handoff stack and commented UIKit startup are unchanged.
+
 macOS's simulator launch [keeps bootstrap dyld outside the shared cache](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp#L1191-L1195).
 Its handoff does not reset TLS. Simulator libpthread [adopts the existing main pthread](https://github.com/apple-oss-distributions/libpthread/blob/42d026df5b07825070f60134b980a1ec2552dfee/src/pthread.c#L2086-L2096),
 whose bootstrap storage survives normal macOS cache removal. Here native app startup has already placed that storage in the host

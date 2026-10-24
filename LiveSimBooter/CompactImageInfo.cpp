@@ -22,6 +22,7 @@
  */
 
 // Modified 2026-10-24: emit bounded Apple Archive / process.plist snapshots with executable-local storage and primitives.
+// Modified 2026-10-24: describe loaded cache images directly, including their packed headers and relocated segment addresses.
 // Format follows Apple's framework/AtlasSchema.swift, common/PropertyList.cpp and the native dyld atlas CRC attribute.
 #include "CompactImageInfo.h"
 #include "LocalPOSIX.h"
@@ -163,16 +164,17 @@ void copyImage(Image &destination, const Image &source) {
     for (unsigned byte = 0; byte < 16; ++byte) destination.uuid[byte] = source.uuid[byte];
 }
 
-bool isPageZero(const segment_command_64 *segment) {
-    const char name[] = "__PAGEZERO";
-    for (unsigned index = 0; index < sizeof(name); ++index) if (segment->segname[index] != name[index]) return false;
+template <size_t Size> bool hasSegmentName(const segment_command_64 *segment, const char (&name)[Size]) {
+    static_assert(Size <= sizeof(segment->segname), "Segment name must fit its fixed-width field");
+    for (unsigned index = 0; index < Size; ++index) if (segment->segname[index] != name[index]) return false;
     return true;
 }
 
 int addImage(const mach_header *header, const char *path, size_t &count) {
     if (!header || !path || !*path) return EINVAL;
     const uintptr_t address = reinterpret_cast<uintptr_t>(header);
-    if (address % kPageSize) return EINVAL;
+    // Cache builders pack individual Mach-O headers on 4 KiB boundaries inside 16 KiB mappings.
+    if (address % 4096 || (address % kPageSize && !(header->flags & MH_DYLIB_IN_CACHE))) return EINVAL;
     for (size_t index = 0; index < count; ++index) if (sImages[index].address == address) return 0;
     if (count == kMaxImages) return E2BIG;
     size_t pathLength = 0;
@@ -206,7 +208,7 @@ int addImage(const mach_header *header, const char *path, size_t &count) {
             if (command->cmdsize < sizeof(segment_command_64)) return ENOEXEC;
             const auto *segment = reinterpret_cast<const segment_command_64 *>(command);
             if (segment->nsects > (command->cmdsize - sizeof(*segment)) / sizeof(section_64)) return ENOEXEC;
-            if (!isPageZero(segment) && ++segments > kMaxSegments) return E2BIG;
+            if (!hasSegmentName(segment, "__PAGEZERO") && ++segments > kMaxSegments) return E2BIG;
         }
         offset += command->cmdsize;
     }
@@ -224,14 +226,15 @@ uint32_t writeImage(Writer &writer, const Image &image) {
     for (uint32_t index = 0; index < header->ncmds; ++index) {
         if (command->cmd == LC_SEGMENT_64) {
             const auto *segment = reinterpret_cast<const segment_command_64 *>(command);
-            if (!isPageZero(segment)) {
+            if (!hasSegmentName(segment, "__PAGEZERO")) {
                 size_t nameLength = 0;
                 while (nameLength < sizeof(segment->segname) && segment->segname[nameLength]) ++nameLength;
                 uint32_t keys[] = {Name, Padr, Size, Fsze, Foff, Perm};
                 uint32_t values[] = {writer.string(segment->segname, nameLength), writer.integer(segment->vmaddr), writer.integer(segment->vmsize),
                                      writer.integer(segment->filesize), writer.integer(segment->fileoff), writer.integer(segment->initprot)};
                 segmentObjects[segmentCount++] = writer.dictionary(keys, values, 6);
-                if (segment->fileoff == 0 && segment->filesize) preferredAddress = segment->vmaddr;
+                // A cache image's __TEXT file offset is relative to its cache file and is usually nonzero.
+                if (hasSegmentName(segment, "__TEXT")) preferredAddress = segment->vmaddr;
             }
         }
         command = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(command) + command->cmdsize);
@@ -250,7 +253,8 @@ uint32_t writeImage(Writer &writer, const Image &image) {
 int buildSnapshot(dyld_all_image_infos *info, Writer &writer, uint64_t timestamp, uint64_t state) {
     if ((info->infoArrayCount && !info->infoArray)) return EINVAL;
     if (info->infoArrayCount > kMaxImages) return E2BIG;
-    if (info->sharedCacheBaseAddress || info->sharedCacheSlide) return ENOTSUP;
+    // Atlas permits complete image records in imgs without dsc1. Flatten loaded cache images here so LLDB can consume their real segments.
+    // Cache-specific APIs and cache bitmap introspection are not represented; the legacy sharedCache fields remain owned by dyld_sim.
     size_t count = 0;
     for (uint32_t index = 0; index < info->infoArrayCount; ++index) {
         const dyld_image_info &image = info->infoArray[index];

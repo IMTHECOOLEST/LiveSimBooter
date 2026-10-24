@@ -15,6 +15,14 @@ static void check(bool condition, const char *message) {
 }
 struct alignas(16384) TestImage { mach_header_64 header; uuid_command uuid; segment_command_64 pageZero, text; };
 static TestImage fixtures[3];
+struct alignas(16384) CacheImageFixture {
+    uint8_t padding[4096];
+    mach_header_64 header;
+    uuid_command uuid;
+    segment_command_64 text, data;
+};
+static CacheImageFixture cachedFixture;
+static_assert(offsetof(CacheImageFixture, header) == 4096, "Exercise a cached image not aligned to the VM page size");
 static uint64_t little(const uint8_t *bytes, unsigned size) {
     uint64_t result = 0;
     for (unsigned index = 0; index < size; ++index) result |= uint64_t(bytes[index]) << (index * 8);
@@ -103,6 +111,37 @@ static void expectFailure(dyld_all_image_infos &info, int error, uint64_t state 
           "failed publication preserves descriptor and timestamp");
     check(currentBytes(info) == oldBytes, "failed publication preserves active bytes");
 }
+static void checkCachedSnapshot(const dyld_all_image_infos &info) {
+    auto bytes = currentBytes(info);
+    CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, bytes.data() + 44, static_cast<CFIndex>(little(bytes.data() + 34, 4)));
+    CFErrorRef error = nullptr;
+    CFPropertyListRef decoded = CFPropertyListCreateWithData(kCFAllocatorDefault, encoded, kCFPropertyListImmutable, nullptr, &error);
+    check(decoded && !error && CFGetTypeID(decoded) == CFDictionaryGetTypeID(), "cache snapshot decodes independently");
+    auto root = static_cast<CFDictionaryRef>(decoded);
+    check(!CFDictionaryGetValue(root, CFSTR("dsc1")), "flattened images do not also appear through a cache bitmap");
+    auto images = static_cast<CFArrayRef>(value(root, CFSTR("imgs")));
+    check(CFArrayGetCount(images) == 4, "all ordinary and cached images are present exactly once");
+    unsigned found = 0;
+    for (CFIndex index = 0; index < CFArrayGetCount(images); ++index) {
+        auto image = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(images, index));
+        if (number(image, CFSTR("addr")) != reinterpret_cast<uintptr_t>(&cachedFixture.header)) continue;
+        ++found;
+        check(number(image, CFSTR("padr")) == 0x180022000, "cache image preferred address comes from TEXT despite nonzero file offset");
+        check(CFEqual(value(image, CFSTR("file")), CFSTR("/usr/lib/libcache-test.dylib")), "cache image install path is retained");
+        auto segments = static_cast<CFArrayRef>(value(image, CFSTR("segs")));
+        check(CFArrayGetCount(segments) == 2, "cache text and data mappings are both retained");
+        auto text = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(segments, 0));
+        auto data = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(segments, 1));
+        check(number(text, CFSTR("padr")) == 0x180022000 && number(text, CFSTR("foff")) == 0x22000, "packed cache text coordinates");
+        check(number(data, CFSTR("padr")) == 0x1800a0128 && number(data, CFSTR("foff")) == 0xa0128 &&
+              number(data, CFSTR("size")) == 0x178 && number(data, CFSTR("perm")) == 3, "unaligned cache data coordinates");
+        uint64_t slide = number(image, CFSTR("addr")) - number(image, CFSTR("padr"));
+        check(number(data, CFSTR("padr")) + slide == reinterpret_cast<uintptr_t>(&cachedFixture.header) + 0x7e128,
+              "Atlas address-minus-preferred-address calculation locates the real cached segment");
+    }
+    check(found == 1, "cached header appears exactly once");
+    CFRelease(decoded); CFRelease(encoded);
+}
 int main(int argc, char **argv) {
     check(crc32c(reinterpret_cast<const uint8_t *>("123456789"), 9) == 0xe3069283, "standard CRC32C check value");
     check(crc32c(nullptr, 0) == 0, "empty CRC32C check value");
@@ -121,7 +160,7 @@ int main(int argc, char **argv) {
     const auto *app = reinterpret_cast<const mach_header *>(&fixtures[0]);
     const auto *df = reinterpret_cast<const mach_header *>(&fixtures[1]);
     const auto *dyld = reinterpret_cast<const mach_header *>(&fixtures[2]);
-    dyld_image_info images[] = {{dyld, "/RuntimeRoot/usr/lib/dyld_sim", 0}, {app, "/app/LiveSimBooter", 0}, {df, "/RuntimeRoot/bin/df", 0}};
+    dyld_image_info images[] = {{dyld, "/RuntimeRoot/usr/lib/dyld_sim", 0}, {app, "/app/LiveSimBooter", 0}, {df, "/RuntimeRoot/bin/df", 0}, {}};
     alignas(16) dyld_all_image_infos info = {};
     info.infoArray = images; info.infoArrayCount = 3; info.initialImageCount = 2; info.platform = PLATFORM_IOSSIMULATOR;
     info.dyldImageLoadAddress = dyld; info.dyldPath = images[0].imageFilePath; info.processDetachedFromSharedRegion = true;
@@ -143,7 +182,24 @@ int main(int argc, char **argv) {
     check(lsb::publishCompactImageInfo(nullptr) == EINVAL, "null metadata rejected");
     info.infoArrayCount = 1025; expectFailure(info, E2BIG); info.infoArrayCount = 3;
     info.infoArray = nullptr; expectFailure(info, EINVAL); info.infoArray = images;
-    info.sharedCacheBaseAddress = 0x180000000; expectFailure(info, ENOTSUP); info.sharedCacheBaseAddress = 0;
+    cachedFixture.header.magic = MH_MAGIC_64; cachedFixture.header.ncmds = 3; cachedFixture.header.flags = MH_DYLIB_IN_CACHE;
+    cachedFixture.header.sizeofcmds = sizeof(uuid_command) + 2 * sizeof(segment_command_64);
+    cachedFixture.uuid.cmd = LC_UUID; cachedFixture.uuid.cmdsize = sizeof(uuid_command);
+    cachedFixture.text.cmd = cachedFixture.data.cmd = LC_SEGMENT_64;
+    cachedFixture.text.cmdsize = cachedFixture.data.cmdsize = sizeof(segment_command_64);
+    std::strcpy(cachedFixture.text.segname, "__TEXT"); std::strcpy(cachedFixture.data.segname, "__DATA");
+    cachedFixture.text.vmaddr = 0x180022000; cachedFixture.text.fileoff = 0x22000;
+    cachedFixture.text.vmsize = cachedFixture.text.filesize = 0x2380; cachedFixture.text.initprot = 5;
+    cachedFixture.data.vmaddr = 0x1800a0128; cachedFixture.data.fileoff = 0xa0128;
+    cachedFixture.data.vmsize = cachedFixture.data.filesize = 0x178; cachedFixture.data.initprot = 3;
+    images[3] = {reinterpret_cast<const mach_header *>(&cachedFixture.header), "/usr/lib/libcache-test.dylib", 0};
+    info.infoArrayCount = 4; info.sharedCacheBaseAddress = 0x180010000; info.sharedCacheSlide = 0x10000; info.sharedCacheUUID[0] = 42;
+    check(lsb::publishCompactImageInfo(&info) == 0, "shared cache and packed Mach-O headers are supported");
+    checkCachedSnapshot(info);
+    check(info.sharedCacheBaseAddress == 0x180010000 && info.sharedCacheSlide == 0x10000 && info.sharedCacheUUID[0] == 42,
+          "snapshot leaves authoritative legacy cache metadata unchanged");
+    cachedFixture.header.flags = 0; expectFailure(info, EINVAL); cachedFixture.header.flags = MH_DYLIB_IN_CACHE;
+    info.infoArrayCount = 3; info.sharedCacheBaseAddress = info.sharedCacheSlide = 0; info.sharedCacheUUID[0] = 0;
     fixtures[1].header.magic = 0; expectFailure(info, ENOEXEC); fixtures[1].header.magic = MH_MAGIC_64;
     fixtures[1].uuid.cmdsize = 7; expectFailure(info, ENOEXEC); fixtures[1].uuid.cmdsize = sizeof(uuid_command);
     fixtures[1].header.ncmds = 4; expectFailure(info, ENOEXEC); fixtures[1].header.ncmds = 3;
