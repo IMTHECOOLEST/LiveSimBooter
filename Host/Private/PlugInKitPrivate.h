@@ -5,6 +5,14 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Verified by iOS 26/26.1 NSStringFromRBSLegacyFlags; AssertionServices preserves these low six bits.
+enum {
+    LSBProcessAssertionPreventTaskSuspend = 1u << 0,
+    LSBProcessAssertionPreventTaskThrottleDown = 1u << 1,
+    LSBProcessAssertionAllowIdleSleep = 1u << 2,
+    LSBProcessAssertionPreventThrottleDownUI = 1u << 5,
+};
+
 // iOS 26 PlugInKit's launch-only path, before PKHostPlugIn creates the child NSXPC Hub connection.
 @interface PKProcessAssertionProxy : NSObject
 @property (nonatomic, copy, nullable) void (^invalidationHandler)(void);

@@ -1,60 +1,68 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <ImageIO/ImageIO.h>
 #include "SimulatorDisplayGeometry.h"
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-static void LSBReleaseDisplayPixels(void *info, const void *data, size_t size) {
-    (void)info;
-    (void)size;
-    free((void *)data);
-}
+static const char *const LSBCaptureFilename = "LiveSimBooter-first-frame.png";
+static BOOL LSBDisplayCaptureEnabled(const char *value) { return value && !strcmp(value, "1"); }
 
-static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) CF_RETURNS_RETAINED;
-static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) {
-    *error = 0;
-    if (!surface) { *error = EINVAL; return NULL; }
-    if (IOSurfaceGetPixelFormat(surface) != 0x42475241 || IOSurfaceGetPlaneCount(surface) != 0 ||
-        IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetElementWidth(surface) != 1 || IOSurfaceGetElementHeight(surface) != 1) {
-        *error = ENOTSUP;
-        return NULL;
+// Encode only the immutable snapshot, never the producer's IOSurface. Production supplies the fixed native app tmp directory.
+static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
+    if (!image || !directory) return EINVAL;
+    CFMutableDataRef encoded = CFDataCreateMutable(kCFAllocatorDefault, 0);
+    if (!encoded) return ENOMEM;
+    CGImageDestinationRef destination = CGImageDestinationCreateWithData(encoded, CFSTR("public.png"), 1, NULL);
+    if (!destination) { CFRelease(encoded); return ENOMEM; }
+    CGImageDestinationAddImage(destination, image, NULL);
+    BOOL finished = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+    if (!finished) { CFRelease(encoded); return EIO; }
+    int folder = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (folder < 0) { int error = errno; CFRelease(encoded); return error; }
+    char temporary[96];
+    snprintf(temporary, sizeof(temporary), ".LiveSimBooter-first-frame.%08x%08x.png", arc4random(), arc4random());
+    int descriptor = openat(folder, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int error = descriptor < 0 ? errno : 0;
+    if (!error) {
+        const UInt8 *bytes = CFDataGetBytePtr(encoded);
+        size_t remaining = (size_t)CFDataGetLength(encoded);
+        while (remaining) {
+            ssize_t written = write(descriptor, bytes, remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) { error = written < 0 ? errno : EIO; break; }
+            bytes += written;
+            remaining -= (size_t)written;
+        }
+        if (close(descriptor) && !error) error = errno;
+        // Atomic replacement also replaces a stale destination symlink rather than writing through it.
+        if (!error && renameat(folder, temporary, folder, LSBCaptureFilename)) error = errno;
+        if (error) unlinkat(folder, temporary, 0);
     }
-    size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface), stride = IOSurfaceGetBytesPerRow(surface);
-    size_t rowBytes, copyBytes;
-    *error = LSBDisplayBGRALayout(width, height, stride, IOSurfaceGetAllocSize(surface), &rowBytes, &copyBytes);
-    if (*error) return NULL;
-    uint8_t *pixels = malloc(copyBytes);
-    if (!pixels) { *error = ENOMEM; return NULL; }
-    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL)) { free(pixels); *error = EIO; return NULL; }
-    const uint8_t *source = IOSurfaceGetBaseAddress(surface);
-    if (source) {
-        for (size_t row = 0; row < height; ++row) memcpy(pixels + row * rowBytes, source + row * stride, rowBytes);
-    } else *error = EINVAL;
-    if (IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL)) *error = EIO;
-    if (*error) { free(pixels); return NULL; }
-    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, pixels, copyBytes, LSBReleaseDisplayPixels);
-    if (!provider) { free(pixels); *error = ENOMEM; return NULL; }
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGImageRef image = colorSpace ? CGImageCreate(width, height, 8, 32, rowBytes, colorSpace,
-        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst, provider, NULL, false, kCGRenderingIntentDefault) : NULL;
-    if (colorSpace) CGColorSpaceRelease(colorSpace);
-    CGDataProviderRelease(provider);
-    if (!image) *error = ENOMEM;
-    return image;
+    close(folder);
+    CFRelease(encoded);
+    return error;
 }
 
-// The portable tests exercise the actual IOSurface snapshot code above without linking UIKit on macOS.
+// The portable tests exercise geometry and diagnostic PNG publication without linking UIKit on macOS.
 #ifndef LSB_SIMULATOR_DISPLAY_CORE_ONLY
 #import "SimulatorDisplayView.h"
 #import "IndigoHIDServer.h"
+#import "MetalDisplayRenderer.h"
 
 @interface LSBSimulatorDisplayView () {
-    UIImageView *_imageView;
+    CAMetalLayer *_displayLayer;
+    LSBMetalDisplayRenderer *_renderer;
+    int _rendererError;
     NSMapTable<UITouch *, NSNumber *> *_touches;
     CGSize _pixelSize;
     CGRect _viewport;
-    uint64_t _nextTouchIdentifier;
-    BOOL _applicationActive;
+    uint64_t _nextTouchIdentifier, _presentationGeneration;
+    BOOL _applicationActive, _captureFirstFrame, _captureAttempted;
 }
 @end
 
@@ -76,16 +84,29 @@ static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) {
     self.opaque = YES;
     self.clipsToBounds = YES;
     self.multipleTouchEnabled = YES;
-    _imageView = [[UIImageView alloc] initWithFrame:CGRectZero];
-    _imageView.userInteractionEnabled = NO;
-    [self addSubview:_imageView];
     _touches = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
                                     valueOptions:NSPointerFunctionsStrongMemory];
     _applicationActive = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    _captureFirstFrame = LSBDisplayCaptureEnabled(getenv("LSB_FRAMEBUFFER_CAPTURE_FIRST"));
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserver:self selector:@selector(applicationInactive:) name:UIApplicationWillResignActiveNotification object:nil];
     [center addObserver:self selector:@selector(applicationInactive:) name:UIApplicationDidEnterBackgroundNotification object:nil];
     [center addObserver:self selector:@selector(applicationActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
+}
+
+- (int)prepareRenderer {
+    if (_renderer) return 0;
+    if (_rendererError) return _rendererError;
+    CAMetalLayer *layer = [CAMetalLayer layer];
+    LSBMetalDisplayRenderer *renderer = [[LSBMetalDisplayRenderer alloc] initWithLayer:layer error:&_rendererError];
+    if (!renderer) {
+        fprintf(stderr, "[framebuffer] Metal presenter initialization failed: %s\n", strerror(_rendererError));
+        return _rendererError ?: ENODEV;
+    }
+    _displayLayer = layer;
+    _renderer = renderer;
+    [self.layer addSublayer:layer];
+    return 0;
 }
 
 - (void)dealloc {
@@ -105,29 +126,75 @@ static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) {
     _indigoServer = indigoServer;
 }
 
-- (int)presentSurface:(IOSurfaceRef)surface {
-    if (!NSThread.isMainThread) return EPERM;
-    if (!surface) {
-        [self cancelActiveTouches];
-        _imageView.image = nil;
-        _pixelSize = CGSizeZero;
-        [self setNeedsLayout];
-        [self layoutIfNeeded];
-        return 0;
-    }
-    int error;
-    CGImageRef image = LSBCopySurfaceImage(surface, &error);
-    if (!image) return error;
-    UIImage *snapshot = [UIImage imageWithCGImage:image scale:1 orientation:UIImageOrientationUp];
-    CGSize size = CGSizeMake(CGImageGetWidth(image), CGImageGetHeight(image));
-    CGImageRelease(image);
-    if (!snapshot) return ENOMEM;
-    if (!CGSizeEqualToSize(size, _pixelSize)) [self cancelActiveTouches];
-    _pixelSize = size;
-    _imageView.image = snapshot;
+- (void)resetPresentation {
+    NSAssert(NSThread.isMainThread, @"Simulator display must be used on the main thread");
+    ++_presentationGeneration;
+    [self cancelActiveTouches];
+    [_renderer reset];
+    // GPU completion is not display completion. Retire the layer as well as its composition baseline between sessions.
+    [_displayLayer removeFromSuperlayer];
+    _displayLayer = nil;
+    _renderer = nil;
+    _rendererError = 0;
+    _pixelSize = CGSizeZero;
     [self setNeedsLayout];
     [self layoutIfNeeded];
-    return 0;
+}
+
+- (void)captureFirstFrameWithRenderer:(LSBMetalDisplayRenderer *)renderer surfaceID:(uint32_t)surfaceID {
+    if (!_captureFirstFrame || _captureAttempted) return;
+    _captureAttempted = YES; // Only this explicitly enabled diagnostic reads pixels back to the CPU.
+    NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp"];
+    [renderer copyImageWithCompletion:^(CGImageRef image, int error) {
+        if (!image) {
+            fprintf(stderr, "[framebuffer] first-frame Metal readback failed: %s\n", strerror(error));
+            return;
+        }
+        CGImageRef captured = CGImageRetain(image);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                int captureError = LSBCaptureDisplayImage(captured, directory.fileSystemRepresentation);
+                fprintf(stderr, "[framebuffer] first-frame PNG surface=%u size=%zux%zu error=%d path=%s/%s\n", surfaceID,
+                    CGImageGetWidth(captured), CGImageGetHeight(captured), captureError, directory.fileSystemRepresentation, LSBCaptureFilename);
+                CGImageRelease(captured);
+            }
+        });
+    }];
+}
+
+- (void)presentSurface:(IOSurfaceRef)surface dirtyRect:(CGRect)dirtyRect completion:(void (^)(int))completion {
+    if (!NSThread.isMainThread) { completion(EPERM); return; }
+    int error = [self prepareRenderer];
+    if (error) { completion(error); return; }
+    LSBMetalDisplayRenderer *renderer = _renderer;
+    uint64_t generation = _presentationGeneration;
+    uint32_t surfaceID = surface ? IOSurfaceGetID(surface) : 0;
+    // Only geometry changes run here. Drawable acquisition, GPU completion, and optional readback happen off the UI thread.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _displayLayer.frame = surface ? LSBDisplayViewport(self.bounds, CGSizeMake(IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface))) : _viewport;
+    [CATransaction commit];
+    __weak LSBSimulatorDisplayView *weakSelf = self;
+    [renderer presentSurface:surface dirtyRect:dirtyRect completion:^(int presentError) {
+        LSBSimulatorDisplayView *view = weakSelf;
+        if (!view || generation != view->_presentationGeneration || renderer != view->_renderer) { completion(ECANCELED); return; }
+        if (!presentError) {
+            CGSize size = renderer.pixelSize;
+            if (!CGSizeEqualToSize(size, view->_pixelSize)) [view cancelActiveTouches];
+            view->_pixelSize = size;
+            [view setNeedsLayout];
+            [view layoutIfNeeded];
+            [view captureFirstFrameWithRenderer:renderer surfaceID:surfaceID];
+        } else {
+            if (!renderer.hasFrame) {
+                [view cancelActiveTouches];
+                view->_pixelSize = CGSizeZero;
+            }
+            [view setNeedsLayout];
+            [view layoutIfNeeded]; // Restore the previous viewport after a rejected size or rectangle.
+        }
+        completion(presentError);
+    }];
 }
 
 - (void)layoutSubviews {
@@ -135,7 +202,10 @@ static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) {
     CGRect viewport = LSBDisplayViewport(self.bounds, _pixelSize);
     if (!CGRectEqualToRect(viewport, _viewport)) [self cancelActiveTouches];
     _viewport = viewport;
-    _imageView.frame = viewport;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _displayLayer.frame = viewport;
+    [CATransaction commit];
 }
 
 - (void)willMoveToWindow:(UIWindow *)window {
@@ -181,7 +251,7 @@ static CGImageRef LSBCopySurfaceImage(IOSurfaceRef surface, int *error) {
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)event;
-    if (!_indigoServer || !_imageView.image || !_applicationActive || !self.window || self.hidden || !self.userInteractionEnabled) return;
+    if (!_indigoServer || !_renderer.hasFrame || !_applicationActive || !self.window || self.hidden || !self.userInteractionEnabled) return;
     [self layoutIfNeeded];
     for (UITouch *touch in touches) {
         if (touch.view != self || [_touches objectForKey:touch] || _touches.count == 16) continue;

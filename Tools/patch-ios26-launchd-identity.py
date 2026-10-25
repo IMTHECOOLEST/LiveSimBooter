@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch only 23A343 arm64 launchd_sim's four audit-PID owner reads.
+"""Patch only 23A343 arm64 launchd_sim's six audit-PID owner reads.
 
 Creates a new executable and manifest without signing or modifying the source. The output MUST be
 signed again: its old signature is retained only as an allocation/template for codesign --force.
@@ -26,13 +26,15 @@ SIGNATURE_COMMAND = 0xBE0
 LINKEDIT_COMMAND = 0xA00
 CHAIN_TAIL, CHAIN_TAIL_WORD = 0x59070, 0x5D218
 GOT_SLOT = 0x5BFF8
-CAVE_BEGIN, CAVE_END, VENEER_STRIDE = 0x51C00, 0x52500, 0x200
-SYMBOL_OFFSET = CAVE_BEGIN + 4 * VENEER_STRIDE
+CAVE_BEGIN, CAVE_END, VENEER_STRIDE = 0x51C00, 0x52900, 0x200
 SYMBOL = b'LSBLaunchdResolveAuditPID\0'
 FRAME_SIZE = 0x320
 # Offset, exact original LDR, token register (None means original SP), destination W register.
 SITES = ((0x236B0, 0xB9401421, 1, 1), (0x2E658, 0xB9401681, 20, 1),
-         (0x2E6B8, 0xB9401688, 20, 8), (0x1BC08, 0xB94017E0, None, 0))
+         (0x2E6B8, 0xB9401688, 20, 8), (0x1BC08, 0xB94017E0, None, 0),
+         (0x1DB98, 0xB9401429, 1, 9),  # Routine 718: XPC service dictionary owner comparison.
+         (0x2D130, 0xB9401440, 2, 0))  # Requestor domain: choose the managed job's domain before its existing fallback.
+SYMBOL_OFFSET = CAVE_BEGIN + len(SITES) * VENEER_STRIDE
 
 
 def require(condition, message):
@@ -150,6 +152,7 @@ def build_veneer(index, external_labels=False):
 
 
 def cave_bytes():
+    require(SYMBOL_OFFSET + len(SYMBOL) <= CAVE_END, 'Veneers and resolver name exceed verified padding')
     result = bytearray(CAVE_END - CAVE_BEGIN)
     for index in range(len(SITES)):
         code, _ = build_veneer(index)

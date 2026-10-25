@@ -2,6 +2,8 @@
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
 #include "ChildStatus.h"
+#include "NativeProbeLoader.h"
+#include "../NativeMetal/Backend.h"
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -69,6 +71,66 @@ static int resolveExecutable(char output[PATH_MAX]) {
     return 0;
 }
 
+static int runNativeProbe(int error) {
+    LSBNativeProbe probe = {0};
+    char detail[1024] = {0};
+    mach_port_t broker = MACH_PORT_NULL;
+    int portError = LSBTransportCopyBrokerPort(&broker);
+    if (!error) error = portError;
+    if (!error) error = LSBNativeProbePrepare(&probe, detail, sizeof(detail));
+    // Native framework initialization may create workers. This role keeps the native cache and never performs a simulator handoff.
+    int readyError = MACH_PORT_VALID(broker) ? LSBTransportReadyOnPort(broker, launch.requestID, error) :
+        LSBTransportReady(launch.requestID, error);
+    if (MACH_PORT_VALID(broker)) mach_port_deallocate(mach_task_self(), broker);
+    closeStatus();
+    if (error || readyError) {
+        fprintf(stderr, "[LiveProcess] Native probe preparation failed: %s %s\n", strerror(error ? error : readyError), detail);
+        return 1;
+    }
+    fprintf(stderr, "[LiveProcess] pid=%d native Metal probe folder=%s; host cache retained\n", getpid(), probe.folder);
+    fflush(stderr);
+    error = LSBNativeProbeRun(&probe);
+    fprintf(stderr, "[LiveProcess] Native Metal probe result=%d (%s)\n", error, strerror(error));
+    fflush(stderr);
+    return error ? 1 : 0;
+}
+
+static int runNativeMetalService(int error, int planApplied) {
+    LSBNativeProbe backend = {0};
+    char detail[1024] = {0};
+    mach_port_t broker = MACH_PORT_NULL, registration = MACH_PORT_NULL;
+    int portError = LSBTransportCopyBrokerPort(&broker);
+    if (!error) error = portError;
+    if (!error) error = LSBNativeProbePrepare(&backend, detail, sizeof(detail));
+    LSBMetalServicePrepare prepare = NULL;
+    LSBMetalServiceRun run = NULL;
+    if (!error) {
+        prepare = (LSBMetalServicePrepare)dlsym(backend.handle, "LSBMetalNativeServicePrepare");
+        run = (LSBMetalServiceRun)dlsym(backend.handle, "LSBMetalNativeServiceRun");
+        Dl_info expected = {0}, prepareImage = {0}, runImage = {0};
+        if (!prepare || !run || !dladdr((void *)backend.entry, &expected) || !dladdr((void *)prepare, &prepareImage) ||
+            !dladdr((void *)run, &runImage) || expected.dli_fbase != prepareImage.dli_fbase || expected.dli_fbase != runImage.dli_fbase)
+            error = ENOEXEC;
+    }
+    // fd3 is installed only by the broker's fixed native-service plan, never selected by a guest argument or environment.
+    if (!error) error = prepare(backend.folder, 3, &registration);
+    if (planApplied) close(3);
+    if (error && MACH_PORT_VALID(registration)) { mach_port_deallocate(mach_task_self(), registration); registration = MACH_PORT_NULL; }
+    int readyError = MACH_PORT_VALID(broker) ? LSBTransportReadyNativeServiceOnPort(broker, launch.requestID, error, registration) :
+        LSBTransportReady(launch.requestID, error ? error : EIO);
+    if (MACH_PORT_VALID(registration)) mach_port_deallocate(mach_task_self(), registration);
+    if (MACH_PORT_VALID(broker)) mach_port_deallocate(mach_task_self(), broker);
+    closeStatus();
+    if (error || readyError) {
+        fprintf(stderr, "[LiveProcess] Native Metal service preparation failed: %s %s\n", strerror(error ? error : readyError), detail);
+        return 1;
+    }
+    fprintf(stderr, "[LiveProcess] pid=%d native Metal service ready; host cache retained\n", getpid());
+    fflush(stderr);
+    run();
+    return 1; // The service owns the process until the broker terminates it.
+}
+
 int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char *apple[]) {
     (void)argc; (void)argv; (void)envp;
     // Cancel launchd's extension-alive timer through its C API before any broker retry.
@@ -86,7 +148,11 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     if (error) { fprintf(stderr, "[LiveProcess] Check-in failed: %s\n", strerror(error)); return 1; }
     error = prepareStatus();
     if (!error) error = LSBApplySpawnPlanPreservingFD(&launch.plan, received, launch.wakeFD);
+    int planApplied = !error;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) if (received[i] >= 0) { close(received[i]); received[i] = -1; }
+    // Only the authenticated broker bootstrap can select this role; no environment value or executable path is consulted.
+    if (launch.executionRole == LSB_EXECUTION_NATIVE_METAL_PROBE) return runNativeProbe(error);
+    if (launch.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE) return runNativeMetalService(error, planApplied);
     char executablePath[PATH_MAX], dyldPath[PATH_MAX], insertLibrary[PATH_MAX + 32], brokerEnvironment[64], detail[1024] = {0};
     char statusEnvironment[64], wakeEnvironment[64];
     char guestPIDEnvironment[48], parentPIDEnvironment[48];

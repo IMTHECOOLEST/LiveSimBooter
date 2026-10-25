@@ -10,7 +10,8 @@ controller and storyboards remain in `unused/`, outside the app target.
 
 `RuntimeRoot` lives inside App Group `group.com.kdt.LiveSimBooter`. On first launch, the broker moves an existing
 `Documents/RuntimeRoot` there if the destination does not exist. Both app and extension need matching App Group provisioning.
-The child contains no Objective-C imports; the native broker uses Foundation and UIKit. A simulator interposer
+The C child entry contains no Objective-C imports; the native broker uses Foundation and UIKit. A separately selected native
+Metal helper can load its bundled Objective-C backend while retaining the host cache. A simulator interposer
 forwards `posix_spawn`/`posix_spawnp` to the broker, including argv, environment, supported attributes and ordered FD actions.
 It also provides `wait`/`waitpid` over a shared child-status table and delivers `SIGCHLD` through the native host.
 Waiting accepts `WUNTRACED` and `WCONTINUED`, but reports terminal exits only; stopped/continued events and job control remain unsupported.
@@ -33,10 +34,29 @@ The opt-in `--launchd` mode starts an isolated, empty simulator launchd bootstra
 `--launchd-df` loads one df job through stock `xpcproxy_sim`. POSIX_SPAWN_SETEXEC prepares a replacement LiveProcess while keeping
 the child's guest PID stable for the parent's waitpid, kill and launchd exec/exit events. The old native instance is retired after preparation.
 See [launchd startup, its holding-tank handshake, and workqueue compatibility](docs/launchd.md) for the current experiment.
-`--launchd-lifecycle` exercises process EXIT delivery after waitpid and orphan adoption. `--launchd-backboardd` starts a
-single stock backboardd job. The expanded 545-image UIKit/backboardd cache runs df on the phone; backboardd currently reaches
-an IOHID service-ownership failure after exec replacement. Native Indigo input and a BGRA presentation view are prepared,
-while guest graphics-service integration remains unfinished. See [backboardd progress and cache measurements](docs/backboardd.md).
+`--launchd-lifecycle` exercises process EXIT delivery after waitpid and orphan adoption. `--launchd-backboardd` starts
+stock backboardd and cfprefsd jobs after an isolated native Metal helper. It enables the stock touch-visualization preference
+only in [the simulator's preferences](docs/cfprefsd.md). The expanded 545-image UIKit/backboardd cache
+runs df on the phone. Backboardd now passes IOHID service ownership and connects to native Indigo, framebuffer, and IOSurface
+endpoints. The host uses Apple's `IOSurfaceRemoteServer` and presents stock backboardd's 1290 × 2796 spinner and touch markers
+through a native Metal display layer. Dirty rectangles accumulate in a private GPU texture before copying into a three-drawable
+pool; drawable and GPU waits stay off the UI thread. Apple-logo/progress rendering and a complete simulator boot remain unverified.
+See [backboardd progress and cache measurements](docs/backboardd.md), [framebuffer transport](docs/framebuffer.md), and
+[the native IOSurface service](docs/iosurface.md).
+
+The native Metal backend uses matching simulator serializer/server libraries adapted through platform, dependency and
+export metadata, with their code sections unchanged. A phone probe running as the backboardd job compiled shader source
+through the stock guest compiler, created a pipeline, rendered a triangle, verified IOSurface pixels and wrote a PNG.
+The native helper requests the verified GPU assertion flag while ordinary guest launches retain their previous policy.
+After fixing Indigo digitizer creation and supplying the matching font/runtime assets, stock backboardd accepts physical touches
+and renders readable touch markers. The native Metal presenter sustained approximately 60 presentations per second on the
+iOS 26.1 phone, with source ownership retained until GPU reads complete. The framebuffer wire protocol uses named, layout-checked structs.
+The helper accepts one owner per session, receives
+a read-only authorization page at fd 3, and is revoked/terminated when that owner exits. `--native-metal-probe` separately
+checks native-device/deserializer construction.
+Build, sign and embed the three backend dylibs at the fixed `LiveProcess.appex/Frameworks/NativeMetal` path before using
+either mode; missing backend files fail preparation normally. See [Metal results and remaining boundary](docs/metal.md)
+and [backend preparation/package instructions](NativeMetal/README.md).
 
 Unmodified Fish 4.9.3 source, built for iOS Simulator, now runs noninteractive external commands through this runtime.
 On the iOS 26.1 phone it spawned and waited for two df children, then separately verified a Bash child exiting 37. Fish exited 0

@@ -15,12 +15,14 @@
 @property (nonatomic, strong) NSUUID *instanceIdentifier;
 @property (nonatomic, copy) NSString *bundleIdentifier;
 @property (nonatomic) uint64_t requestID;
+@property (nonatomic) uint32_t launchOptions;
 @property (nonatomic) LSBExtensionEvent event;
 @property (nonatomic) void *context;
 @property (nonatomic) pid_t pid;
 @property (nonatomic) BOOL active;
 @property (nonatomic) BOOL completed;
 @property (nonatomic) BOOL failed;
+@property (nonatomic) BOOL assertionInvalidated;
 @end
 
 @implementation LSBExtensionSession
@@ -60,7 +62,9 @@ int LSBSignalExtension(uint64_t requestID, int signal) {
     if (!pthread_main_np()) return EDEADLK;
     if (!requestID || signal < 0 || signal >= NSIG) return EINVAL;
     LSBExtensionSession *session = gSessions[@(requestID)];
-    if (!session.active || session.failed || !session.completed || session.pid <= 0 ||
+    // Assertion loss ends GPU execution authority, but must not remove our way to terminate that exact instance.
+    BOOL invalidatedGPUKill = signal == SIGKILL && (session.launchOptions & LSB_EXTENSION_LAUNCH_GPU) && session.assertionInvalidated;
+    if (!session.active || (session.failed && !invalidatedGPUKill) || !session.completed || session.pid <= 0 ||
         !session.instanceIdentifier || !session.bundleIdentifier.length) return ESRCH;
     uuid_t instance;
     [session.instanceIdentifier getUUIDBytes:instance];
@@ -110,19 +114,23 @@ static void LSBExtensionReady(LSBExtensionSession *session, NSError *error, NSAr
         return;
     }
     session.pid = pids[0].intValue;
-    // The same assertion parameters are used by PKHostPlugIn between its ready reply and its Hub handshake.
-    session.assertion = [session.plugin.external.runningboard processAssertionWithPID:session.pid flags:7 reason:9 name:@"com.apple.extension.session"];
+    // PKHostPlugIn uses flags 7 before its Hub handshake. RunningBoard raises gpuRole to 2 for PreventThrottleDownUI.
+    uint32_t flags = LSBProcessAssertionPreventTaskSuspend | LSBProcessAssertionPreventTaskThrottleDown | LSBProcessAssertionAllowIdleSleep;
+    if (session.launchOptions & LSB_EXTENSION_LAUNCH_GPU) flags |= LSBProcessAssertionPreventThrottleDownUI;
+    session.assertion = [session.plugin.external.runningboard processAssertionWithPID:session.pid flags:flags reason:9 name:@"com.apple.extension.session"];
     __weak LSBExtensionSession *weakSession = session;
     session.assertion.invalidationHandler = ^{
         LSBOnMainThread(^{
             LSBExtensionSession *current = weakSession;
             if (!current.active || current.failed) return;
+            current.assertionInvalidated = YES;
             NSLog(@"[LiveProcess] request %llu PID %d assertion invalidated", (unsigned long long)current.requestID, current.pid);
             LSBExtensionReport(current, 0, ECANCELED);
         });
     };
-    if (![session.assertion acquire]) {
-        NSLog(@"[LiveProcess] request %llu PID %d could not acquire extension assertion", (unsigned long long)session.requestID, session.pid);
+    BOOL acquired = [session.assertion acquire];
+    NSLog(@"[LiveProcess] request %llu PID %d assertion flags=0x%x acquired=%d", (unsigned long long)session.requestID, session.pid, flags, acquired);
+    if (!acquired) {
         LSBExtensionReport(session, 0, EACCES);
         return;
     }
@@ -131,8 +139,12 @@ static void LSBExtensionReady(LSBExtensionSession *session, NSError *error, NSAr
 }
 
 int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionEvent event, void *context) {
+    return LSBLaunchExtensionWithOptions(identifier, requestID, 0, event, context);
+}
+
+int LSBLaunchExtensionWithOptions(const char *identifier, uint64_t requestID, uint32_t options, LSBExtensionEvent event, void *context) {
     if (!pthread_main_np()) return EDEADLK;
-    if (!identifier || !identifier[0] || !event) return EINVAL;
+    if (!identifier || !identifier[0] || !event || (options & ~LSB_EXTENSION_LAUNCH_GPU)) return EINVAL;
     NSString *bundleIdentifier = [NSString stringWithUTF8String:identifier];
     if (!bundleIdentifier) return EINVAL;
     if (!gSessions) gSessions = [NSMutableDictionary dictionary];
@@ -154,6 +166,7 @@ int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionE
         session.instanceIdentifier = instanceIdentifier;
         session.bundleIdentifier = bundleIdentifier;
         session.requestID = requestID;
+        session.launchOptions = options;
         session.event = event;
         session.context = context;
         session.active = YES;

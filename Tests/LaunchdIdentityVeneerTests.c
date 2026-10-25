@@ -21,9 +21,9 @@ extern void LSBTestRunVeneer(unsigned index);
 extern void *LSBTestFakeDlsym(void *handle, const char *symbol);
 extern const char LSBTestSymbolName[];
 void *(*LSBTestDlsymPointer)(void *, const char *) = LSBTestFakeDlsym;
+static const unsigned destinations[] = {1, 1, 8, 0, 9, 0};
 
 static void verify(unsigned index, int available, int32_t result) {
-    static const unsigned destinations[] = {1, 1, 8, 0};
     memset(&LSBTestFixture, 0, sizeof(LSBTestFixture));
     struct Fixture *f = &LSBTestFixture;
     for (unsigned reg = 0; reg < 31; ++reg) f->before[reg] = UINT64_C(0x123456789abc0000) + reg * 0x101;
@@ -58,12 +58,12 @@ static void verify(unsigned index, int available, int32_t result) {
 }
 
 int main(void) {
-    for (unsigned index = 0; index < 4; ++index) {
+    for (unsigned index = 0; index < sizeof(destinations) / sizeof(destinations[0]); ++index) {
         verify(index, 1, 0x12345678);
         verify(index, 1, -1);
         verify(index, 1, 0);
         verify(index, 0, 0x12345678);
     }
-    puts("LaunchdIdentityVeneerTests passed (four sites, found/missing helper, all GPR/SIMD/flags/SP/LR)");
+    puts("LaunchdIdentityVeneerTests passed (six sites, found/missing helper, all GPR/SIMD/flags/SP/LR)");
     return 0;
 }

@@ -49,6 +49,26 @@ static bool signedValue(xpc_object_t dictionary, const char *key, int64_t *value
     return true;
 }
 
+static int decodeExecutionRole(xpc_object_t dictionary, uint32_t *role) {
+    *role = LSB_EXECUTION_SIMULATOR;
+    xpc_object_t versionObject = xpc_dictionary_get_value(dictionary, "bootstrap-version");
+    xpc_object_t roleObject = xpc_dictionary_get_value(dictionary, "execution-role");
+    // A legacy broker can only launch a simulator. Never infer native execution from a path or environment string.
+    if (!versionObject && !roleObject) return 0;
+    uint64_t version, value;
+    if (!unsignedValue(dictionary, "bootstrap-version", &version) || version != LSB_BOOTSTRAP_VERSION ||
+        !unsignedValue(dictionary, "execution-role", &value) || value > LSB_EXECUTION_NATIVE_METAL_SERVICE) return EPROTO;
+    *role = (uint32_t)value;
+    return 0;
+}
+
+static int validateRoleMetadata(uint32_t role, pid_t pid, pid_t guestPID, mach_port_t tank, const LSBSpawnPorts *ports) {
+    if (role > LSB_EXECUTION_NATIVE_METAL_SERVICE) return EINVAL;
+    if (role != LSB_EXECUTION_SIMULATOR &&
+        (pid != guestPID || tank != MACH_PORT_NULL || (ports && (ports->registeredPresent || ports->bootstrapPresent)))) return EINVAL;
+    return 0;
+}
+
 static void initializeFDs(int fds[LSB_MAX_FDS]) {
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) fds[i] = -1;
 }
@@ -319,6 +339,7 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         result->pid = pid;
         if (!error) error = remoteError;
         if (!error && (!result->requestID || pid <= 0)) error = EPROTO;
+        if (!error) error = decodeExecutionRole(reply, &result->executionRole);
         if (!error) {
             int64_t guestPID, parentPID;
             if (!signedValue(reply, "guest-pid", &guestPID) || guestPID <= 0 || guestPID > INT_MAX ||
@@ -346,6 +367,8 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
                 }
             }
         }
+        if (!error && validateRoleMetadata(result->executionRole, result->pid, result->guestPID,
+                                           result->launchdTankPort, &result->ports)) error = EPROTO;
     }
     if (reply) xpc_release(reply);
     if (error) {
@@ -360,10 +383,11 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
     return error;
 }
 
-int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int childError) {
-    if (!requestID || childError < 0) return EINVAL;
+static int readyOnPort(mach_port_t broker, uint64_t requestID, int childError, mach_port_t servicePort) {
+    if (!requestID || childError < 0 || (servicePort != MACH_PORT_NULL && (childError || !sendRight(servicePort)))) return EINVAL;
     xpc_object_t request = createRequest(LSB_REQUEST_READY, requestID, childError);
     if (!request) return ENOMEM;
+    if (servicePort != MACH_PORT_NULL) xpc_dictionary_set_mach_send(request, "native-service-port", servicePort);
     xpc_object_t reply = NULL;
     int error = callBrokerOnPort(broker, request, &reply);
     xpc_release(request);
@@ -377,6 +401,15 @@ int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int childErr
     }
     if (reply) xpc_release(reply);
     return error;
+}
+
+int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int childError) {
+    return readyOnPort(broker, requestID, childError, MACH_PORT_NULL);
+}
+
+int LSBTransportReadyNativeServiceOnPort(mach_port_t broker, uint64_t requestID, int childError, mach_port_t servicePort) {
+    if (!childError && !sendRight(servicePort)) return EINVAL;
+    return readyOnPort(broker, requestID, childError, servicePort);
 }
 
 int LSBTransportReady(uint64_t requestID, int childError) {
@@ -439,11 +472,13 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     message->object = NULL;
     closeFDs(message->fds);
     LSBSpawnPortsDispose(&message->ports);
+    if (MACH_PORT_VALID(message->nativeServicePort)) mach_port_deallocate(mach_task_self(), message->nativeServicePort);
+    message->nativeServicePort = MACH_PORT_NULL;
 }
 
 static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                           const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD,
-                          mach_port_t tankPort, const LSBSpawnPorts *ports, pid_t guestPID, pid_t parentPID) {
+                          mach_port_t tankPort, const LSBSpawnPorts *ports, pid_t guestPID, pid_t parentPID, uint32_t executionRole) {
     if (!message || !message->object || error < 0 || pid < 0) return EINVAL;
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     if (!reply) {
@@ -461,6 +496,7 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
     }
     if (!error && !encodingError && bootstrap) {
         encodingError = plan && pid > 0 && guestPID > 0 && parentPID >= 0 ? validateBootstrapFDs(statusFD, wakeFD) : EINVAL;
+        if (!encodingError) encodingError = validateRoleMetadata(executionRole, pid, guestPID, tankPort, ports);
         if (!encodingError) {
             xpc_object_t status = xpc_fd_create(statusFD), wake = xpc_fd_create(wakeFD);
             if (!status || !wake) encodingError = errno ? errno : EBADF;
@@ -476,6 +512,8 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
         if (!encodingError) {
             xpc_dictionary_set_int64(reply, "guest-pid", guestPID);
             xpc_dictionary_set_int64(reply, "parent-pid", parentPID);
+            xpc_dictionary_set_uint64(reply, "bootstrap-version", LSB_BOOTSTRAP_VERSION);
+            xpc_dictionary_set_uint64(reply, "execution-role", executionRole);
         }
     }
     if (encodingError) error = encodingError;
@@ -492,17 +530,19 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
 
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL, NULL, 0, 0);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL, NULL, 0, 0, LSB_EXECUTION_SIMULATOR);
 }
 
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL, NULL, pid, getpid());
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
+                          MACH_PORT_NULL, NULL, pid, getpid(), LSB_EXECUTION_SIMULATOR);
 }
 
 int LSBTransportReplyBootstrapWithPorts(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                         const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, const LSBSpawnPorts *ports) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL, ports, pid, getpid());
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
+                          MACH_PORT_NULL, ports, pid, getpid(), LSB_EXECUTION_SIMULATOR);
 }
 
 int LSBTransportReplyBootstrapWithMetadata(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
@@ -510,13 +550,14 @@ int LSBTransportReplyBootstrapWithMetadata(LSBReceivedMessage *message, int erro
                                            const LSBBootstrapMetadata *metadata) {
     if (!metadata || (metadata->launchdTankPort != MACH_PORT_NULL && !sendRight(metadata->launchdTankPort))) return EINVAL;
     return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
-                          metadata->launchdTankPort, metadata->ports, metadata->guestPID, metadata->parentPID);
+                          metadata->launchdTankPort, metadata->ports, metadata->guestPID, metadata->parentPID, metadata->executionRole);
 }
 
 int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, mach_port_t tankPort) {
     if (!MACH_PORT_VALID(tankPort)) return EINVAL;
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, tankPort, NULL, pid, getpid());
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
+                          tankPort, NULL, pid, getpid(), LSB_EXECUTION_SIMULATOR);
 }
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
@@ -541,6 +582,9 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     if (!error) {
         message->kind = (uint32_t)kind;
         message->error = (int)childError;
+        if (xpc_dictionary_get_value(request, "execution-role") || xpc_dictionary_get_value(request, "bootstrap-version")) error = EPROTO;
+    }
+    if (!error) {
         if (kind == LSB_REQUEST_READY) {
             if (!message->requestID || xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds") ||
                 xpc_dictionary_get_value(request, "registered-ports") || xpc_dictionary_get_value(request, "bootstrap-port")) error = EPROTO;
@@ -550,6 +594,14 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
             if (!error) error = decodePorts(request, &message->ports);
         } else if (xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds") ||
                    xpc_dictionary_get_value(request, "registered-ports") || xpc_dictionary_get_value(request, "bootstrap-port")) error = EPROTO;
+        xpc_object_t nativeEndpoint = xpc_dictionary_get_value(request, "native-service-port");
+        if (!error && nativeEndpoint) {
+            if (kind != LSB_REQUEST_READY || childError || xpc_get_type(nativeEndpoint) != &_xpc_type_mach_send) error = EPROTO;
+            else {
+                message->nativeServicePort = xpc_dictionary_copy_mach_send(request, "native-service-port");
+                if (!sendRight(message->nativeServicePort)) error = EPROTO;
+            }
+        }
         if (!error && kind == LSB_REQUEST_KILL) {
             int64_t target = 0, signal = 0;
             if (!signedValue(request, "target-pid", &target) || target < INT_MIN || target > INT_MAX ||

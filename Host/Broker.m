@@ -10,7 +10,10 @@
 #include "LaunchdProbe.h"
 #include "LaunchdConfiguration.h"
 #include "LaunchdEndpoint.h"
+#include "NativeMetalControl.h"
 #import "IndigoHIDServer.h"
+#import "FramebufferServer.h"
+#import "IOSurfaceServer.h"
 #import "TerminalSession.h"
 #include "FakePTY.h"
 #include <errno.h>
@@ -25,6 +28,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @interface LSBJob : NSObject
 @property uint64_t identifier;
 @property int phase;
+@property uint32_t executionRole;
 @property pid_t pid;
 @property pid_t guestPID;
 @property uint64_t replacesIdentifier, replacementIdentifier;
@@ -45,9 +49,17 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property LSBLaunchdHandshake *launchdHandshake;
 @property dispatch_source_t launchdSource;
 @property (nonatomic, strong) LSBIndigoHIDServer *indigo;
+@property (nonatomic, strong) LSBFramebufferServer *framebuffer;
+@property (nonatomic, strong) LSBIOSurfaceServer *iosurface;
 @property BOOL servicesPending;
 @property int servicesError;
 @property uint64_t indigoAuthorizedIdentifier;
+@property uint64_t framebufferAuthorizedIdentifier;
+@property uint64_t iosurfaceAuthorizedIdentifier;
+@property uint64_t nativeMetalServiceIdentifier, nativeMetalAuthorizedIdentifier;
+@property LSBNativeMetalControl *nativeMetalControl;
+@property mach_port_t nativeServicePort;
+@property BOOL finishing;
 @end
 @implementation LSBJob
 - (instancetype)init {
@@ -55,6 +67,8 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
     return self;
 }
 - (void)dealloc {
+    if (_nativeMetalControl) LSBNativeMetalControlUnmap(_nativeMetalControl);
+    if (MACH_PORT_VALID(_nativeServicePort)) mach_port_deallocate(mach_task_self(), _nativeServicePort);
     if (_launchdHandshake) { LSBLaunchdHandshakeDispose(_launchdHandshake); free(_launchdHandshake); }
     if (_childStatus) munmap(_childStatus, LSB_CHILD_STATUS_MAPPING_SIZE);
     if (_statusFD >= 0) close(_statusFD);
@@ -86,7 +100,9 @@ static LSBRetiredIdentity retiredIdentities[RetiredIdentityCapacity];
 static unsigned retiredIdentityCount, auditResolutionLogs;
 static BOOL retiredIdentitiesFull;
 NSString *const LSBHostIndigoDidChangeNotification = @"LSBHostIndigoDidChange";
+NSString *const LSBHostFramebufferDidChangeNotification = @"LSBHostFramebufferDidChange";
 static void startNextJob(void);
+static int signalJob(LSBJob *child, int signalNumber);
 
 LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
 int LSBHostUsesSimulatorDisplay(void) { return enableIndigo; }
@@ -94,10 +110,21 @@ LSBIndigoHIDServer *LSBHostIndigoHIDServer(void) {
     for (LSBJob *job in jobs) if (job.simulatorLaunchd && job.indigo) return job.indigo;
     return nil;
 }
+LSBFramebufferServer *LSBHostFramebufferServer(void) {
+    for (LSBJob *job in jobs) if (job.simulatorLaunchd && job.framebuffer) return job.framebuffer;
+    return nil;
+}
 
 static LSBJob *findJob(uint64_t identifier) {
     for (LSBJob *job in jobs) if (job.identifier == identifier) return job;
     return nil;
+}
+
+static BOOL isBackboardProgram(const LSBReceivedMessage *request) {
+    const char *program = request->plan.strings + request->plan.path;
+    if (!strcmp(program, "/usr/libexec/backboardd")) return YES;
+    NSString *path = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec/backboardd"];
+    return !strcmp(program, path.fileSystemRepresentation);
 }
 
 static void disposeMessage(LSBReceivedMessage *message) {
@@ -274,7 +301,8 @@ static int resolveAuditPID(const audit_token_t *audit, pid_t *result) {
 }
 
 static void finishJob(LSBJob *job, int error) {
-    if (!findJob(job.identifier)) return;
+    if (!findJob(job.identifier) || job.finishing) return;
+    job.finishing = YES;
     ++finishingDepth;
     fprintf(stderr, "[broker] request=%llu pid=%d finished error=%d\n", job.identifier, job.pid, error);
     // A timed-out launch can still start later. Never let that unbound child claim another request's plan.
@@ -290,9 +318,59 @@ static void finishJob(LSBJob *job, int error) {
     if (job.exitMonitor) { dispatch_source_cancel(job.exitMonitor); job.exitMonitor = nil; }
     if (job.launchdSource) { dispatch_source_cancel(job.launchdSource); job.launchdSource = nil; }
     if (job.indigo) [job.indigo close];
-    for (LSBJob *owner in jobs) if (owner.indigoAuthorizedIdentifier == job.identifier) {
-        [owner.indigo authorizeClientWithAuditToken:NULL];
-        owner.indigoAuthorizedIdentifier = 0;
+    BOOL framebufferChanged = job.framebuffer != nil;
+    if (job.framebuffer) [job.framebuffer close];
+    if (job.iosurface) [job.iosurface close];
+    // This helper belongs to the isolated launchd session, never to its simulated child ledger.
+    // Revoke before terminating either endpoint owner; a queued native request must stop authenticating immediately.
+    if (job.nativeMetalControl) {
+        int revokeError = LSBNativeMetalControlPublish(job.nativeMetalControl, NULL);
+        if (revokeError) fprintf(stderr, "[Metal] authorization revoke failed: %s\n", strerror(revokeError));
+        if (job.pid > 0) {
+            int stopError = signalJob(job, SIGKILL);
+            if (stopError && stopError != ESRCH) fprintf(stderr, "[Metal] helper termination failed: %s\n", strerror(stopError));
+        }
+        uint64_t authorized = job.nativeMetalAuthorizedIdentifier;
+        job.nativeMetalAuthorizedIdentifier = 0;
+        if (MACH_PORT_VALID(job.nativeServicePort)) {
+            mach_port_deallocate(mach_task_self(), job.nativeServicePort);
+            job.nativeServicePort = MACH_PORT_NULL;
+        }
+        for (LSBJob *dependent in [jobs copy]) if (dependent.nativeMetalServiceIdentifier == job.identifier) {
+            dependent.servicesPending = NO;
+            dependent.servicesError = error ? error : EPIPE;
+            if (dependent.phase != JobRunning) finishJob(dependent, dependent.servicesError);
+        }
+        LSBJob *owner = findJob(authorized);
+        if (owner && !owner.finishing) {
+            int stopError = signalJob(owner, SIGKILL);
+            if (stopError && stopError != ESRCH) fprintf(stderr, "[Metal] owner termination failed: %s\n", strerror(stopError));
+            finishJob(owner, EPIPE);
+        }
+    }
+    for (LSBJob *helper in [jobs copy]) {
+        if (helper.finishing || helper.executionRole != LSB_EXECUTION_NATIVE_METAL_SERVICE) continue;
+        if (helper.identifier != job.nativeMetalServiceIdentifier && helper.nativeMetalAuthorizedIdentifier != job.identifier) continue;
+        int revokeError = LSBNativeMetalControlPublish(helper.nativeMetalControl, NULL);
+        if (helper.nativeMetalAuthorizedIdentifier == job.identifier) helper.nativeMetalAuthorizedIdentifier = 0;
+        if (revokeError) fprintf(stderr, "[Metal] authorization revoke failed: %s\n", strerror(revokeError));
+        finishJob(helper, ECANCELED);
+    }
+    for (LSBJob *owner in jobs) {
+        if (owner.indigoAuthorizedIdentifier == job.identifier) {
+            [owner.indigo authorizeClientWithAuditToken:NULL];
+            owner.indigoAuthorizedIdentifier = 0;
+        }
+        if (owner.framebufferAuthorizedIdentifier == job.identifier) {
+            [owner.framebuffer authorizeClientWithAuditToken:NULL];
+            owner.framebufferAuthorizedIdentifier = 0;
+            framebufferChanged = YES;
+        }
+        if (owner.iosurfaceAuthorizedIdentifier == job.identifier) {
+            [owner.iosurface authorizeClientWithAuditToken:NULL];
+            owner.iosurfaceAuthorizedIdentifier = 0;
+            framebufferChanged = YES;
+        }
     }
     if (job.runningBoardMonitor) { LSBRunningBoardMonitorCancel(job.runningBoardMonitor); job.runningBoardMonitor = nil; }
     LSBJob *old = findJob(job.replacesIdentifier);
@@ -335,6 +413,7 @@ static void finishJob(LSBJob *job, int error) {
     retireAuditIdentity(job);
     if (startingJob == job) startingJob = nil;
     [jobs removeObject:job];
+    if (framebufferChanged) [NSNotificationCenter.defaultCenter postNotificationName:LSBHostFramebufferDidChangeNotification object:nil];
     retryAdoptions();
     BOOL terminalAlive = NO;
     for (LSBJob *remaining in jobs) if (remaining.terminalSession) terminalAlive = YES;
@@ -377,7 +456,19 @@ static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *cont
         job.extensionPID = pid;
         if (job.pid && job.pid != pid) { finishJob(job, EACCES); return; }
     }
-    if (error && job.phase != JobRunning) finishJob(job, error);
+    if (!error) return;
+    if (job.phase != JobRunning) { finishJob(job, error); return; }
+    if (job.executionRole == LSB_EXECUTION_SIMULATOR) return;
+    audit_token_t identity = job.audit;
+    // Process exit also invalidates assertions. Keep its monitor alive to report the actual exit, and never signal a reused PID.
+    if (LSBRunningBoardValidateIdentity(&identity) == ESRCH) return;
+    fprintf(stderr, "[Metal] native request=%llu lost its process assertion: %s\n", identifier, strerror(error));
+    // Service cleanup revokes its shared authorization before terminating. The construction probe has no shared control page.
+    if (!job.nativeMetalControl) {
+        int stopError = signalJob(job, SIGKILL);
+        if (stopError && stopError != ESRCH) fprintf(stderr, "[Metal] probe termination failed: %s\n", strerror(stopError));
+    }
+    finishJob(job, error);
 }
 
 static void startNextJob(void) {
@@ -388,15 +479,24 @@ static void startNextJob(void) {
     }
     for (LSBJob *job in jobs) {
         if (job.phase != JobQueued) continue;
+        if (job.nativeMetalServiceIdentifier) {
+            LSBJob *helper = findJob(job.nativeMetalServiceIdentifier);
+            if (!helper) { finishJob(job, EPIPE); return; }
+            if (helper.phase != JobRunning) continue;
+            if (!MACH_PORT_VALID(helper.nativeServicePort)) { finishJob(job, EPIPE); return; }
+        }
         LSBJob *old = findJob(job.replacesIdentifier);
         LSBJob *parent = findJob(old ? old.parentIdentifier : job.parentIdentifier);
-        // Let xpcproxy return READY so launchd can service the registration MIG before its SETEXEC replacement runs.
-        if (old && parent.servicesPending) continue;
-        if (old && parent.servicesError) { finishJob(job, parent.servicesError); return; }
+        // Let xpcproxy return READY so launchd can answer registration before SETEXEC or a direct backboardd launch.
+        BOOL needsServices = old || isBackboardProgram(job.request);
+        if (needsServices && parent.servicesPending) continue;
+        if (needsServices && parent.servicesError) { finishJob(job, parent.servicesError); return; }
         startingJob = job;
         job.phase = JobStarting;
         uint64_t identifier = job.identifier;
-        int error = LSBLaunchExtension(LSB_EXTENSION_IDENTIFIER, identifier, extensionEvent, NULL);
+        uint32_t launchOptions = job.executionRole == LSB_EXECUTION_NATIVE_METAL_PROBE || job.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE
+            ? LSB_EXTENSION_LAUNCH_GPU : 0;
+        int error = LSBLaunchExtensionWithOptions(LSB_EXTENSION_IDENTIFIER, identifier, launchOptions, extensionEvent, NULL);
         if (error) { job.phase = JobQueued; finishJob(job, error); return; }
         fprintf(stderr, "[broker] extension request=%llu submitted\n", identifier);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -407,18 +507,25 @@ static void startNextJob(void) {
     }
 }
 
-static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
+static LSBJob *enqueueJob(LSBReceivedMessage *message, LSBJob *parent, uint32_t executionRole) {
+    if (executionRole > LSB_EXECUTION_NATIVE_METAL_SERVICE) { replyError(message, EINVAL); return nil; }
+    // Only a locally constructed host request can select the native role. Guest RPCs never carry this authority.
+    if (executionRole != LSB_EXECUTION_SIMULATOR &&
+        (parent || message->object || message->ports.registeredPresent || message->ports.bootstrapPresent)) {
+        replyError(message, EACCES); return nil;
+    }
     retryAdoptions();
-    if (pendingAdoptions.count) { replyError(message, EAGAIN); return; }
-    if (launchLaneFailed) { replyError(message, EBUSY); return; }
-    if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
+    if (pendingAdoptions.count) { replyError(message, EAGAIN); return nil; }
+    if (launchLaneFailed) { replyError(message, EBUSY); return nil; }
+    if (jobs.count >= 16) { replyError(message, EAGAIN); return nil; }
     LSBJob *job = [LSBJob new];
+    job.executionRole = executionRole;
     int error = prepareChildStatus(job);
-    if (error) { replyError(message, error); return; }
+    if (error) { replyError(message, error); return nil; }
     if (parent) {
         LSBChildTicket ticket;
         error = LSBChildStatusReserve(parent.childStatus, &ticket);
-        if (error) { replyError(message, error); return; }
+        if (error) { replyError(message, error); return nil; }
         job.parentIdentifier = parent.identifier;
         job.parentTicket = ticket;
     }
@@ -431,13 +538,21 @@ static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
     job.request = message;
     [jobs addObject:job];
     startNextJob();
+    return findJob(job.identifier);
+}
+
+static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
+    enqueueJob(message, parent, LSB_EXECUTION_SIMULATOR);
 }
 
 static void enqueueExec(LSBReceivedMessage *message, LSBJob *old) {
     if (launchLaneFailed) { replyError(message, EBUSY); return; }
     if (old.replacementIdentifier || old.simulatorLaunchd) { replyError(message, ENOTSUP); return; }
-    // Authorizing a replacement drops the current Indigo event port and gestures. Token rollback cannot restore those capabilities.
-    for (LSBJob *owner in jobs) if (owner.indigoAuthorizedIdentifier == old.identifier) { replyError(message, ENOTSUP); return; }
+    // A graphics replacement would discard live event ports, surfaces and gestures; token rollback cannot restore those capabilities.
+    for (LSBJob *owner in jobs) if (owner.indigoAuthorizedIdentifier == old.identifier || owner.framebufferAuthorizedIdentifier == old.identifier ||
+                                  owner.iosurfaceAuthorizedIdentifier == old.identifier || owner.nativeMetalAuthorizedIdentifier == old.identifier) {
+        replyError(message, ENOTSUP); return;
+    }
     if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
     LSBJob *job = [LSBJob new];
     int error = inheritChildStatus(job, old);
@@ -493,13 +608,85 @@ static int signalTerminal(pid_t foreground, int signalNumber) {
     return found ? firstError : ESRCH;
 }
 
+static void registerDisplayServices(LSBJob *active, mach_port_t service) {
+    if (!active.servicesPending) return;
+    LSBJob *helper = findJob(active.nativeMetalServiceIdentifier);
+    mach_port_t metal = helper.nativeServicePort;
+    if (active.nativeMetalServiceIdentifier && (!helper || helper.phase != JobRunning || !MACH_PORT_VALID(metal))) {
+        active.servicesPending = NO;
+        active.servicesError = EPIPE;
+        startNextJob();
+        return;
+    }
+    kern_return_t copied = mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1);
+    if (copied) { active.servicesPending = NO; active.servicesError = EPIPE; startNextJob(); return; }
+    if (MACH_PORT_VALID(metal) && mach_port_mod_refs(mach_task_self(), metal, MACH_PORT_RIGHT_SEND, 1)) {
+        mach_port_deallocate(mach_task_self(), service);
+        active.servicesPending = NO;
+        active.servicesError = EPIPE;
+        startNextJob();
+        return;
+    }
+    audit_token_t expected = active.audit;
+    uint64_t identifier = active.identifier;
+    uint64_t helperIdentifier = helper.identifier;
+    LSBIndigoHIDServer *indigo = active.indigo;
+    LSBFramebufferServer *framebuffer = active.framebuffer;
+    LSBIOSurfaceServer *iosurface = active.iosurface;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        kern_return_t indigoStatus = -1, iosurfaceStatus = -1, framebufferStatus = -1, metalStatus = -1, backboardMetalStatus = -1;
+        int indigoError = indigo ? LSBLaunchdRegisterEndpoint(service, &expected, "IndigoHIDRegistrationPort",
+                                                             indigo.registrationPort, &indigoStatus) : 0;
+        int endpointError = indigoError, iosurfaceError = ECANCELED, framebufferError = ECANCELED;
+        if (!endpointError && iosurface) {
+            iosurfaceError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.IOSurface.Remote", iosurface.registrationPort, &iosurfaceStatus);
+            endpointError = iosurfaceError;
+        }
+        if (!endpointError && framebuffer) {
+            framebufferError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.CoreSimulator.SimFramebufferServer",
+                                                         framebuffer.registrationPort, &framebufferStatus);
+            endpointError = framebufferError;
+        }
+        int metalError = ECANCELED, backboardMetalError = ECANCELED;
+        if (!endpointError && MACH_PORT_VALID(metal)) {
+            metalError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.metal.simulator", metal, &metalStatus);
+            endpointError = metalError;
+        }
+        if (!endpointError && MACH_PORT_VALID(metal)) {
+            backboardMetalError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.metal.simulator.backboardd", metal, &backboardMetalStatus);
+            endpointError = backboardMetalError;
+        }
+        if (MACH_PORT_VALID(metal)) mach_port_deallocate(mach_task_self(), metal);
+        mach_port_deallocate(mach_task_self(), service);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LSBJob *current = findJob(identifier);
+            if (!current) return;
+            current.servicesPending = NO;
+            LSBJob *currentHelper = findJob(helperIdentifier);
+            // A delayed registration reply must not clear an error from helper death or authorize a replacement endpoint.
+            if (!current.servicesError) current.servicesError = helperIdentifier && (!currentHelper || currentHelper.phase != JobRunning) ? EPIPE : endpointError;
+            if (indigo) fprintf(stderr, "[Indigo] registration error=%d bootstrap=%d\n", indigoError, indigoStatus);
+            if (iosurface) fprintf(stderr, "[IOSurface] registration error=%d bootstrap=%d\n", iosurfaceError, iosurfaceStatus);
+            if (framebuffer) fprintf(stderr, "[framebuffer] registration error=%d bootstrap=%d\n", framebufferError, framebufferStatus);
+            if (helperIdentifier) fprintf(stderr, "[Metal] registration error=%d bootstrap=%d backboard-error=%d bootstrap=%d\n",
+                                          metalError, metalStatus, backboardMetalError, backboardMetalStatus);
+            startNextJob();
+        });
+    });
+}
+
 static int prepareLaunchdHandshake(LSBJob *job) {
     if (enableIndigo) {
         int error = 0;
         job.indigo = [[LSBIndigoHIDServer alloc] initWithError:&error];
         if (!job.indigo) return error ? error : ENOMEM;
+        job.framebuffer = [[LSBFramebufferServer alloc] initWithError:&error];
+        if (!job.framebuffer) return error ? error : ENOMEM;
+        job.iosurface = [[LSBIOSurfaceServer alloc] initWithError:&error];
+        if (!job.iosurface) return error ? error : ENOMEM;
         job.servicesPending = YES;
         [NSNotificationCenter.defaultCenter postNotificationName:LSBHostIndigoDidChangeNotification object:nil];
+        [NSNotificationCenter.defaultCenter postNotificationName:LSBHostFramebufferDidChangeNotification object:nil];
     }
     job.launchdHandshake = calloc(1, sizeof(*job.launchdHandshake));
     if (!job.launchdHandshake) return ENOMEM;
@@ -522,28 +709,7 @@ static int prepareLaunchdHandshake(LSBJob *job) {
                     LSBLaunchdHandshakeServicePort(active.launchdHandshake));
             const char *probe = getenv("LSB_LAUNCHD_HEALTHCHECK");
             mach_port_t service = LSBLaunchdHandshakeServicePort(active.launchdHandshake);
-            if (active.indigo && active.servicesPending) {
-                kern_return_t copied = mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1);
-                if (copied) { active.servicesPending = NO; active.servicesError = EPIPE; startNextJob(); }
-                else {
-                    audit_token_t expected = active.audit;
-                    LSBIndigoHIDServer *indigo = active.indigo;
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        kern_return_t status = -1;
-                        int endpointError = LSBLaunchdRegisterEndpoint(service, &expected, "IndigoHIDRegistrationPort",
-                                                                       indigo.registrationPort, &status);
-                        mach_port_deallocate(mach_task_self(), service);
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            LSBJob *current = findJob(identifier);
-                            if (!current) return;
-                            current.servicesPending = NO;
-                            current.servicesError = endpointError;
-                            fprintf(stderr, "[Indigo] registration error=%d bootstrap=%d\n", endpointError, status);
-                            startNextJob();
-                        });
-                    });
-                }
-            }
+            if (active.servicesPending) registerDisplayServices(active, service);
             if (probe && !strcmp(probe, "1") && !mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1)) {
                 audit_token_t expected = active.audit;
                 pid_t process = active.pid;
@@ -570,15 +736,15 @@ static void handleMessage(LSBReceivedMessage *message) {
     for (LSBJob *job in jobs) if (job.pid == pid && job.pidVersion == generation) { sender = job; break; }
     switch (message->kind) {
         case LSB_REQUEST_SPAWN:
-            if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
+            if (!sender || sender.phase != JobRunning || sender.executionRole != LSB_EXECUTION_SIMULATOR) { replyError(message, EACCES); return; }
             enqueueSpawn(message, sender);
             return;
         case LSB_REQUEST_EXEC:
-            if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
+            if (!sender || sender.phase != JobRunning || sender.executionRole != LSB_EXECUTION_SIMULATOR) { replyError(message, EACCES); return; }
             enqueueExec(message, sender);
             return;
         case LSB_REQUEST_KILL: {
-            if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
+            if (!sender || sender.phase != JobRunning || sender.executionRole != LSB_EXECUTION_SIMULATOR) { replyError(message, EACCES); return; }
             int error = signalChild(sender, message->targetPID, message->signalNumber);
             LSBTransportReply(message, error, error ? 0 : message->targetPID, 0, NULL, NULL, NULL);
             disposeMessage(message);
@@ -657,17 +823,35 @@ static void handleMessage(LSBReceivedMessage *message) {
             }
             LSBJob *old = findJob(job.replacesIdentifier);
             LSBJob *parent = findJob(old ? old.parentIdentifier : job.parentIdentifier);
-            const char *program = job.request->plan.strings + job.request->plan.path;
-            NSString *backboardPath = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec/backboardd"];
-            if (parent.indigo && (!strcmp(program, "/usr/libexec/backboardd") || !strcmp(program, backboardPath.fileSystemRepresentation))) {
+            if (parent.nativeMetalServiceIdentifier && isBackboardProgram(job.request)) {
+                LSBJob *helper = findJob(parent.nativeMetalServiceIdentifier);
                 audit_token_t backboardIdentity = job.audit;
-                [parent.indigo authorizeClientWithAuditToken:&backboardIdentity];
-                parent.indigoAuthorizedIdentifier = job.identifier;
+                error = !helper || helper.phase != JobRunning || !MACH_PORT_VALID(helper.nativeServicePort) ? EPIPE :
+                    helper.nativeMetalAuthorizedIdentifier ? EBUSY : LSBNativeMetalControlPublish(helper.nativeMetalControl, &backboardIdentity);
+                if (error) { replyError(message, error); finishJob(job, error); return; }
+                helper.nativeMetalAuthorizedIdentifier = job.identifier;
+                fprintf(stderr, "[Metal] authorized backboard native=%d version=%u helper=%d\n", pid, generation, helper.pid);
+            }
+            if ((parent.indigo || parent.framebuffer || parent.iosurface) && isBackboardProgram(job.request)) {
+                audit_token_t backboardIdentity = job.audit;
+                if (parent.indigo) {
+                    [parent.indigo authorizeClientWithAuditToken:&backboardIdentity];
+                    parent.indigoAuthorizedIdentifier = job.identifier;
+                }
+                if (parent.framebuffer) {
+                    [parent.framebuffer authorizeClientWithAuditToken:&backboardIdentity];
+                    parent.framebufferAuthorizedIdentifier = job.identifier;
+                    [NSNotificationCenter.defaultCenter postNotificationName:LSBHostFramebufferDidChangeNotification object:nil];
+                }
+                if (parent.iosurface) {
+                    [parent.iosurface authorizeClientWithAuditToken:&backboardIdentity];
+                    parent.iosurfaceAuthorizedIdentifier = job.identifier;
+                }
             }
             LSBChildStatusSetParentPID(job.childStatus, parent ? parent.guestPID : old ? LSBChildStatusGetParentPID(old.childStatus) : getpid());
             LSBBootstrapMetadata metadata = { .guestPID = job.guestPID, .parentPID = LSBChildStatusGetParentPID(job.childStatus),
                 .launchdTankPort = job.simulatorLaunchd ? LSBLaunchdHandshakeTankPort(job.launchdHandshake) : MACH_PORT_NULL,
-                .ports = &job.request->ports };
+                .ports = &job.request->ports, .executionRole = job.executionRole };
             error = LSBTransportReplyBootstrapWithMetadata(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
                 &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD, &metadata);
             disposeMessage(message);
@@ -685,6 +869,20 @@ static void handleMessage(LSBReceivedMessage *message) {
                 replyError(message, ESRCH); return;
             }
             int error = message->error;
+            audit_token_t expectedAudit = sender.audit;
+            BOOL nativeService = sender.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE;
+            if (nativeService && memcmp(&message->audit, &expectedAudit, sizeof(expectedAudit))) { replyError(message, EACCES); return; }
+            if (MACH_PORT_VALID(message->nativeServicePort) && (!nativeService || error)) error = EPROTO;
+            if (!error && nativeService && !MACH_PORT_VALID(message->nativeServicePort)) error = EPROTO;
+            if (!error && nativeService) {
+                mach_port_type_t type = 0;
+                if (mach_port_type(mach_task_self(), message->nativeServicePort, &type) || !(type & MACH_PORT_TYPE_SEND)) error = EPIPE;
+            }
+            if (!error && nativeService) {
+                // Receive owns one send reference. Move it into the helper before disposing READY and advancing the launch lane.
+                sender.nativeServicePort = message->nativeServicePort;
+                message->nativeServicePort = MACH_PORT_NULL;
+            }
             LSBJob *parent = findJob(sender.parentIdentifier);
             LSBJob *old = findJob(sender.replacesIdentifier);
             LSBChildExecUpdate execution = {0};
@@ -788,9 +986,23 @@ static int prepareRuntimeRoot(void) {
     return 0;
 }
 
+static int initialExecutionRole(int argc, const char *argv[], uint32_t *role) {
+    if (!role || argc < 1 || !argv || !argv[0]) return EINVAL;
+    *role = LSB_EXECUTION_SIMULATOR;
+    if (argc > 1 && !strcmp(argv[1], "--native-metal-probe")) {
+        if (argc != 2) return EINVAL;
+        *role = LSB_EXECUTION_NATIVE_METAL_PROBE;
+    }
+    return 0;
+}
+
 static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[], const char *envp[]) {
     LSBSpawnPlan *plan = &message->plan;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
+    uint32_t executionRole;
+    int roleError = initialExecutionRole(argc, argv, &executionRole);
+    if (roleError) return roleError;
+    BOOL nativeProbe = executionRole == LSB_EXECUTION_NATIVE_METAL_PROBE;
     if (argc > 1 && !strcmp(argv[1], "--launchd"))
         return argc == 2 ? LSBPrepareLaunchdPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     if (argc > 1 && !strcmp(argv[1], "--launchd-df"))
@@ -804,17 +1016,18 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     plan->version = LSB_PLAN_VERSION;
     const char *defaultArgs[] = {"/bin/fish", "-i", "-N", "-P", "-C",
         "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end", NULL};
+    const char *nativeArgs[] = { "/__LiveSimBooterNativeMetalProbe", NULL };
     BOOL terminal = argc == 1 || (argc > 1 && !strcmp(argv[1], "--terminal"));
     int firstArgument = terminal && argc > 1 ? 2 : 1;
-    const char *const *arguments = argc > firstArgument ? argv + firstArgument : defaultArgs;
-    int count = argc > firstArgument ? argc - firstArgument : 6;
+    const char *const *arguments = nativeProbe ? nativeArgs : argc > firstArgument ? argv + firstArgument : defaultArgs;
+    int count = nativeProbe ? 1 : argc > firstArgument ? argc - firstArgument : 6;
     int error = LSBPlanAddString(plan, arguments[0], &plan->path);
     if (!error) error = LSBPlanAddString(plan, runtimeRoot.fileSystemRepresentation, &plan->cwd);
     for (int i = 0; !error && i < count; ++i) {
         if (plan->argc == LSB_MAX_VECTOR) return E2BIG;
         error = LSBPlanAddString(plan, arguments[i], &plan->argv[plan->argc++]);
     }
-    for (const char **item = envp; !error && item && *item; ++item) {
+    for (const char **item = nativeProbe ? NULL : envp; !error && item && *item; ++item) {
         if (terminal && (!strncmp(*item, "TERM=", 5) || !strncmp(*item, "PATH=", 5) || !strncmp(*item, "HOME=", 5) ||
                          !strncmp(*item, LSB_FAKE_PTY_ENV "=", sizeof(LSB_FAKE_PTY_ENV)))) continue;
         if (plan->envc == LSB_MAX_VECTOR) return E2BIG;
@@ -850,6 +1063,44 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     return error ? error : LSBValidateSpawnPlan(plan);
 }
 
+static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole) {
+    if (!enableIndigo) { enqueueJob(initial, nil, executionRole); return 0; }
+    // Only the host's --launchd-backboardd plan can provision a native service. Neither the plan pathname nor guest environment selects it.
+    const char *arguments[] = { "LiveSimBooter", "--native-metal-probe", NULL };
+    LSBReceivedMessage *request = calloc(1, sizeof(*request));
+    if (!request) { disposeMessage(initial); return ENOMEM; }
+    LSBNativeMetalControl *control = NULL;
+    int readOnlyFD = -1;
+    int error = initialPlan(request, 2, arguments, NULL);
+    if (!error) error = LSBPlanAddString(&request->plan, "/__LiveSimBooterNativeMetalService", &request->plan.path);
+    request->plan.argv[0] = request->plan.path;
+    if (!error) error = LSBNativeMetalControlCreate(runtimeRoot.stringByDeletingLastPathComponent.fileSystemRepresentation, &control, &readOnlyFD);
+    if (!error) {
+        unsigned index = request->plan.fdCount++;
+        request->plan.fds[index] = (LSBInheritedFD){3, 0};
+        request->fds[index] = readOnlyFD;
+        error = LSBValidateSpawnPlan(&request->plan);
+    }
+    if (error) {
+        LSBNativeMetalControlUnmap(control);
+        disposeMessage(request);
+        disposeMessage(initial);
+        return error;
+    }
+    // Install the dependency before either extension is submitted, including synchronous launch-error paths.
+    ++finishingDepth;
+    LSBJob *helper = enqueueJob(request, nil, LSB_EXECUTION_NATIVE_METAL_SERVICE);
+    if (helper) helper.nativeMetalControl = control;
+    else LSBNativeMetalControlUnmap(control);
+    LSBJob *launchd = helper ? enqueueJob(initial, nil, executionRole) : nil;
+    if (!helper) disposeMessage(initial);
+    if (launchd) launchd.nativeMetalServiceIdentifier = helper.identifier;
+    else if (helper) finishJob(helper, ECANCELED);
+    --finishingDepth;
+    startNextJob();
+    return launchd ? 0 : EIO;
+}
+
 int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
     @autoreleasepool {
         if (![NSThread isMainThread]) return EPERM;
@@ -859,7 +1110,9 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
         if (error) { fprintf(stderr, "[broker] Startup failed: %s\n", strerror(error)); return error; }
         LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
         if (!initial) return ENOMEM;
+        uint32_t executionRole = LSB_EXECUTION_SIMULATOR;
         error = initialPlan(initial, argc, argv, envp);
+        if (!error) error = initialExecutionRole(argc, argv, &executionRole);
         if (error) { disposeMessage(initial); fprintf(stderr, "[broker] Invalid initial plan: %s\n", strerror(error)); return error; }
         mach_port_t service = MACH_PORT_NULL;
         kern_return_t status = bootstrap_check_in(bootstrap_port, LSB_BROKER_SERVICE, &service);
@@ -889,7 +1142,8 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
                 dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { handleMessage(message); } });
             }
         });
-        enqueueSpawn(initial, nil);
-        return 0;
+        error = enqueueInitialJob(initial, executionRole);
+        if (error) fprintf(stderr, "[broker] Initial service setup failed: %s\n", strerror(error));
+        return error;
     }
 }

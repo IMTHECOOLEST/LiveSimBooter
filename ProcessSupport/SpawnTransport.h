@@ -7,12 +7,17 @@
 
 #define LSB_BROKER_PORT_ENV "LSB_BROKER_PORT"
 
+// Bootstrap-only metadata; ordinary guest spawn/exec transport stays at its existing wire version.
+#define LSB_BOOTSTRAP_VERSION 1
+enum LSBExecutionRole { LSB_EXECUTION_SIMULATOR = 0, LSB_EXECUTION_NATIVE_METAL_PROBE = 1, LSB_EXECUTION_NATIVE_METAL_SERVICE = 2 };
+
 enum LSBRequestKind {
     LSB_REQUEST_SPAWN = 1, LSB_REQUEST_CHECKIN = 2, LSB_REQUEST_READY = 3, LSB_REQUEST_KILL = 4, LSB_REQUEST_EXEC = 5,
     LSB_REQUEST_RESOLVE_AUDIT_PID = 6
 };
 typedef struct {
     uint64_t requestID;
+    uint32_t executionRole;
     int32_t error, pid, guestPID, parentPID;
     int statusFD, wakeFD;
     mach_port_t launchdTankPort;
@@ -26,6 +31,7 @@ typedef struct {
     pid_t guestPID, parentPID;
     mach_port_t launchdTankPort;
     const LSBSpawnPorts *ports;
+    uint32_t executionRole; // Chosen by the native broker, never supplied by a guest spawn plan.
 } LSBBootstrapMetadata;
 
 typedef struct {
@@ -37,6 +43,7 @@ typedef struct {
     pid_t targetPID;
     int signalNumber;
     audit_token_t targetAudit;
+    mach_port_t nativeServicePort; // Owned send reference, allowed only on a native service READY request.
     LSBSpawnPlan plan;
     int fds[LSB_MAX_FDS];
     LSBSpawnPorts ports;
@@ -57,6 +64,8 @@ int LSBTransportSpawnWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_F
 int LSBTransportExecWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports);
 int LSBTransportCheckIn(LSBBootstrapReply *reply, int fds[LSB_MAX_FDS]);
 int LSBTransportReady(uint64_t requestID, int error);
+// Native service only: success publishes one listener send right; caller retains its reference. Failure carries no endpoint.
+int LSBTransportReadyNativeServiceOnPort(mach_port_t broker, uint64_t requestID, int error, mach_port_t servicePort);
 // Uses a borrowed held broker send right, even after native bootstrap/registered ports have been replaced. Caller retains ownership.
 int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int error);
 // Exact positive PID of a running broker-managed child. Signal 0 validates identity without sending a signal.

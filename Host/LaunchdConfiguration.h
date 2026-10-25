@@ -11,7 +11,7 @@ int LSBPrepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRoot, 
 // The executable path is absolute inside RuntimeRoot; this does not provide a chroot or load any runtime LaunchDaemons.
 int LSBPrepareLaunchdDFPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]);
 
-// One-shot stock backboardd probe, preserving its MachServices but omitting unsupported native policy attributes.
+// Stock backboardd plus the simulator cfprefsd daemon, preserving their MachServices but omitting unsupported native policy attributes.
 int LSBPrepareLaunchdBackboardPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]);
 // Process-event and orphan-adoption regression job under simulator launchd.
 int LSBPrepareLaunchdLifecyclePlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]);

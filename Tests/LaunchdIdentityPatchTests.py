@@ -107,6 +107,16 @@ class EncodingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 PATCH.branch(0, target)
 
+    def test_veneer_slots_and_symbol_do_not_overlap(self):
+        cave = PATCH.cave_bytes()
+        self.assertEqual(len(cave), PATCH.CAVE_END - PATCH.CAVE_BEGIN)
+        for index in range(len(PATCH.SITES)):
+            code, _ = PATCH.build_veneer(index)
+            begin = index * PATCH.VENEER_STRIDE
+            self.assertEqual(cave[begin:begin + len(code)], code)
+            self.assertLessEqual(PATCH.CAVE_BEGIN + begin + len(code), PATCH.SYMBOL_OFFSET)
+        self.assertEqual(cave[PATCH.SYMBOL_OFFSET - PATCH.CAVE_BEGIN:].rstrip(b'\0'), PATCH.SYMBOL.rstrip(b'\0'))
+
 
 class PinnedBinaryTests(unittest.TestCase):
     @classmethod
@@ -126,6 +136,30 @@ class PinnedBinaryTests(unittest.TestCase):
         old_imports, new_imports = imports(self.original), imports(self.patched)
         self.assertEqual(new_imports[:-1], old_imports)
         self.assertEqual(new_imports[-1], (1, 0, b'_dlsym'))
+
+    def test_xpc_service_dictionary_owner_check_preserved(self):
+        self.assertEqual(PATCH.SITES[4], (0x1DB98, 0xB9401429, 1, 9))
+        # Preserve the stable job PID load and comparison; translate only its authenticated caller operand.
+        self.assertEqual(struct.unpack_from('<3I', self.original, 0x1DB94), (0xB943A008, 0xB9401429, 0x6B09011F))
+        self.assertEqual(self.patched[0x1DB94:0x1DB98], self.original[0x1DB94:0x1DB98])
+        self.assertEqual(self.patched[0x1DB9C:0x1DBA4], self.original[0x1DB9C:0x1DBA4])
+        # The original routine-718 dispatch still selects the handler whose owner check is patched.
+        self.assertEqual(0x17804 + 4 * self.original[0x3F25E + 18], 0x179F4)
+        self.assertEqual(self.patched[0x3F25E:0x3F278], self.original[0x3F25E:0x3F278])
+
+    def test_requestor_domain_uses_managed_job_without_changing_native_pid_domains(self):
+        self.assertEqual(PATCH.SITES[5], (0x2D130, 0xB9401440, 2, 0))
+        # Keep the full token saved in x19 for the existing user-domain fallback; translate only managed-job lookup input.
+        self.assertEqual(struct.unpack_from('<2I', self.original, 0x2D12C), (0xAA0203F3, 0xB9401440))
+        call = struct.unpack_from('<I', self.original, 0x2D134)[0]
+        self.assertEqual(call >> 26, 0b100101)
+        self.assertEqual(decode_branch(call, 0x2D134), 0x17F84)
+        self.assertEqual(struct.unpack_from('<I', self.original, 0x2D13C)[0], 0xF9407C00)  # job->domain
+        self.assertEqual(struct.unpack_from('<I', self.original, 0x2D14C)[0], 0xB9400E61)  # original token rgid
+        self.assertEqual(self.patched[0x2D0E8:0x2D130], self.original[0x2D0E8:0x2D130])
+        self.assertEqual(self.patched[0x2D134:0x2D164], self.original[0x2D134:0x2D164])
+        # The separate PID-domain creation path still compares the requested native PID against the original audit PID.
+        self.assertEqual(self.patched[0x2D2E0:0x2D338], self.original[0x2D2E0:0x2D338])
 
     def test_signature_moved_metadata_bounded_and_idempotent(self):
         old_start, old_size = PATCH.inspect_header(self.original)
@@ -158,7 +192,7 @@ class PinnedBinaryTests(unittest.TestCase):
                     PATCH.patched_bytes(changed)
 
     def test_reject_partial_or_tampered_patch(self):
-        for offset in (PATCH.SITES[1][0], PATCH.CAVE_BEGIN + 72, PATCH.SYMBOL_OFFSET, PATCH.GOT_SLOT,
+        for offset in (PATCH.SITES[1][0], PATCH.SITES[4][0], PATCH.SITES[5][0], PATCH.CAVE_BEGIN + 72, PATCH.SYMBOL_OFFSET, PATCH.GOT_SLOT,
                        PATCH.CHAIN_TAIL, PATCH.ORIGINAL_SIGNATURE + 200, 0x4321, PATCH.FIXUPS_COMMAND + 8):
             with self.subTest(offset=hex(offset)):
                 changed = bytearray(self.patched)

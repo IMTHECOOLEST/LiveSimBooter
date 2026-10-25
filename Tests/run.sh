@@ -76,6 +76,17 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutableAccessTests.c -o "$test_directory/ExecutableAccess"
 "$test_directory/ExecutableAccess"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/MetalCompilerRegistrationTests.c -o "$test_directory/MetalCompilerRegistration"
+"$test_directory/MetalCompilerRegistration"
+xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Werror -arch arm64 \
+    Tests/FrameworkBundleCompatibilityTests.m -framework Foundation -framework QuartzCore -o "$test_directory/FrameworkBundleCompatibility"
+"$test_directory/FrameworkBundleCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Guest/FrameworkBundleCompatibility.c -framework CoreFoundation -o "$test_directory/libFrameworkBundleCompatibility.dylib"
+xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Werror -arch arm64 -DLSB_FRAMEWORK_BUNDLE_INTERPOSE_TESTING \
+    Tests/FrameworkBundleCompatibilityTests.m -framework Foundation -framework QuartzCore -o "$test_directory/FrameworkBundleCompatibilityInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libFrameworkBundleCompatibility.dylib" "$test_directory/FrameworkBundleCompatibilityInterpose"
 python3 -B Tests/PatchIOSPlatformTests.py
 python3 -B Tests/LaunchdIdentityPatchTests.py
 python3 -B Tests/LaunchdIdentityVeneerTests.py
@@ -103,6 +114,31 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdCompatibilityTests.c -o "$test_directory/LaunchdCompatibility"
 "$test_directory/LaunchdCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SystemPowerCompatibilityTests.c -framework IOKit -framework CoreFoundation -o "$test_directory/SystemPowerCompatibility"
+"$test_directory/SystemPowerCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Guest/SystemPowerCompatibility.c -framework IOKit -install_name "$test_directory/libSystemPowerCompatibility.dylib" \
+    -o "$test_directory/libSystemPowerCompatibility.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_SYSTEM_POWER_INTERPOSE_TESTING \
+    Tests/SystemPowerCompatibilityTests.c -framework IOKit -framework CoreFoundation -o "$test_directory/SystemPowerCompatibilityInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libSystemPowerCompatibility.dylib" "$test_directory/SystemPowerCompatibilityInterpose"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/BootstrapRoleTests.c ProcessSupport/SpawnPlan.c -o "$test_directory/BootstrapRole"
+"$test_directory/BootstrapRole"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/NativeServiceTransportTests.c ProcessSupport/SpawnPlan.c -o "$test_directory/NativeServiceTransport"
+"$test_directory/NativeServiceTransport"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/NativeMetalControlTests.c ProcessSupport/NativeMetalControl.c -o "$test_directory/NativeMetalControl"
+"$test_directory/NativeMetalControl"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Tests/NativeProbeFixture.c -o "$test_directory/NativeProbeFixture.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib -DLSB_NATIVE_PROBE_MISSING_ENTRY \
+    Tests/NativeProbeFixture.c -o "$test_directory/NativeProbeMissingEntry.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/NativeProbeLoaderTests.c LiveProcess/NativeProbeLoader.c -o "$test_directory/NativeProbeLoader"
+"$test_directory/NativeProbeLoader" "$test_directory/NativeProbeFixture.dylib" "$test_directory/NativeProbeMissingEntry.dylib"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
@@ -121,18 +157,31 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WI
 DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/BrokerTests.m Host/TerminalSession.m Host/LaunchdConfiguration.m ProcessSupport/LaunchdHandshake.c ProcessSupport/LaunchdProbe.c \
-    Host/IndigoHIDServer.m ProcessSupport/LaunchdEndpoint.c ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
-    -framework Foundation -o "$test_directory/Broker"
+    Host/IndigoHIDServer.m Host/FramebufferServer.m Host/IOSurfaceServer.m ProcessSupport/LaunchdEndpoint.c \
+    ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c ProcessSupport/NativeMetalControl.c \
+    -framework Foundation -framework IOSurface -o "$test_directory/Broker"
 "$test_directory/Broker"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/IndigoHIDServerTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoHIDServer"
 "$test_directory/IndigoHIDServer"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/FramebufferServerTests.m Host/FramebufferServer.m -framework Foundation -framework IOSurface -framework CoreGraphics \
+    -o "$test_directory/FramebufferServer"
+"$test_directory/FramebufferServer"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/IOSurfaceServerTests.m -framework Foundation -framework IOSurface -o "$test_directory/IOSurfaceServer"
+"$test_directory/IOSurfaceServer"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdEndpointTests.c ProcessSupport/LaunchdEndpoint.c -o "$test_directory/LaunchdEndpoint"
 "$test_directory/LaunchdEndpoint"
 xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 Tests/SimulatorDisplayTests.m \
-    -framework Foundation -framework CoreGraphics -framework IOSurface -o "$test_directory/SimulatorDisplay"
+    -framework Foundation -framework CoreGraphics -framework IOSurface -framework ImageIO -o "$test_directory/SimulatorDisplay"
 "$test_directory/SimulatorDisplay"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/MetalDisplayRendererTests.m Host/MetalDisplayRenderer.m \
+    -framework Foundation -framework QuartzCore -framework CoreGraphics -framework IOSurface -framework Metal \
+    -o "$test_directory/MetalDisplayRenderer"
+"$test_directory/MetalDisplayRenderer"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/LaunchdConfigurationTests.m Host/LaunchdConfiguration.m ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/LaunchdConfiguration"

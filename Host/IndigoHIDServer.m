@@ -7,19 +7,24 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { TouchCapacity = 16, IndigoDigitizer = 11, DigitizerRange = 1, DigitizerTouch = 2, DigitizerPosition = 4, DigitizerCancel = 128 };
+enum { TouchCapacity = 16, IndigoDigitizer = 11, IndigoBuiltinTouch = 50, IndigoDynamicTouch = 0x40000001,
+       DigitizerRange = 1, DigitizerTouch = 2, DigitizerPosition = 4, DigitizerCancel = 128 };
 
-// Indigo's packed payload has a 144-byte stride. Offset 28 in the message is the number of payloads, including the parent.
-// Verified against SimulatorHID's _IOHIDEventFromIndigoHIDData and its Mach receive loop, not native IOHIDEvent memory layout.
+// SimulatorHID 1171.7's Indigo wire format: target at 76, parent index at 144, timestamp flags at 145.
+// The receiver reads timestamp flags even for legacy strides; always include the modern 148-byte payload.
+// These are wire payloads, not native IOHIDEvent structures. Message byte 28 counts payloads, including the parent.
 #pragma pack(push, 4)
 typedef struct {
     uint32_t type;
     uint64_t timestamp;
     uint32_t flags, index, identity, mask;
     double x, y, z, pressure, twist;
-    uint32_t range, touch, options, collection, transducerType;
+    uint32_t range, touch, target, collection, transducerType;
     double quality, density, irregularity, minorRadius, majorRadius;
     uint32_t other[4];
+    int8_t parentIndex;
+    uint8_t timestampFlags;
+    uint16_t reserved;
 } IndigoPayload;
 typedef struct {
     mach_msg_header_t header;
@@ -27,10 +32,29 @@ typedef struct {
     uint8_t count, padding[3];
     IndigoPayload payloads[TouchCapacity + 1];
 } IndigoTouches;
+typedef struct {
+    mach_msg_header_t header;
+    uint32_t stride;
+    uint8_t count, padding[3];
+    uint32_t type;
+    uint64_t timestamp;
+    uint32_t flags, command, reserved[3], target;
+    uint8_t builtIn;
+    char displayUID[64];
+    uint8_t unused[43];
+    int8_t parentIndex;
+    uint8_t timestampFlags;
+    uint16_t tail;
+} IndigoCreateDigitizer;
 #pragma pack(pop)
-_Static_assert(sizeof(IndigoPayload) == 144 && offsetof(IndigoPayload, x) == 28 && offsetof(IndigoPayload, transducerType) == 84,
+_Static_assert(sizeof(IndigoPayload) == 148 && offsetof(IndigoPayload, x) == 28 && offsetof(IndigoPayload, transducerType) == 84 &&
+               offsetof(IndigoPayload, target) == 76 && offsetof(IndigoPayload, parentIndex) == 144 &&
+               offsetof(IndigoPayload, timestampFlags) == 145,
                "Indigo digitizer payload layout");
 _Static_assert(offsetof(IndigoTouches, payloads) == 32, "Indigo message payload offset");
+_Static_assert(sizeof(IndigoCreateDigitizer) == 32 + sizeof(IndigoPayload) && offsetof(IndigoCreateDigitizer, command) == 48 &&
+               offsetof(IndigoCreateDigitizer, target) == 64 && offsetof(IndigoCreateDigitizer, builtIn) == 68 &&
+               offsetof(IndigoCreateDigitizer, displayUID) == 69, "Indigo create-digitizer command layout");
 
 typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool active; } Touch;
 
@@ -39,7 +63,7 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
     dispatch_source_t _source;
     mach_port_t _registration, _eventPort;
     audit_token_t _expectedAudit;
-    BOOL _authorized, _closed;
+    BOOL _authorized, _closed, _digitizerReady;
     BOOL _cancelPending;
     uint64_t _cancelGeneration;
     pid_t _clientPID;
@@ -48,6 +72,8 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
 }
 - (void)drainRegistrations;
 - (void)dropClient;
+- (int)sendMessage:(mach_msg_header_t *)message size:(mach_msg_size_t)size;
+- (int)ensureDigitizer;
 - (int)sendTouches:(const Touch *)touches changed:(unsigned)changed phase:(LSBIndigoTouchPhase)phase cancellingAll:(BOOL)cancelAll;
 - (void)scheduleCancellationRetry:(uint64_t)generation;
 - (void)retryCancellation:(uint64_t)generation;
@@ -107,6 +133,7 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
     if (MACH_PORT_VALID(_eventPort)) mach_port_deallocate(mach_task_self(), _eventPort);
     _eventPort = MACH_PORT_NULL;
     _clientPID = 0;
+    _digitizerReady = NO;
     _cancelPending = NO;
     ++_cancelGeneration;
     memset(_touches, 0, sizeof(_touches));
@@ -151,15 +178,47 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
                 header->msgh_remote_port = MACH_PORT_NULL;
                 _clientPID = (pid_t)trailer.msgh_audit.val[5];
                 fprintf(stderr, "[indigo] guest event port registered native=%d\n", _clientPID);
+                int error = [self ensureDigitizer];
+                if (error && error != EAGAIN) [self dropClient];
             }
         }
         mach_msg_destroy(header);
     }
 }
 
+- (int)sendMessage:(mach_msg_header_t *)message size:(mach_msg_size_t)size {
+    if (_closed) return EBADF;
+    if (!MACH_PORT_VALID(_eventPort)) return ENOTCONN;
+    *message = (mach_msg_header_t){.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
+        .msgh_size = size, .msgh_remote_port = _eventPort};
+    mach_msg_return_t result = mach_msg(message, MACH_SEND_MSG | MACH_SEND_TIMEOUT, size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    // A timed-out send copies its COPY_SEND destination back as a new send uref; release only that returned copy.
+    if (result && MACH_MSGH_BITS_REMOTE(message->msgh_bits) == MACH_MSG_TYPE_PORT_SEND) mach_msg_destroy(message);
+    if (result == MACH_SEND_INVALID_DEST) { [self dropClient]; return EPIPE; }
+    return result == MACH_MSG_SUCCESS ? 0 : result == MACH_SEND_TIMED_OUT ? EAGAIN : EIO;
+}
+
+- (int)ensureDigitizer {
+    if (_digitizerReady) return 0;
+    // The stock receiver requires a dynamic target with bit 30 set. Built-in creation also installs its canonical alias 50.
+    // PurpleMain is the UID advertised by our framebuffer. FIFO delivery guarantees creation precedes every touch.
+    IndigoCreateDigitizer message = {.stride = sizeof(IndigoPayload), .count = 1, .type = 0x7fff0001,
+        .timestamp = mach_absolute_time(), .command = 1, .target = IndigoDynamicTouch, .builtIn = 1,
+        .displayUID = "PurpleMain", .parentIndex = -1};
+    int error = [self sendMessage:&message.header size:sizeof(message)];
+    if (!error) {
+        _digitizerReady = YES;
+        fprintf(stderr, "[indigo] built-in digitizer queued native=%d target=%u alias=%u display=PurpleMain\n",
+                _clientPID, IndigoDynamicTouch, IndigoBuiltinTouch);
+    }
+    return error;
+}
+
 - (int)sendTouches:(const Touch *)touches changed:(unsigned)changed phase:(LSBIndigoTouchPhase)phase cancellingAll:(BOOL)cancelAll {
     if (_closed) return EBADF;
     if (!MACH_PORT_VALID(_eventPort)) return ENOTCONN;
+    int error = [self ensureDigitizer];
+    if (error) return error; // A full queue must never allow a touch to overtake digitizer creation.
     IndigoTouches message = {.stride = sizeof(IndigoPayload), .count = 1};
     uint64_t timestamp = mach_absolute_time();
     unsigned mask = phase == LSBIndigoTouchMoved ? DigitizerPosition : DigitizerRange | DigitizerTouch;
@@ -171,17 +230,12 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
         active |= down;
         message.payloads[message.count++] = (IndigoPayload){.type = IndigoDigitizer, .timestamp = timestamp,
             .index = i + 1, .identity = touches[i].identity, .mask = i == changed || cancelAll ? mask : 0,
-            .x = touches[i].x, .y = touches[i].y, .pressure = down ? 1 : 0, .range = down, .touch = down, .transducerType = 2};
+            .x = touches[i].x, .y = touches[i].y, .pressure = down ? 1 : 0, .range = down, .touch = down,
+            .target = IndigoBuiltinTouch, .transducerType = 2, .parentIndex = 0};
     }
     message.payloads[0] = (IndigoPayload){.type = IndigoDigitizer, .timestamp = timestamp, .index = 0x00400002,
-        .mask = mask, .range = active, .touch = active, .collection = 1, .transducerType = 3};
-    message.header = (mach_msg_header_t){.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
-        .msgh_size = (mach_msg_size_t)(offsetof(IndigoTouches, payloads) + message.count * sizeof(IndigoPayload)), .msgh_remote_port = _eventPort};
-    mach_msg_return_t result = mach_msg(&message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, message.header.msgh_size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-    // A timed-out send copies its COPY_SEND destination back as a new send uref; release only that returned copy.
-    if (result && MACH_MSGH_BITS_REMOTE(message.header.msgh_bits) == MACH_MSG_TYPE_PORT_SEND) mach_msg_destroy(&message.header);
-    if (result == MACH_SEND_INVALID_DEST) { [self dropClient]; return EPIPE; }
-    return result == MACH_MSG_SUCCESS ? 0 : result == MACH_SEND_TIMED_OUT ? EAGAIN : EIO;
+        .mask = mask, .range = active, .touch = active, .target = IndigoBuiltinTouch, .collection = 1, .transducerType = 3, .parentIndex = -1};
+    return [self sendMessage:&message.header size:(mach_msg_size_t)(offsetof(IndigoTouches, payloads) + message.count * sizeof(IndigoPayload))];
 }
 
 - (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y {

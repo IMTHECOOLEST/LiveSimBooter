@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void initialize(LSBReceivedMessage *message) {
@@ -76,7 +77,9 @@ static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *da
     assert(!strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim"));
     assert(!strcmp(message->plan.strings + message->plan.argv[1], configPath.fileSystemRepresentation));
     assert(!strcmp(environmentValue(&message->plan, "LSB_DEBUG_STOP_BEFORE_HANDOFF"), "1"));
+    assert(!environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER"));
     NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    for (NSString *scope in @[@"Self", @"Child"]) assert(!bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
     assert([bootstrap[@"Paths"] isEqualToArray:@[jobDirectory]]);
     assert(!bootstrap[@"Child"][@"LSB_SIMULATOR_LAUNCHD"]);
     assert([[NSFileManager.defaultManager contentsOfDirectoryAtPath:jobDirectory error:NULL] isEqualToArray:@[@"com.kdt.LiveSimBooter.df.plist"]]);
@@ -153,6 +156,106 @@ static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *da
     dispose(message);
 }
 
+static void testBackboardPreferences(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
+    NSString *directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-BackboardDaemons"];
+    NSString *jobPath = [directory stringByAppendingPathComponent:@"com.apple.cfprefsd.xpc.daemon.plist"];
+    NSSet *expectedJobs = [NSSet setWithArray:@[@"com.apple.backboardd.plist", @"com.apple.cfprefsd.xpc.daemon.plist"]];
+    assert([[NSSet setWithArray:[NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL]] isEqual:expectedJobs]);
+    NSDictionary *job = readPlist(jobPath);
+    assert([job[@"Label"] isEqual:@"com.apple.cfprefsd.xpc.daemon"]);
+    assert(([job[@"ProgramArguments"] isEqual:@[@"/usr/sbin/cfprefsd", @"daemon"]]));
+    assert(([job[@"MachServices"] isEqual:@{@"com.apple.cfprefsd.daemon": @YES}]));
+    assert([job[@"RunAtLoad"] boolValue] && ![job[@"KeepAlive"] boolValue] && ![job[@"EnableTransactions"] boolValue]);
+    for (NSString *key in @[@"POSIXSpawnType", @"UserName", @"LimitLoadToSessionType", @"HardResourceLimits", @"SoftResourceLimits",
+                            @"EnvironmentVariables", @"EnablePressuredExit"]) assert(!job[key]);
+    assert([job[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/cfprefsd.log"]);
+    assert([job[@"StandardErrorPath"] isEqual:job[@"StandardOutPath"]]);
+    NSString *preferencesDirectory = [dataPath stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *preferencesPath = [preferencesDirectory stringByAppendingPathComponent:@"com.apple.backboardd.plist"];
+    NSString *logPath = [dataPath stringByAppendingPathComponent:@"Library/Logs/cfprefsd.log"];
+    struct stat status;
+    assert(!stat(preferencesDirectory.fileSystemRepresentation, &status) && S_ISDIR(status.st_mode) && (status.st_mode & 0777) == 0700);
+    assert(!stat(preferencesPath.fileSystemRepresentation, &status) && S_ISREG(status.st_mode) && (status.st_mode & 0777) == 0600);
+    assert(([readPlist(preferencesPath) isEqual:@{@"BKDigitizerVisualizeTouches": @YES}]));
+    assert(!stat(logPath.fileSystemRepresentation, &status) && S_ISREG(status.st_mode) && (status.st_mode & 0777) == 0600);
+    NSData *logContent = [@"existing cfprefsd output\n" dataUsingEncoding:NSUTF8StringEncoding];
+    assert([logContent writeToFile:logPath atomically:NO]);
+    NSDictionary *existing = @{@"BKDigitizerVisualizeTouches": @NO, @"KeepOtherSetting": @[@1, @"value", @{@"nested": @YES}]};
+    NSData *binary = [NSPropertyListSerialization dataWithPropertyList:existing format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+    assert([binary writeToFile:preferencesPath atomically:NO]);
+    assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    NSMutableDictionary *expected = existing.mutableCopy;
+    expected[@"BKDigitizerVisualizeTouches"] = @YES;
+    assert([readPlist(preferencesPath) isEqual:expected]);
+    assert([[NSData dataWithContentsOfFile:logPath] isEqual:logContent]);
+    NSData *preferences = [NSData dataWithContentsOfFile:preferencesPath];
+    assert(!stat(preferencesPath.fileSystemRepresentation, &status));
+    ino_t inode = status.st_ino;
+    assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    assert(!stat(preferencesPath.fileSystemRepresentation, &status) && status.st_ino == inode);
+    NSData *configuration = [NSData dataWithContentsOfFile:configPath];
+    for (id invalid in @[@[@"not a dictionary"], @"malformed plist"]) {
+        NSData *data = [invalid isKindOfClass:NSString.class] ? [invalid dataUsingEncoding:NSUTF8StringEncoding] :
+            [NSPropertyListSerialization dataWithPropertyList:invalid format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+        assert([data writeToFile:preferencesPath atomically:NO]);
+        assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EINVAL);
+        assertUnchanged(message);
+        assert([[NSData dataWithContentsOfFile:preferencesPath] isEqual:data]);
+        assert([[NSData dataWithContentsOfFile:configPath] isEqual:configuration]);
+    }
+    int fd = open(preferencesPath.fileSystemRepresentation, O_WRONLY);
+    assert(fd >= 0 && !ftruncate(fd, 1024 * 1024 + 1) && !close(fd));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EFBIG);
+    assertUnchanged(message);
+    assert(!unlink(preferencesPath.fileSystemRepresentation));
+    assert(!symlink(configPath.fileSystemRepresentation, preferencesPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(preferencesPath.fileSystemRepresentation));
+    assert(!link(configPath.fileSystemRepresentation, preferencesPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EINVAL);
+    assertUnchanged(message);
+    assert(!unlink(preferencesPath.fileSystemRepresentation) && !mkfifo(preferencesPath.fileSystemRepresentation, 0600));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EINVAL);
+    assertUnchanged(message);
+    assert(!unlink(preferencesPath.fileSystemRepresentation));
+    assert(!rmdir(preferencesDirectory.fileSystemRepresentation));
+    assert(!symlink(root.fileSystemRepresentation, preferencesDirectory.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) != 0);
+    assertUnchanged(message);
+    assert(!unlink(preferencesDirectory.fileSystemRepresentation) && !mkdir(preferencesDirectory.fileSystemRepresentation, 0700));
+    assert([preferences writeToFile:preferencesPath atomically:NO]);
+    NSString *unexpectedJob = [directory stringByAppendingPathComponent:@"com.apple.cfprefsd.xpc.daemon.system.plist"];
+    assert([@{} writeToFile:unexpectedJob atomically:YES]);
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EEXIST);
+    assertUnchanged(message);
+    assert(!unlink(unexpectedJob.fileSystemRepresentation));
+    assert(!unlink(jobPath.fileSystemRepresentation) && !symlink(configPath.fileSystemRepresentation, jobPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(jobPath.fileSystemRepresentation));
+    assert(!unlink(logPath.fileSystemRepresentation) && !symlink(configPath.fileSystemRepresentation, logPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(logPath.fileSystemRepresentation));
+    assert([[NSData dataWithContentsOfFile:configPath] isEqual:configuration]);
+    assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    // Other launch modes do not enable or alter this simulator preference.
+    assert([binary writeToFile:preferencesPath atomically:NO]);
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    assert([[NSData dataWithContentsOfFile:preferencesPath] isEqual:binary]);
+    assert(!LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    assert([[NSData dataWithContentsOfFile:preferencesPath] isEqual:binary]);
+    assert(!LSBPrepareLaunchdLifecyclePlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+    assert([[NSData dataWithContentsOfFile:preferencesPath] isEqual:binary]);
+}
+
 static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
     NSData *previous = [NSData dataWithContentsOfFile:configPath];
     assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ENOENT);
@@ -164,36 +267,90 @@ static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSSt
     NSDictionary *services = @{@"com.apple.CARenderServer": @{@"ResetAtClose": @YES}, @"com.apple.backboardd.virtualframebuffer": @YES};
     NSDictionary *stock = @{@"MachServices": services, @"KeepAlive": @YES, @"POSIXSpawnType": @"Interactive", @"UserName": @"root"};
     assert([stock writeToFile:stockPath atomically:YES]);
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ENOENT);
+    assertUnchanged(message);
+    assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:previous]);
+    NSString *preferencesStockPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.cfprefsd.xpc.daemon.plist"];
+    NSDictionary *preferencesStock = @{
+        @"Label": @"com.apple.cfprefsd.xpc.daemon", @"ProgramArguments": @[@"/usr/sbin/cfprefsd", @"daemon"],
+        @"MachServices": @{@"com.apple.cfprefsd.daemon": @YES}, @"POSIXSpawnType": @"Adaptive", @"EnableTransactions": @YES,
+        @"EnablePressuredExit": @NO, @"HardResourceLimits": @{@"NumberOfFiles": @512}, @"SoftResourceLimits": @{@"NumberOfFiles": @512}
+    };
+    for (NSString *key in @[@"Label", @"ProgramArguments", @"MachServices"]) {
+        NSMutableDictionary *invalid = preferencesStock.mutableCopy;
+        invalid[key] = @"unexpected";
+        assert([invalid writeToFile:preferencesStockPath atomically:YES]);
+        assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == EINVAL);
+        assertUnchanged(message);
+        assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:previous]);
+    }
+    assert([preferencesStock writeToFile:preferencesStockPath atomically:YES]);
     const char *inherited[] = {
         "SIMULATOR_FRAMEBUFFER_FRAMEWORK=/System/Library/PrivateFrameworks/SimFramebufferClient.framework/SimFramebufferClient",
-        "SIMULATOR_FRAMEBUFFER_FRAMEWORK=", "SIMULATOR_FRAMEBUFFER_FRAMEWORK_EXTRA=preserved", NULL
+        "SIMULATOR_FRAMEBUFFER_FRAMEWORK=", "SIMULATOR_FRAMEBUFFER_FRAMEWORK_EXTRA=preserved",
+        "SIMULATOR_MAINSCREEN_WIDTH=1", "SIMULATOR_MAINSCREEN_WIDTH=", "SIMULATOR_MAINSCREEN_HEIGHT=2", "SIMULATOR_MAINSCREEN_HEIGHT=3",
+        "SIMULATOR_MAINSCREEN_SCALE=99", "SIMULATOR_MAINSCREEN_SCALE=", "SIMULATOR_MAINSCREEN_PITCH=0", "SIMULATOR_MAINSCREEN_PITCH=7",
+        "SIMULATOR_MAINSCREEN_WIDTH_EXTRA=preserved", "LSB_SIMULATE_SYSTEM_POWER=0", "LSB_SIMULATE_SYSTEM_POWER=",
+        "LSB_SIMULATE_SYSTEM_POWER_EXTRA=preserved", NULL
+    };
+    NSDictionary<NSString *, NSString *> *screen = @{
+        @"SIMULATOR_MAINSCREEN_WIDTH": @"1290", @"SIMULATOR_MAINSCREEN_HEIGHT": @"2796",
+        @"SIMULATOR_MAINSCREEN_SCALE": @"3", @"SIMULATOR_MAINSCREEN_PITCH": @"460"
     };
     NSString *uncanonicalRoot = [root stringByAppendingString:@"/."];
     assert(!LSBPrepareLaunchdBackboardPlan(message, uncanonicalRoot.fileSystemRepresentation, inherited));
     NSString *provider = [root stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimFramebuffer.framework/SimFramebuffer"];
     assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"), provider.fileSystemRepresentation));
     assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK_EXTRA"), "preserved"));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_MAINSCREEN_WIDTH_EXTRA"), "preserved"));
+    assert(!strcmp(environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER"), "1"));
+    assert(!strcmp(environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER_EXTRA"), "preserved"));
     NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
-    for (NSString *scope in @[@"Self", @"Child"])
+    for (NSString *key in screen)
+        assert(!strcmp(environmentValue(&message->plan, key.UTF8String), screen[key].UTF8String));
+    for (NSString *scope in @[@"Self", @"Child"]) {
         assert([bootstrap[scope][@"SIMULATOR_FRAMEBUFFER_FRAMEWORK"] isEqualToString:provider]);
+        assert([bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"] isEqualToString:@"1"]);
+        for (NSString *key in screen) assert([bootstrap[scope][key] isEqualToString:screen[key]]);
+    }
     NSString *directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-BackboardDaemons"];
     NSDictionary *job = readPlist([directory stringByAppendingPathComponent:@"com.apple.backboardd.plist"]);
     assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqualToArray:@[directory]]);
     assert([job[@"Label"] isEqualToString:@"com.apple.backboardd"] && [job[@"MachServices"] isEqualToDictionary:services]);
     assert([job[@"ProgramArguments"] isEqualToArray:@[@"/usr/libexec/backboardd"]]);
+    assert(([job[@"EnvironmentVariables"] isEqualToDictionary:
+        @{@"LSB_REGISTER_METAL_COMPILER": @"1", @"LSB_SIMULATE_FRAMEWORK_BUNDLES": @"1"}]));
+    assert(!bootstrap[@"Self"][@"LSB_REGISTER_METAL_COMPILER"] && !bootstrap[@"Child"][@"LSB_REGISTER_METAL_COMPILER"]);
+    assert(!bootstrap[@"Self"][@"LSB_SIMULATE_FRAMEWORK_BUNDLES"] && !bootstrap[@"Child"][@"LSB_SIMULATE_FRAMEWORK_BUNDLES"]);
+    assert(!environmentValue(&message->plan, "LSB_REGISTER_METAL_COMPILER"));
     assert(![job[@"KeepAlive"] boolValue] && ![job[@"EnableTransactions"] boolValue]);
     assert(!job[@"POSIXSpawnType"] && !job[@"UserName"]);
     assert([job[@"StandardOutPath"] isEqualToString:@"/private/var/mobile/Library/Logs/backboardd.log"]);
     dispose(message);
+    testBackboardPreferences(message, root, dataPath, configPath);
     assert(!LSBPrepareLaunchdLifecyclePlan(message, root.fileSystemRepresentation, NULL));
     assert(!environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"));
-    for (NSString *scope in @[@"Self", @"Child"])
+    assert(!environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER"));
+    for (NSString *key in screen) assert(!environmentValue(&message->plan, key.UTF8String));
+    for (NSString *scope in @[@"Self", @"Child"]) {
         assert(!readPlist(configPath)[@"Bootstrap"][scope][@"SIMULATOR_FRAMEBUFFER_FRAMEWORK"]);
+        assert(!readPlist(configPath)[@"Bootstrap"][scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
+        for (NSString *key in screen) assert(!readPlist(configPath)[@"Bootstrap"][scope][key]);
+    }
     directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-LifecycleDaemons"];
     job = readPlist([directory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.lifecycle.plist"]);
     assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqualToArray:@[directory]]);
     assert([job[@"ProgramArguments"] isEqualToArray:@[@"/bin/lifecycle-probe"]]);
+    assert(!job[@"EnvironmentVariables"][@"LSB_REGISTER_METAL_COMPILER"]);
     assert(!job[@"MachServices"] && ![job[@"KeepAlive"] boolValue]);
+    dispose(message);
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
+    assert(!environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER"));
+    for (NSString *key in screen) assert(!environmentValue(&message->plan, key.UTF8String));
+    for (NSString *scope in @[@"Self", @"Child"]) {
+        assert(!readPlist(configPath)[@"Bootstrap"][scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
+        for (NSString *key in screen) assert(!readPlist(configPath)[@"Bootstrap"][scope][key]);
+    }
     dispose(message);
     assert([NSFileManager.defaultManager removeItemAtPath:[root stringByAppendingPathComponent:@"System"] error:NULL]);
 }
@@ -209,10 +366,12 @@ int main(void) {
         assert(!mkdir(root.fileSystemRepresentation, 0700));
         const char *inherited[] = {"LSB_DEBUG_STOP_BEFORE_HANDOFF=1", "KEEP=value=with=equals", "HOME=/wrong", "PATH=/wrong",
             "XPC_SIMULATOR_LAUNCHD_NAME=wrong", "XPC_SIMULATOR_HOLDING_TANK_HACK=999", "XPC_SIMULATOR_HOLDING_TANK_FD_HACK=7",
-            "XPC_USERSPACE_REBOOT_TO_BOOT_MODE=wrong", "XPC_FLAGS=0x2", "TERM=xterm", "LSB_FAKE_PTY_STATE=/wrong", "LSB_SIMULATOR_LAUNCHD=0", NULL};
+            "XPC_USERSPACE_REBOOT_TO_BOOT_MODE=wrong", "XPC_FLAGS=0x2", "TERM=xterm", "LSB_FAKE_PTY_STATE=/wrong", "LSB_SIMULATOR_LAUNCHD=0",
+            "SIMULATOR_BOOT_TIME=stale", "SIMULATOR_BOOT_TIME=0", "SIMULATOR_BOOT_TIME_EXTRA=preserved", NULL};
         LSBReceivedMessage *message = calloc(1, sizeof(*message));
         assert(message);
         initialize(message);
+        time_t beforeBoot = time(NULL);
         assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, inherited));
         LSBSpawnPlan *plan = &message->plan;
         assert(!LSBValidateSpawnPlan(plan) && plan->argc == 2 && plan->fdCount == 3 && plan->creationMask == 022);
@@ -226,7 +385,16 @@ int main(void) {
         assert(!strcmp(environmentValue(plan, "LSB_SIMULATOR_LAUNCHD"), "1"));
         assert(!strcmp(environmentValue(plan, "SIMULATOR_PRODUCT_CLASS"), "D84"));
         assert(!strcmp(environmentValue(plan, "SIMULATOR_MODEL_IDENTIFIER"), "iPhone16,2"));
+        const char *bootTime = environmentValue(plan, "SIMULATOR_BOOT_TIME");
+        assert(bootTime && *bootTime && strspn(bootTime, "0123456789") == strlen(bootTime));
+        char *end;
+        errno = 0;
+        unsigned long bootSeconds = strtoul(bootTime, &end, 10);
+        assert(!errno && !*end && bootSeconds >= (unsigned long)beforeBoot && bootSeconds <= (unsigned long)time(NULL));
+        assert(!strcmp(environmentValue(plan, "SIMULATOR_BOOT_TIME_EXTRA"), "preserved"));
+        NSString *bootGeneration = [NSString stringWithUTF8String:bootTime];
         assert(!environmentValue(plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"));
+        assert(!environmentValue(plan, "LSB_SIMULATE_SYSTEM_POWER"));
         assert(!strcmp(environmentValue(plan, "HOME"), dataPath.fileSystemRepresentation));
         assert(!environmentValue(plan, "TERM") && !environmentValue(plan, "LSB_FAKE_PTY_STATE"));
         assert(!environmentValue(plan, "XPC_USERSPACE_REBOOT_TO_BOOT_MODE") && !environmentValue(plan, "XPC_SIMULATOR_HOLDING_TANK_FD_HACK"));
@@ -241,8 +409,10 @@ int main(void) {
         assert([config[@"Bootstrap"][@"Child"][@"SIMULATOR_HID_SYSTEM_MANAGER"]
             isEqualToString:[root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"]]);
         for (NSString *scope in @[@"Self", @"Child"]) {
+            assert([config[@"Bootstrap"][scope][@"SIMULATOR_BOOT_TIME"] isEqualToString:bootGeneration]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_PRODUCT_CLASS"] isEqualToString:@"D84"]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqualToString:@"iPhone16,2"]);
+            assert(!config[@"Bootstrap"][scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
         }
         assert(!config[@"Bootstrap"][@"Child"][@"XPC_SIMULATOR_HOLDING_TANK_HACK"]);
         assert(!config[@"Bootstrap"][@"Child"][@"LSB_DEBUG_STOP_BEFORE_HANDOFF"]);

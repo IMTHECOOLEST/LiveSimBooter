@@ -15,10 +15,16 @@ typedef void (*LSBExtensionEvent)(uint64_t requestID, pid_t pid, int error, void
 // A zero return only means the request was submitted. Keep context alive until LSBReleaseExtension returns.
 int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionEvent event, void *context);
 
+enum { LSB_EXTENSION_LAUNCH_GPU = 1u << 0 };
+// Host-selected native Metal roles may request GPU access. This remains subject to the host's foreground assertion lifetime.
+// Unknown options fail with EINVAL. The default entry above uses no options.
+int LSBLaunchExtensionWithOptions(const char *identifier, uint64_t requestID, uint32_t options, LSBExtensionEvent event, void *context);
+
 // Call on the main thread. Returns the PID supplied by pkd after its launch reply, or 0 if unavailable.
 pid_t LSBExtensionProcessIdentifier(uint64_t requestID);
 
 // Call on the main thread for an active launched session. Signals its exact service instance through launchd.
+// After a GPU session's assertion invalidates, only SIGKILL remains available until the session is released.
 // Zero means submitted: the underlying private API returns no delivery result.
 int LSBSignalExtension(uint64_t requestID, int signal);
 

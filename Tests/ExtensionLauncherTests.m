@@ -38,6 +38,8 @@ static PKHostPlugIn *testPlugin;
 static PKProcessAssertionProxy *testAssertion;
 static void (^testInvalidation)(void);
 static unsigned assertionReleaseCount;
+static uint32_t expectedAssertionFlags = 7;
+static unsigned assertionAcquireCount;
 static BOOL signalAllocationFails;
 static NSString *signaledService;
 static NSUUID *signaledInstance;
@@ -101,7 +103,7 @@ static void LSBMockXPCConnectionActivate(xpc_connection_t connection) {
 @end
 @implementation PKRunningBoardProvider
 - (PKProcessAssertionProxy *)processAssertionWithPID:(pid_t)pid flags:(uint32_t)flags reason:(uint32_t)reason name:(NSString *)name {
-    assert(pid == 4242 && flags == 7 && reason == 9 && [name isEqualToString:@"com.apple.extension.session"]);
+    assert(pid == 4242 && flags == expectedAssertionFlags && reason == 9 && [name isEqualToString:@"com.apple.extension.session"]);
     testAssertion = [PKProcessAssertionProxy new];
     return testAssertion;
 }
@@ -109,7 +111,7 @@ static void LSBMockXPCConnectionActivate(xpc_connection_t connection) {
 @implementation PKProcessAssertionProxy
 - (void (^)(void))invalidationHandler { return testInvalidation; }
 - (void)setInvalidationHandler:(void (^)(void))handler { testInvalidation = handler; }
-- (BOOL)acquire { return testMode != 2; }
+- (BOOL)acquire { ++assertionAcquireCount; return testMode != 2; }
 - (void)invalidate { ++assertionReleaseCount; if (testInvalidation) testInvalidation(); }
 @end
 @implementation PKHost
@@ -229,6 +231,41 @@ int main(void) {
         Drain();
         assert(count == 8 && lastError == EPROTO);
         LSBReleaseExtension(9);
+        assert(LSBLaunchExtensionWithOptions("test", 10, 2, Record, &expectedContext) == EINVAL);
+        expectedAssertionFlags = 39;
+        for (unsigned failed = 0; failed < 2; ++failed) {
+            testMode = failed ? 2 : 0;
+            unsigned previousAcquires = assertionAcquireCount, previousEvents = count;
+            uint64_t identifier = 10 + failed;
+            assert(!LSBLaunchExtensionWithOptions("test", identifier, LSB_EXTENSION_LAUNCH_GPU, Record, &expectedContext));
+            Ready();
+            Drain();
+            assert(assertionAcquireCount == previousAcquires + 1 && count == previousEvents + 1 && lastRequest == identifier);
+            assert(lastError == (failed ? EACCES : 0) && LSBExtensionProcessIdentifier(identifier) == (failed ? 0 : 4242));
+            if (!failed) {
+                NSUUID *launchedInstance = lastInstanceUUID;
+                unsigned previousSignals = signalCount;
+                testInvalidation();
+                Drain();
+                assert(count == previousEvents + 2 && lastError == ECANCELED && !LSBExtensionProcessIdentifier(identifier));
+                assert(LSBSignalExtension(identifier, 0) == ESRCH && LSBSignalExtension(identifier, SIGTERM) == ESRCH);
+                assert(!LSBSignalExtension(identifier, SIGKILL) && signalCount == previousSignals + 1 && signaledSignal == SIGKILL);
+                assert([signaledInstance isEqual:launchedInstance] && [signaledService isEqualToString:@"test"]);
+                testInvalidation();
+                Drain();
+                assert(count == previousEvents + 2); // Duplicate invalidation cannot re-notify or create a different target.
+            } else assert(LSBSignalExtension(identifier, SIGKILL) == ESRCH); // Failed acquisition never grants this cleanup path.
+            LSBReleaseExtension(identifier);
+            assert(LSBSignalExtension(identifier, SIGKILL) == ESRCH);
+        }
+        // A GPU launch cannot change the policy of a later ordinary guest launch.
+        testMode = 0;
+        expectedAssertionFlags = 7;
+        assert(!LSBLaunchExtension("test", 12, Record, &expectedContext));
+        Ready();
+        Drain();
+        assert(lastRequest == 12 && !lastError && lastPID == 4242);
+        LSBReleaseExtension(12);
         puts("launcher lifecycle tests passed");
     }
     return 0;

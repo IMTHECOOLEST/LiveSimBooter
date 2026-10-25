@@ -229,11 +229,37 @@ kernel audit token against jobs still indexed by the proxy's stable guest PID. B
 (`BOOTSTRAP_NOT_PRIVILEGED`), then `-[BKHIDSystem startHIDSystem]` failed. Details, the backtrace and the expanded cache's
 verified df run are in [backboardd and the simulator UI cache](backboardd.md).
 
-The implemented adapter changes four inline PID loads in the pinned 23A343 launchd_sim, UUID
+The implemented adapter changes six inline PID loads in the pinned 23A343 launchd_sim, UUID
 `C3EC5C45-8C85-3D11-B59C-62C4248F5EF9`. The current bootstrap check-in (routine 206) and XPC listener activation (routine 805)
 both call the endpoint handler at image offset `0x23670`. Its PID load at `0x236b0` now resolves the caller through the broker
 before the existing job lookup and endpoint-owner comparison. The two legacy check-in loads at `0x2e658` and `0x2e6b8`, plus
-XPC self lookup at `0x1bc08`, use the same adapter. Interposing `audit_token_to_pid` alone cannot cover these inline reads.
+XPC self lookup at `0x1bc08`, use the same adapter. The fifth load at `0x1db98` covers the owner comparison before returning
+an XPC service's bundle dictionary (routine 718). The sixth, at `0x2d130`, selects the managed requestor's domain before
+endpoint activation. Interposing `audit_token_to_pid` alone cannot cover these inline reads.
+
+The dictionary comparison became observable after explicitly registering the stock MTLCompilerService bundle. Launchd
+spawned xpcproxy with guest PID **81562**, then the broker committed its compiler replacement with native PID **81564**.
+The existing self-lookup adapter found that job, but routine 718 still compared `job->pid` from `[x0 + 0x3a0]` against the
+native audit PID from `[x1 + 0x14]` and returned `EPERM`. Guest libxpc then trapped in
+`_xpc_copy_xpcservice_dictionary.cold.2`, reporting that it could not retrieve the XPCService dictionary. The fifth veneer
+translates only that audited owner operand into `w9`; it preserves the job PID in `w8`, the original comparison, error path
+and complete audit token. This is separate from libxpc's native-PID domain creation and lookup, which remain unchanged.
+The compiler crash is recorded in `tmp/metal-iosurface/compiler-crash.ips`. The signed five-site adapter let compiler
+**81647** finish `xpc_main` startup, but its listener canceled with `failed at listener activation with error 1 - Operation
+not permitted`; the client's source compilation then waited until its 60-second alarm. This was a separate domain lookup
+failure, rather than another dictionary failure or evidence that compilation had begun.
+
+The next hardware-breakpoint run stopped launchd **81737** at the endpoint handler's failure path. It received the original
+audit token for native compiler **81752**, which the broker resolved to logical PID **81749**, but its domain-local lookup
+selected `com.apple.xpc.launchd.unmanaged.confusing.1.81749` in the user domain. A read-only walk of launchd's global managed
+job hash found the actual compiler job at the same logical PID in a different application PID domain. The upstream requestor
+domain resolver at `0x2d0e8` was still loading the native audit PID at `0x2d130` before global managed lookup `0x17f84`; on a miss
+it fell back to the user's domain. Translating only this load lets the original lookup select `job->domain`, while retaining
+the original full token and user-domain fallback. Endpoint checks, native PID-domain handles and kernel identities are unchanged.
+The capture is `tmp/metal-iosurface/lldb-compiler-listener-failure.txt`. The signed six-site output subsequently passed on
+the phone: launchd **81795** started native compiler **81799** with stable logical PID **81798**, and native guest **81797**
+completed source shader compilation, pipeline creation and GPU triangle rendering before exiting 0. Evidence is
+`tmp/metal-native/console-compiler-sixth.log` and the **81797** section of `tmp/metal-iosurface/guest-compiler-sixth.log`.
 
 [The offline patcher](../Tools/patch-ios26-launchd-identity.py) replaces each load with a `B` into verified empty __TEXT
 padding. Each veneer preserves all general and SIMD registers except the original load's destination, restores NZCV,
@@ -265,6 +291,10 @@ Indigo registration deadline below. Avoid pausing the host broker while expectin
 Use a fresh output directory: the patcher and executable signer refuse to overwrite their source or an existing output.
 The patcher accepts the original stock payload or that same payload with a different signature allocation, validates its
 UUID and all nonsigning bytes, rejects partial or unrelated patches, and recognizes an already patched input idempotently.
+Older four-site and five-site outputs are not inputs to this six-site patch: regenerate from the original stock or unpatched
+signed payload. The fifth and sixth veneers occupy verified zero padding at `0x52400` and `0x52600`; the resolver name is at
+`0x52800`, with the reserved range ending at `0x52900` inside the existing `__TEXT` segment. The last named section ends at
+`0x51b8c` and the segment ends at `0x54000`; the complete reserved range is verified empty before patching.
 It never signs or deploys a file. Rebuild and deploy the matching host app and shim with the patched launchd; an older shim
 without the exported resolver cannot complete the patched owner lookups.
 
@@ -295,12 +325,13 @@ Install the signed executable as `RuntimeRoot/sbin/launchd_sim` and the signed s
 `RuntimeRoot/usr/lib/libLiveSimSpawn.dylib`, retaining the previous files for reversal. The executable signer preserves
 MH_EXECUTE while clearing CS_EXECSEG_MAIN_BINARY, as required by this runtime's earlier signing tests.
 
-All nine offline patch tests passed against both stock and the device's unpatched signed binary. An independent chain walk
+All twelve offline patch tests passed against both stock and the device's unpatched signed binary. An independent chain walk
 verified all 1,708 existing fixups and exactly one new `_dlsym` bind. The native arm64 harness assembles the same veneer source,
-compares its instructions with the emitted patch bytes, and exercises all four sites with positive, zero, negative and
+compares its instructions with the emitted patch bytes, and exercises all six sites with positive, zero, negative and
 missing-helper results. It verifies original token bytes, destination W-register zero extension, and GPR/SIMD/flags/SP/LR
 preservation. Broker, transport and resolver tests cover authorization, stale generations, aliases, replacement ordering,
-and history saturation. The full host suite also passes. Device check-in success is not established by these local tests.
+and history saturation. The requestor-domain test also preserves the original managed lookup, fallback and native PID-domain
+creation instructions. The separate phone trial above establishes the sixth site's compiler-listener and rendering result.
 
 `dyld_info -validate_only` and `-imports` accept the new metadata. The installed `dyld_info -fixups` printer traps when it
 tries to name the added GOT slot's section: the slot is valid segment/page padding outside a named section. Use the independent
@@ -329,5 +360,11 @@ Host tests cover the MIG endpoint protocol, audit mismatch, malformed replies, s
 rights. They also verify Indigo touch/cancel/backpressure behavior. The health-lookup helper now destroys any copied send
 right returned by a timed-out send, while retaining the caller's original right. The phone's native host 80851 successfully
 registered the endpoint with simulator launchd 80852 (`error=0 bootstrap=0`) before the backboardd replacement was prepared.
-The guest event-port handshake and view-to-guest touch delivery remain blocked by IOHID job ownership. No IOSurface XPC or
-Metal server has been implemented.
+That initial trial was still blocked by IOHID job ownership. Subsequent native-to-guest identity fixes established the
+Indigo handshake; the current host also registers [framebuffer](framebuffer.md) and [native IOSurface](iosurface.md) endpoints.
+The current broker also starts an isolated [native Metal helper](metal.md) before launchd and registers its generic and
+backboardd-specific endpoints. Phone probes passed authenticated Metal peer connections, completed a GPU clear and then
+stock guest shader compilation, pipeline creation and triangle rendering with verified IOSurface pixels. Stock backboardd
+then presented its first spinner frame to the host image view, and the next run completed 300 frames with partial updates
+before aborting on an Indigo HID target mismatch. End-to-end touch delivery and complete simulator boot remain unverified;
+see [framebuffer evidence](framebuffer.md#first-stock-phone-frame).

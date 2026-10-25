@@ -1,11 +1,21 @@
 # Development notes
 
 These notes describe the runtime experiments and the multiprocess implementation added on 2026-10-25.
-The current target is an arm64 runtime handoff with brokered `posix_spawn` and a native terminal host; a complete simulator boot remains later work.
+The current implementation includes arm64 runtime handoff, brokered `posix_spawn`, a native terminal host, isolated simulator
+launchd and initial backboardd services. Guest offscreen GPU triangle rendering, stock backboardd spinner and touch-marker
+rendering, and native Metal dirty-rectangle presentation are verified. The latest phone run settles near 60 presentations
+per second after fixing drawable-pool stalls. Apple-logo/progress rendering and complete simulator boot remain unverified.
 
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.
 - [Simulator launchd](launchd.md): empty bootstrap, tank handoff without execve, workqueue startup, and device findings.
+- [Backboardd](backboardd.md): the expanded runtime cache, service identity, and boot progress.
+- [Simulator preferences](cfprefsd.md): the stock cfprefsd job and isolated `BKDigitizerVisualizeTouches` preference.
+- [Framebuffer](framebuffer.md): verified first phone frame, frame scheduling, surface fences, and bounded dirty-rectangle composition.
+- [IOSurface](iosurface.md): Apple's native remote server, authenticated guest connections, and allocation tests.
+- [System power](system-power.md): the denied power user-client open and the tested virtual-awake subscription adapter.
+- [Metal](metal.md): isolated native service, stock guest compiler registration, and verified shader-based triangle rendering.
+- [Native Metal backend](../NativeMetal/README.md): host-selected roles, pinned metadata adaptation, signing and fixed-path packaging.
 - [Bash](bash.md): noninteractive builtin baseline, terminal-access probes, and remaining fork/exec design requirements.
 - [Fish](fish.md): unmodified-source shell results, executable-access compatibility, and interactive startup.
 - [Fake terminal](fake-pty.md): socket transport, pure-C guest terminal controls, native keyboard/display, and current limits.
@@ -17,6 +27,19 @@ The current target is an arm64 runtime handoff with brokered `posix_spawn` and a
 - [Pointer classification](cache-pointer-classification.md): structural filtering of all false positives in both caches, preserving measured relocations.
 - [Device debugging](debugging.md): installation, file transfer, SSH logs, LLDB attachment, and verification.
 - [Provisioning cleanup](provisioning-cleanup.md): the custom trigger conflict, targeted repair, backup, and installation evidence.
+
+The shader-compilation Metal trial on iPhone16,2 / iOS 26.1 used host **81793**, native helper **81794**, native guest **81797** and stock
+guest compiler **81799**. Source compilation, pipeline creation and GPU triangle rendering succeeded. The guest verified
+center/corner IOSurface pixels, wrote a visually inspected PNG and exited 0. A subsequent normal stock backboardd run used
+host **82139**, helper **82140**, launchd **82141** and native backboardd **82143**. Operation 1 from surface **45** reached
+the host image view; the recovered 1290 × 2796 PNG visibly contains a spinner on black. Later dirty-rectangle updates were
+rejected by the then-full-frame-only server. After bounded partial composition was added, host **82181**, helper **82182**,
+launchd **82183** and native backboardd **82185** reached 300 frames, including the observed `597,1350,96,96` updates.
+Backboardd then aborted with `SIGABRT` after about 21 seconds because SimulatorHID rejected target 0. That historical input
+failure is fixed by creating the built-in digitizer with the correct target and boot-generation environment. The latest run
+uses native host **82532**, helper **82533**, launchd **82534**, backboardd **82537** and cfprefsd **82538**. Async Metal
+presentation with three drawables passed 4,800 frames at 58.6 fps including startup, with later intervals approximately 60 fps.
+See [framebuffer evidence](framebuffer.md) and [preferences/input results](cfprefsd.md). Full simulator boot remains unverified.
 
 The matching iOS 26 build **23A343** runtime runs on the tested iOS 27 iPhone. With all 219 loose dylibs temporarily moved
 outside RuntimeRoot, all 46 dependencies loaded from the relocated cache at `0x120000000`. `df` exited zero under LLDB

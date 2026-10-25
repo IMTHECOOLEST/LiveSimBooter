@@ -10,10 +10,11 @@ xcrun --sdk iphonesimulator clang -arch arm64 -target arm64-apple-ios14.0-simula
     -dynamiclib -fblocks -fvisibility=hidden -DLSB_GUEST_RUNTIME -DLSB_XPC_WIRE_COMPATIBILITY $trace_flags \
     -install_name /usr/lib/libLiveSimSpawn.dylib -Wl,-not_for_dyld_shared_cache \
     Guest/SpawnShim.c Guest/SpawnAttributes.c Guest/CreationMask.c Guest/ExecutableAccess.c Guest/ChildWait.c Guest/ChildKill.c \
-    Guest/ProcessIdentity.c Guest/ProcessEvents.c Guest/ProcessSession.c Guest/FakePTY.c Guest/ThreadBootstrap.c \
-    Guest/WorkqueueBootstrap.c Guest/LaunchdCompatibility.c Guest/LaunchdIdentity.c Guest/XPCWireCompatibility.c \
+    Guest/ProcessIdentity.c Guest/ProcessEvents.c Guest/ProcessSession.c Guest/FakePTY.c Guest/ThreadBootstrap.c Guest/MetalCompilerRegistration.c \
+    Guest/WorkqueueBootstrap.c Guest/LaunchdCompatibility.c Guest/LaunchdIdentity.c Guest/XPCWireCompatibility.c Guest/SystemPowerCompatibility.c \
+    Guest/FrameworkBundleCompatibility.c \
     ProcessSupport/ChildStatus.c ProcessSupport/FakePTY.c \
-    ProcessSupport/SpawnPlan.c ProcessSupport/SpawnTransport.c -o "$output"
+    ProcessSupport/SpawnPlan.c ProcessSupport/SpawnTransport.c -framework IOKit -framework CoreFoundation -o "$output"
 xcrun --sdk iphonesimulator clang -arch arm64 -target arm64-apple-ios14.0-simulator -std=c11 -Wall -Wextra -Werror \
     Guest/SpawnProbe.c -o "$probe"
 printf '%s\n' "$output" "$probe"

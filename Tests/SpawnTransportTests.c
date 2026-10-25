@@ -22,8 +22,9 @@
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
 static unsigned openDescriptorCount(void);
-enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedBootstrapCount = 14 + MalformedPortsCount + MalformedIdentityCount,
-       MalformedKillCount = 14, MalformedAuditCount = 16, PortRoundTripCount = 6 };
+enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedRoleCount = 11, MalformedRoleRequestCount = 6,
+       MalformedBootstrapCount = 14 + MalformedPortsCount + MalformedIdentityCount + MalformedRoleCount,
+       MalformedKillCount = 14, MalformedAuditCount = 16, PortRoundTripCount = 7 };
 static volatile sig_atomic_t childSignals;
 static volatile sig_atomic_t signalAcknowledgementFD = -1;
 
@@ -161,6 +162,46 @@ static void testMalformedPorts(const LSBSpawnPlan *plan, int fd, mach_port_t sen
     assert(!mach_port_get_refs(mach_task_self(), sentPort, MACH_PORT_RIGHT_SEND, &references) && references == 1);
 }
 
+static void testRoleRequestInjection(const LSBSpawnPlan *plan, int fd, unsigned variant) {
+    static const uint32_t kinds[] = { LSB_REQUEST_SPAWN, LSB_REQUEST_EXEC, LSB_REQUEST_CHECKIN,
+                                      LSB_REQUEST_READY, LSB_REQUEST_KILL, LSB_REQUEST_RESOLVE_AUDIT_PID };
+    assert(variant < sizeof(kinds) / sizeof(kinds[0]));
+    mach_port_t port;
+    assert(!LSBTestCopyBrokerPort(&port));
+    xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
+    assert(pipe && request);
+    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "kind", kinds[variant]);
+    xpc_dictionary_set_uint64(request, "request-id", kinds[variant] == LSB_REQUEST_READY ? 77 : 0);
+    xpc_dictionary_set_int64(request, "error", 0);
+    if (kinds[variant] == LSB_REQUEST_SPAWN || kinds[variant] == LSB_REQUEST_EXEC) {
+        xpc_dictionary_set_data(request, "plan", plan, sizeof(*plan));
+        xpc_object_t array = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(fd);
+        assert(array && descriptor);
+        xpc_array_append_value(array, descriptor);
+        xpc_dictionary_set_value(request, "fds", array);
+        xpc_release(descriptor);
+        xpc_release(array);
+    }
+    if (kinds[variant] == LSB_REQUEST_KILL) {
+        xpc_dictionary_set_int64(request, "target-pid", 4242);
+        xpc_dictionary_set_int64(request, "signal", 0);
+    }
+    if (kinds[variant] == LSB_REQUEST_RESOLVE_AUDIT_PID) {
+        audit_token_t audit = {{0, 0, 0, 0, 0, 4242, 0, 1}};
+        xpc_dictionary_set_data(request, "target-audit", &audit, sizeof(audit));
+    }
+    if (variant % 2) xpc_dictionary_set_uint64(request, "bootstrap-version", LSB_BOOTSTRAP_VERSION);
+    else xpc_dictionary_set_uint64(request, "execution-role", LSB_EXECUTION_NATIVE_METAL_PROBE);
+    xpc_object_t reply = NULL;
+    assert(!xpc_pipe_routine(pipe, request, &reply));
+    assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
+    xpc_release(reply);
+    xpc_release(request);
+    xpc_release(pipe);
+    assert(!mach_port_deallocate(mach_task_self(), port));
+}
+
 static LSBSpawnPorts orderedPorts(mach_port_t first, mach_port_t second, unsigned variant) {
     LSBSpawnPorts ports = {.registeredPresent = variant < 4, .count = variant < 3 ? 3 : 0,
                            .bootstrapPresent = variant < 3 || variant == 4};
@@ -237,7 +278,8 @@ static void registeredPortsClient(const LSBSpawnPlan *plan, const int fds[LSB_MA
         assert(reply.ports.bootstrapPresent == ports.bootstrapPresent && reply.ports.bootstrapPort == ports.bootstrapPort);
         assert(reply.pid == 4242);
         assert(reply.guestPID == (variant % 2 ? variant == 5 ? INT_MAX : 1234 + (int)variant : 4242));
-        assert(reply.parentPID == (variant % 2 ? variant == 1 ? 0 : 4567 : getppid()));
+        assert(reply.parentPID == (variant == 6 || variant % 2 ? variant == 1 ? 0 : 4567 : getppid()));
+        assert(reply.executionRole == (variant == 6 ? LSB_EXECUTION_NATIVE_METAL_PROBE : LSB_EXECUTION_SIMULATOR));
         assert(reply.launchdTankPort == (variant == 1 ? second : MACH_PORT_NULL));
         unsigned firstCopies = ports.bootstrapPort == first, secondCopies = ports.bootstrapPort == second;
         firstCopies += reply.launchdTankPort == first;
@@ -552,6 +594,7 @@ static int client(void) {
     assert(!mach_msg(&ping, MACH_SEND_MSG, sizeof(ping), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
     registeredPortsClient(&plan, fds);
     for (unsigned variant = 0; variant < MalformedPortsCount; ++variant) testMalformedPorts(&plan, fd, tankAnchor, variant);
+    for (unsigned variant = 0; variant < MalformedRoleRequestCount; ++variant) testRoleRequestInjection(&plan, fd, variant);
     signalAcknowledgementFD = fd;
     struct sigaction action = {.sa_handler = childSignal}, previousAction;
     sigemptyset(&action.sa_mask);
@@ -679,7 +722,7 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
     xpc_release(descriptor);
     xpc_release(array);
     setWirePorts(reply, tank, variant >= 14 && variant < 14 + MalformedPortsCount ? (int)variant - 14 : -1);
-    if (variant >= 14 + MalformedPortsCount) {
+    if (variant >= 14 + MalformedPortsCount && variant < 14 + MalformedPortsCount + MalformedIdentityCount) {
         switch (variant - 14 - MalformedPortsCount) {
             case 0: xpc_dictionary_set_value(reply, "guest-pid", NULL); break;
             case 1: xpc_dictionary_set_string(reply, "guest-pid", "4242"); break;
@@ -706,6 +749,30 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
         xpc_dictionary_set_value(reply, "launchd-tank-port", descriptor);
         xpc_release(descriptor);
     } else xpc_dictionary_set_mach_send(reply, "launchd-tank-port", tank);
+    if (variant >= 14 + MalformedPortsCount + MalformedIdentityCount) {
+        xpc_dictionary_set_uint64(reply, "bootstrap-version", LSB_BOOTSTRAP_VERSION);
+        xpc_dictionary_set_uint64(reply, "execution-role", LSB_EXECUTION_SIMULATOR);
+        switch (variant - 14 - MalformedPortsCount - MalformedIdentityCount) {
+            case 0: xpc_dictionary_set_value(reply, "execution-role", NULL); break;
+            case 1: xpc_dictionary_set_value(reply, "bootstrap-version", NULL); break;
+            case 2: xpc_dictionary_set_uint64(reply, "bootstrap-version", LSB_BOOTSTRAP_VERSION + 1); break;
+            case 3: xpc_dictionary_set_string(reply, "bootstrap-version", "1"); break;
+            case 4: xpc_dictionary_set_int64(reply, "bootstrap-version", 1); break;
+            case 5: xpc_dictionary_set_string(reply, "execution-role", "native"); break;
+            case 6: xpc_dictionary_set_int64(reply, "execution-role", 1); break;
+            case 7: xpc_dictionary_set_uint64(reply, "execution-role", LSB_EXECUTION_NATIVE_METAL_SERVICE + 1); break;
+            case 8: xpc_dictionary_set_uint64(reply, "execution-role", UINT64_MAX); break;
+            case 9: xpc_dictionary_set_uint64(reply, "execution-role", LSB_EXECUTION_NATIVE_METAL_PROBE); break;
+            case 10:
+                xpc_dictionary_set_uint64(reply, "execution-role", LSB_EXECUTION_NATIVE_METAL_PROBE);
+                xpc_dictionary_set_value(reply, "registered-ports", NULL);
+                xpc_dictionary_set_value(reply, "bootstrap-port", NULL);
+                xpc_dictionary_set_value(reply, "launchd-tank-port", NULL);
+                xpc_dictionary_set_int64(reply, "guest-pid", 4243);
+                break;
+            default: assert(false);
+        }
+    }
     if (variant == 1) xpc_dictionary_set_string(reply, "child-status-fd", "not a descriptor");
     else if (variant != 0) {
         int statusFD = variant == 4 ? fds->wake[0] : variant == 7 ? fds->readOnlyStatus : variant == 8 ? fds->shortStatus : fds->status;
@@ -755,9 +822,11 @@ static void registeredPortsHost(mach_port_t broker, const BootstrapFDs *bootstra
             assert(!mach_msg(&ping, MACH_SEND_MSG, sizeof(ping), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
         }
         assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_CHECKIN && !message.ports.count);
-        if (variant % 2) {
-            LSBBootstrapMetadata metadata = {.guestPID = variant == 5 ? INT_MAX : 1234 + (int)variant, .parentPID = variant == 1 ? 0 : 4567,
-                                             .ports = &pending.ports, .launchdTankPort = variant == 1 ? pending.ports.bootstrapPort : MACH_PORT_NULL};
+        if (variant % 2 || variant == 6) {
+            LSBBootstrapMetadata metadata = {.guestPID = variant == 6 ? 4242 : variant == 5 ? INT_MAX : 1234 + (int)variant,
+                .parentPID = variant == 1 ? 0 : 4567, .ports = &pending.ports,
+                .launchdTankPort = variant == 1 ? pending.ports.bootstrapPort : MACH_PORT_NULL,
+                .executionRole = variant == 6 ? LSB_EXECUTION_NATIVE_METAL_PROBE : LSB_EXECUTION_SIMULATOR};
             assert(!LSBTransportReplyBootstrapWithMetadata(&message, 0, 4242, 80 + variant, "/tmp/RuntimeRoot", &pending.plan,
                                                            pending.fds, bootstrap->status, bootstrap->wake[0], &metadata));
         } else assert(!LSBTransportReplyBootstrapWithPorts(&message, 0, 4242, 80 + variant, "/tmp/RuntimeRoot", &pending.plan,
@@ -851,6 +920,12 @@ static int host(const char *executable) {
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
         mach_port_urefs_t references;
         assert(!mach_port_get_refs(mach_task_self(), tank, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(openDescriptorCount() == before);
+    }
+    for (unsigned variant = 0; variant < MalformedRoleRequestCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && !message.object);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
         assert(openDescriptorCount() == before);
     }
     const int signals[] = {0, SIGTERM, SIGKILL, SIGTERM, SIGTERM};

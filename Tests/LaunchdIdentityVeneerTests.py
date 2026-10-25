@@ -12,7 +12,8 @@ spec = importlib.util.spec_from_file_location('launchd_identity_patch', ROOT / '
 patcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(patcher)
 EXPECTED_SITES = ((0x236B0, 0xB9401421, 1, 1), (0x2E658, 0xB9401681, 20, 1),
-                  (0x2E6B8, 0xB9401688, 20, 8), (0x1BC08, 0xB94017E0, None, 0))
+                  (0x2E6B8, 0xB9401688, 20, 8), (0x1BC08, 0xB94017E0, None, 0),
+                  (0x1DB98, 0xB9401429, 1, 9), (0x2D130, 0xB9401440, 2, 0))
 assert patcher.SITES == EXPECTED_SITES, 'Update the independent fixtures when the pinned input build/sites change'
 
 
@@ -54,9 +55,9 @@ def fixture_assembly():
                   '    adrp x30, _LSBTestFixture@PAGE', '    add x30, x30, _LSBTestFixture@PAGEOFF',
                   '    str x18, [x30, #144]', '    mov x9, sp', '    str x9, [x30, #0x600]',
                   '    add x9, x30, #0x688', '    ldp q0, q1, [x9]', '    stp q0, q1, [sp]'))
-    for index in range(3):
+    for index in range(len(EXPECTED_SITES) - 1):
         lines.extend((f'    cmp w0, #{index}', f'    b.eq .Lcase{index}'))
-    lines.append('    b .Lcase3')
+    lines.append(f'    b .Lcase{len(EXPECTED_SITES) - 1}')
     for index, (_, _, token, _) in enumerate(EXPECTED_SITES):
         lines.append(f'.Lcase{index}:')
         lines.append('    mov x9, sp' if token is None else '    add x9, x30, #0x688')
@@ -73,7 +74,7 @@ def fixture_assembly():
             else:
                 lines.append(f'    ldp x{reg}, x{reg + 1}, [x30, #{reg * 8}]')
         lines.extend(('    ldr x30, [x30, #240]', f'    b _LSBTestVeneer{index}'))
-    for index in range(4):
+    for index in range(len(EXPECTED_SITES)):
         lines.extend((f'.globl _LSBTestResume{index}', f'_LSBTestResume{index}:', '    stp x16, x17, [sp, #-16]!',
                       f'    mov x17, #{index}', '    b .Lrecord'))
     lines.extend(('.Lrecord:', '    adrp x16, _LSBTestFixture@PAGE', '    add x16, x16, _LSBTestFixture@PAGEOFF',
@@ -116,7 +117,7 @@ def main():
         directory = Path(temporary)
         clang = ['xcrun', '--sdk', 'macosx', 'clang', '-arch', 'arm64']
         code, expected = [], []
-        for index in range(4):
+        for index in range(len(EXPECTED_SITES)):
             machine, source = patcher.build_veneer(index, external_labels=True)
             code.append(source)
             expected.append(machine)

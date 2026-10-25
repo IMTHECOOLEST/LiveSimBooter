@@ -2,6 +2,43 @@
 #include "../Host/SimulatorDisplayView.m"
 #include <assert.h>
 #include <stdio.h>
+#include <sys/stat.h>
+
+static void testCapture(CGImageRef image, const uint8_t expected[16]) {
+    assert(LSBDisplayCaptureEnabled("1") && !LSBDisplayCaptureEnabled(NULL) && !LSBDisplayCaptureEnabled("0") &&
+           !LSBDisplayCaptureEnabled("true") && !LSBDisplayCaptureEnabled("01"));
+    char directory[] = "/tmp/LiveSimBooter-first-frame.XXXXXX";
+    assert(mkdtemp(directory));
+    NSString *folder = [NSString stringWithUTF8String:directory];
+    NSString *path = [folder stringByAppendingPathComponent:@"LiveSimBooter-first-frame.png"];
+    NSString *other = [folder stringByAppendingPathComponent:@"unrelated"];
+    assert([@"unchanged" writeToFile:other atomically:YES encoding:NSUTF8StringEncoding error:NULL]);
+    assert(!symlink(other.fileSystemRepresentation, path.fileSystemRepresentation));
+    assert(!LSBCaptureDisplayImage(image, directory));
+    assert([[NSString stringWithContentsOfFile:other encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"unchanged"]);
+    struct stat status;
+    assert(!lstat(path.fileSystemRepresentation, &status) && S_ISREG(status.st_mode) && (status.st_mode & 0777) == 0600);
+    NSData *png = [NSData dataWithContentsOfFile:path];
+    const uint8_t signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+    assert(png.length > sizeof(signature) && !memcmp(png.bytes, signature, sizeof(signature)));
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)png, NULL);
+    CGImageRef decoded = source ? CGImageSourceCreateImageAtIndex(source, 0, NULL) : NULL;
+    assert(decoded && CGImageGetWidth(decoded) == 2 && CGImageGetHeight(decoded) == 2);
+    uint8_t pixels[16] = {0};
+    CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(pixels, 2, 2, 8, 8, color, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    assert(context);
+    CGContextDrawImage(context, CGRectMake(0, 0, 2, 2), decoded);
+    assert(!memcmp(pixels, expected, 16)); // Producer was already reused and released before the diagnostic encoded the snapshot.
+    CGContextRelease(context); CGColorSpaceRelease(color); CGImageRelease(decoded); CFRelease(source);
+    assert(LSBCaptureDisplayImage(NULL, directory) == EINVAL && LSBCaptureDisplayImage(image, NULL) == EINVAL);
+    assert([[NSData dataWithContentsOfFile:path] isEqualToData:png]);
+    assert(!unlink(path.fileSystemRepresentation) && !mkdir(path.fileSystemRepresentation, 0700));
+    assert(LSBCaptureDisplayImage(image, directory)); // Failed atomic publication leaves no hidden partial file.
+    assert([[NSFileManager.defaultManager contentsOfDirectoryAtPath:folder error:NULL] count] == 2);
+    assert(!rmdir(path.fileSystemRepresentation) && !unlink(other.fileSystemRepresentation) && !rmdir(directory));
+    assert(LSBCaptureDisplayImage(image, directory) == ENOENT);
+}
 
 static void testCoordinates(void) {
     CGRect viewport = LSBDisplayViewport(CGRectMake(0, 0, 300, 200), CGSizeMake(100, 200));
@@ -38,48 +75,23 @@ static void testLayoutBounds(void) {
     assert(!LSBDisplayBGRALayout(1, 1, SIZE_MAX, 4, &row, &bytes) && row == 4 && bytes == 4);
 }
 
-static IOSurfaceRef createSurface(uint32_t format) CF_RETURNS_RETAINED;
-static IOSurfaceRef createSurface(uint32_t format) {
-    size_t stride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, 16);
-    NSDictionary *properties = @{(__bridge NSString *)kIOSurfaceWidth: @2, (__bridge NSString *)kIOSurfaceHeight: @2,
-        (__bridge NSString *)kIOSurfaceBytesPerElement: @4, (__bridge NSString *)kIOSurfaceBytesPerRow: @(stride),
-        (__bridge NSString *)kIOSurfacePixelFormat: @(format)};
-    return IOSurfaceCreate((__bridge CFDictionaryRef)properties);
-}
-
-static void testSurfaceSnapshot(void) {
-    IOSurfaceRef surface = createSurface(0x42475241);
-    assert(surface);
-    size_t stride = IOSurfaceGetBytesPerRow(surface);
-    assert(stride >= 16);
+static void testSnapshotCapture(void) {
     const uint8_t expected[] = {1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255};
-    assert(!IOSurfaceLock(surface, 0, NULL));
-    uint8_t *pixels = IOSurfaceGetBaseAddress(surface);
-    memset(pixels, 0xCC, IOSurfaceGetAllocSize(surface));
-    memcpy(pixels, expected, 8);
-    memcpy(pixels + stride, expected + 8, 8);
-    assert(!IOSurfaceUnlock(surface, 0, NULL));
-    int error = 42;
-    CGImageRef image = LSBCopySurfaceImage(surface, &error);
-    assert(image && !error && CGImageGetWidth(image) == 2 && CGImageGetHeight(image) == 2 && CGImageGetBytesPerRow(image) == 8);
-    assert(CGImageGetBitmapInfo(image) == (kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst));
-    // A producer may reuse the surface after presentSurface returns; the snapshot must keep its own pixels.
-    assert(!IOSurfaceLock(surface, 0, NULL));
-    memset(pixels, 0, IOSurfaceGetAllocSize(surface));
-    assert(!IOSurfaceUnlock(surface, 0, NULL));
-    CFRelease(surface);
-    CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(image));
-    assert(data && CFDataGetLength(data) == sizeof(expected) && !memcmp(CFDataGetBytePtr(data), expected, sizeof(expected)));
-    CFRelease(data);
+    uint8_t pixels[16];
+    memcpy(pixels, expected, sizeof(pixels));
+    CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(pixels, 2, 2, 8, 8, color, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    assert(context);
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    assert(image);
+    CGContextRelease(context); CGColorSpaceRelease(color);
+    memset(pixels, 0, sizeof(pixels));
+    testCapture(image, expected);
     CGImageRelease(image);
-    surface = createSurface(0x52474241); // RGBA requires a different pixel interpretation and is intentionally unsupported.
-    assert(surface && !LSBCopySurfaceImage(surface, &error) && error == ENOTSUP);
-    CFRelease(surface);
-    assert(!LSBCopySurfaceImage(NULL, &error) && error == EINVAL);
 }
 
 int main(void) {
-    @autoreleasepool { testCoordinates(); testLayoutBounds(); testSurfaceSnapshot(); }
-    puts("SimulatorDisplayTests passed");
+    @autoreleasepool { testCoordinates(); testLayoutBounds(); testSnapshotCapture(); }
+    puts("SimulatorDisplayTests: coordinate mapping and diagnostic PNG publication passed");
     return 0;
 }

@@ -11,10 +11,12 @@ NS_ASSUME_NONNULL_BEGIN
 // Each server should have one presentation view; this view forwards only its own UIKit touches.
 @interface LSBSimulatorDisplayView : UIView
 @property (nonatomic, strong, nullable) LSBIndigoHIDServer *indigoServer;
-// Snapshot a completed, nonplanar 32BGRA surface using premultiplied sRGB pixels. NULL clears the display.
-// The caller must keep the surface valid and avoid writing it during this call. No surface is retained afterward.
-// Returns errno values; unsupported formats return ENOTSUP and failures preserve the previous image.
-- (int)presentSurface:(IOSurfaceRef _Nullable)surface;
+// Discard the composition baseline and retire its presentation layer. The next frame must be complete.
+- (void)resetPresentation;
+// Enqueue a GPU copy without blocking UIKit. The caller must prevent producer writes until completion, called once on main.
+// Integral dirty rectangles merge into host-owned pixels. The first frame after reset needs the complete surface.
+// Unsupported formats return ENOTSUP through completion; a submitted GPU failure invalidates the baseline.
+- (void)presentSurface:(IOSurfaceRef)surface dirtyRect:(CGRect)dirtyRect completion:(void (^)(int error))completion;
 @end
 
 NS_ASSUME_NONNULL_END

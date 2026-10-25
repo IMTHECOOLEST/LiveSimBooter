@@ -1,5 +1,14 @@
 # Backboardd and the simulator UI cache
 
+The current native services cover Indigo, framebuffer, IOSurface and an isolated Metal helper. Stock backboardd now produces
+a real frame that reaches the host image view: a spinner on black at 1290 × 2796. Following the Indigo target and boot-generation
+fixes, physical touches produce readable stock touch markers in that display. An earlier partial-update trial reached 300
+frames before aborting on the then-invalid HID target; that failure is retained below as history. An offscreen probe also compiled
+shader source through the stock guest compiler and rendered a triangle with verified pixels. Apple-logo/progress rendering
+and a complete simulator boot remain unverified. See [the first stock frame](#first-stock-backboardd-frame) and
+[the Metal results](metal.md#latest-phone-results).
+The earlier backboardd traces remain chronological evidence of the separate boot/resource failures.
+
 ## Cache coverage
 
 The earlier iOS 26 simulator cache contains **219 images**. It includes CoreGraphics and QuartzCore but does not include
@@ -116,10 +125,13 @@ Evidence: `activate.log`, `lldb-launchd.txt`, `console-df-fresh.log`, and `lldb-
 
 ## Backboardd startup and the first service failure
 
-`--launchd-backboardd` creates one isolated RunAtLoad job from the stock 23A343 `/usr/libexec/backboardd`. The generated plist
+`--launchd-backboardd` creates an isolated RunAtLoad job from the stock 23A343 `/usr/libexec/backboardd`. The generated plist
 imports the stock job's 21 MachServices entries, uses `KeepAlive = false` and `EnableTransactions = false`, and omits scheduler
 and identity attributes that the broker does not implement. It writes to `SimulatorData/Library/Logs/backboardd.log`.
 The stock executable's `LC_MAIN` offset is `0xb828`; its UUID is `385892A3-EF4B-362A-BAFF-02FE702C41DD`.
+The current configuration also loads the matching `com.apple.cfprefsd.xpc.daemon` job and atomically enables
+`BKDigitizerVisualizeTouches` in the isolated simulator preferences. See [cfprefsd staging and validation](cfprefsd.md).
+The earlier startup trials below predate that addition.
 
 The initial loose-library run first failed to resolve `_OBJC_CLASS_$_AVAudioSession`. AVFAudio re-exports that symbol through
 its weak AudioSession dependency; importing only required load commands therefore missed a real dependency. Adding
@@ -164,6 +176,21 @@ from the installed CoreSimulator framework, version 1171.7, built for iOS Simula
 were checked against the iOS 26 libraries and it was signed with the same identity and identifier as the runtime. This
 static check does not establish full cross-version runtime compatibility. No matching older plugin was found in the
 installed Xcode locations. Staging evidence is in `tmp/backboardd/hid-plugin/manifest.json`.
+
+Each prepared simulator boot supplies `SIMULATOR_BOOT_TIME` to launchd and its children, replacing any inherited stale value.
+It follows CoreSimulator 1171.7's `createLaunchdJobWithBinpref:...` implementation: the current Unix timestamp truncated to
+unsigned integer seconds and formatted with `%lu`. SimulatorHID reads that string as its boot generation and persists it
+with dynamic HID services in `SimulatorData/var/run/SimHIDDynamicServices.plist`. Without it, the first successful built-in
+digitizer creation reached `ScreenTouchService.PurpleMain`, then raised an exception while inserting a nil generation into
+the persistence dictionary. Supplying the normal boot environment addresses this prerequisite; no custom SimulatorHID
+library patch is needed. Evidence: `tmp/metal-native/guest-cfprefsd-indigo.log` and
+`tmp/backboardd/hid-plugin/coresimulator-environment-disassembly.txt` (producer `0x3aad4`–`0x3ab08`; receiver
+`_currentBootGeneration` and `_locked_saveDynamicServicesToDisk`).
+
+The subsequent stock touch-visualization path also needed matching `usr/lib/libobjc-trampolines.dylib` plus the Helvetica
+and LastResort font data under `System/Library/Fonts/Core`. These files have been staged and hash-verified. Physical touches
+produced visualizer label/dirty updates, and the final phone screenshot confirms readable stock marker text after the font copy.
+See [the minimal visualization assets and measured preferences result](cfprefsd.md#touch-visualization-runtime-assets).
 
 `LSBSimulatorDisplayView` can snapshot a completed nonplanar 32BGRA IOSurface into a native UIImage. It checks the format,
 stride and allocation size, copies under an IOSurface read lock, and retains no surface after the call. The view aspect-fits
@@ -291,8 +318,8 @@ resolved to the real provider, and `SFBConnectionCreate` returned object `0x106b
 with error object `0x1075041b0`; the exact bootstrap lookup result was not captured. Backboardd continued past this failure,
 so an unavailable framebuffer connection is nonfatal on this startup path. Evidence: `tmp/launchd-identity/lldb-framebuffer-provider.txt`.
 
-The stock client's initial Mach exchange, packed structures, error replies and proposed host lifetime rules are recorded in
-[framebuffer protocol research](framebuffer.md); that server is not implemented yet.
+The stock client's Mach exchange, packed structures, error replies and implemented host lifetime rules are recorded in
+[framebuffer transport](framebuffer.md).
 
 ## Runtime resources after framebuffer discovery
 
@@ -315,6 +342,120 @@ contained no rejection or TXM event (`tmp/launchd-identity/security-test.log`). 
 can loop during handoff: the test used hardware-only breakpoints, paused the guest, disabled the internal image/thread
 breakpoints, then stepped past the notifier before continuing. This workaround does not fix LLDB's notification handling.
 
-The view is not yet connected to a guest surface producer. An IOSurface XPC service and a Metal service are not implemented;
-their wire protocols and runtime needs remain work after an actual graphics-service request is reached. The 545-image cache
-remains deployed; the earlier 219-image cache and the 139 loose dependencies are retained for reversal.
+The host now connects its view to the framebuffer service and uses Apple's native `IOSurfaceRemoteServer` for guest
+surface allocation. See [the IOSurface service](iosurface.md) and [framebuffer transport](framebuffer.md) for their tests and
+limits. A separate native Metal service has also completed a shader-based triangle and shared pixel readback, as recorded below. The 545-image
+cache remains deployed; the earlier 219-image cache and the 139 loose dependencies are retained for reversal.
+
+## Native Metal service trial
+
+`--launchd-backboardd` now starts a host-selected native LiveProcess helper before simulator launchd. This role retains the
+native cache, loads the fixed bundled backend, and returns its listener send right in authenticated READY. The broker
+registers `com.apple.metal.simulator` and `com.apple.metal.simulator.backboardd` alongside Indigo, IOSurface and framebuffer.
+The xpcproxy instance may run while registration completes; its backboardd SETEXEC replacement waits for all five results.
+
+The helper receives a read-only authorization file at fd 3. The broker retains the writable mapping and publishes only the
+selected backboardd instance's complete native audit token before releasing its launch plan. The native Metal listener
+uses mode-2 XPC framing and admits exact-token matches. These operations preserve the real kernel security identity;
+launchd's stable guest PID does not replace the native audit token.
+
+The 2026-10-25 trial temporarily substituted the offscreen Metal/IOSurface test for RuntimeRoot's backboardd executable.
+Host **81448** launched helper **81449**, simulator launchd **81450**, xpcproxy **81451**, and replacement **81452**. All five
+endpoint registrations returned error 0/bootstrap 0. The replacement retained stable guest PID **81451** while native
+audit PID **81452**, version **202629**, authorized all three Metal connections. The guest created a 256 × 256 BGRA surface,
+obtained `Apple iOS simulator GPU`, and successfully called `newCommandQueue`.
+
+`newLibraryWithSource` then returned `MTLLibraryErrorDomain` code 3 with
+`Compiler encountered XPC_ERROR_CONNECTION_INVALID (is the OS shutting down?)`. The guest exited 1, recorded as wait
+status `0x100`. The broker revoked authorization and terminated helper 81449 as designed. No render pipeline, GPU command
+submission, triangle pixels or framebuffer presentation was established by this trial. It tests the dedicated probe's
+Metal path, not completion of stock backboardd boot.
+
+A later shader-free probe passed with host **81535**, helper **81536**, simulator launchd **81537**, stable guest PID **81538**
+and native guest **81539**. Only the native helper requested assertion flags **39** (`PreventThrottleDownUI` plus the existing
+flags 7). Its GPU clear completed successfully; the guest read back center/corner BGRA **64,128,191,255**, wrote
+`SimulatorData/metal-iosurface.png` and exited 0. This demonstrates offscreen GPU execution through the isolated helper,
+not a stock backboardd frame. At this stage, source and precompiled shader probes were still blocked on compiler XPC despite
+deployment of the complete matching stock compiler bundle. The successful clear logs are
+`tmp/metal-native/console-clear-gpu-assertion.log` and the PID 81539 section of `tmp/metal-iosurface/guest-clear-gpu-assertion.log`.
+
+The subsequent source trial with host **81793**, helper **81794**, launchd **81795**, native guest **81797** and stock compiler
+**81799** passed compilation and pipeline creation after explicit bundle registration and the sixth launchd identity fix.
+GPU rendering completed; CPU readback found center BGRA **127,65,63,255** and corner **0,0,0,255**. The recovered PNG visibly
+contains the triangle and the guest exited 0. Evidence is `tmp/metal-native/console-compiler-sixth.log`, the **81797** section
+of `tmp/metal-iosurface/guest-compiler-sixth.log`, and `tmp/metal-iosurface/phone-triangle.png`. This verifies the probe's
+offscreen shader path; it does not establish a stock backboardd frame or framebuffer presentation.
+
+Evidence: `tmp/metal-native/console-service.log` and the native PID 81452 section of
+`tmp/metal-iosurface/guest-service.log`. See [Metal](metal.md) for the earlier successful construction-only probe, driver
+discovery, compiler fixes and remaining tests; [NativeMetal/README.md](../NativeMetal/README.md) covers preparation,
+signing and packaging. Each native helper is permanently limited to one owner/generation. Owner exit/cancellation or
+helper failure requires a new host/session; an already-authorized graphics owner cannot currently exec again.
+
+## Matching QuartzCore resources
+
+Stock backboardd **81599** passed the prior SystemWake assertion with the [system power adapter](system-power.md), created
+CAWindowServer and a swapchain, then aborted because `fixed_frag_lpf_cpf` was absent from its selected Metal library.
+A phone diagnostic established that CALayer's normal NSBundle lookup read the native QuartzCore `default.metallib`
+(23,192,352 bytes, 189 functions), while the matching RuntimeRoot library contained the required function
+(1,662,256 bytes, 175 functions). Merely deploying the simulator resource did not change that absolute bundle lookup.
+
+The backboardd configuration now enables the pure-C `CFBundleCreate` compatibility adapter before bundle initialization.
+It redirects eligible system-framework URLs only to existing contained framework bundles under RuntimeRoot, with readable
+bundle metadata; missing or ineligible candidates retain their original paths. In the phone trial with host **81917**,
+helper **81919**, launchd **81920**, and native diagnostic guest **81923** (logical **81922**), normal CALayer bundle/resource
+lookup and explicit RuntimeRoot lookup selected the same simulator library, both found the required function, and the
+guest exited **0**. The framework executable remains cache-only, so the resource bundle's `executableURL` is nil.
+This diagnostic proves corrected resource/library selection. The later stock run below additionally verifies its first
+frame. See [the mechanism, scope and evidence](metal.md#simulator-framework-resource-lookup).
+
+## First stock backboardd frame
+
+The normal phone run used host **82139**, native Metal helper **82140**, simulator launchd **82141**, and native stock
+backboardd **82143**, retaining logical PID **82142**. With the matching framework resources and compiler fixes, backboardd
+passed its earlier shader-specialization abort and submitted a real framebuffer request. The host completed operation
+**1** from IOSurface **45**, assigned the copied image to its UIImageView, and captured the same immutable image.
+
+The recovered `tmp/framebuffer-server/phone-first-frame.png` is **1290 × 2796** and visibly contains a spinner on black.
+Its SHA-256 is `174efa36e14dd9edf5f7e765c2fd772adfbe2d89b0825c59eddd59f876f6b212`. This establishes a guest-rendered frame
+through the native presentation path. The image contains no Apple logo or progress bar, and it does not establish complete
+simulator boot or a working SpringBoard session. Evidence is `tmp/metal-native/console-stock-framebuffer.log` and
+`tmp/metal-native/guest-stock-framebuffer.log`; the scoped `security-stock-framebuffer.log` capture contains no amfid rejection
+or TXM event.
+
+Subsequent requests used matching source/destination rectangles **`597,1350,96,96`**, layer 0 and flags **`0x18`**. The
+then-full-frame-only server rejected those with `ENOTSUP`, so this capture does not prove continuing spinner animation.
+The server and view now support bounded composition of matching dirty rectangles after a successful full-frame baseline.
+Focused tests, the full regression suite and the device build pass; the subsequent phone trial below also verifies partial updates.
+See [framebuffer behavior and limits](framebuffer.md#host-implementation-and-limits).
+
+### Partial frames and the subsequent input abort
+
+The next normal run used host **82181**, native helper **82182**, simulator launchd **82183**, and native backboardd
+**82185**, retaining logical PID **82184**. The host completed full-frame operation **1** from surface **302**, partial
+operation **5** from surface **303**, and operation **300** from surface **304**, with **300** completed frames. The partial
+rectangle was the observed **`597,1350,96,96`**. The first-frame PNG matched the earlier spinner image's SHA-256. This verifies
+continued accepted composition on the phone, beyond the first full frame. Evidence is `tmp/metal-native/console-stock-dirty.log`.
+
+This run ended about **21 seconds** after startup with **SIGABRT (6)**. An uncaught `NSInternalInconsistencyException`
+reported `Encountered HID event with unexpected target 0 not in known targets`. The stack passes through
+`-[SimHIDVirtualServiceManager serviceForIndigoHIDData:]` and the `SimHIDSystem initUsingHIDService:error:` event block.
+The exception and full stack are in `tmp/metal-native/guest-stock-dirty-exit.log`. The broker recorded wait status `0x6`,
+revoked the graphics owner's authorization and terminated its native Metal helper. This is a separate Indigo packet failure;
+the successful frame count does not mean that earlier backboardd remained alive or finished booting. The later input result is below.
+
+### Readable stock touch markers
+
+After the Indigo target/creation fixes, normal boot-generation environment and missing runtime assets were supplied, a
+fresh normal run used host **82455**, helper **82456**, launchd **82457**, backboardd logical **82458** / native **82460**,
+and cfprefsd logical **82459** / native **82461**. Physical touches reached the stock visualizer and produced dirty updates.
+The phone screenshot `tmp/framebuffer-server/phone-display-inset.png` shows readable `t3 p1`, `in range`, `touch down`,
+and `ctx:C488CF8E` labels plus the spinner, with the native status bar unobstructed. Its SHA-256 is
+`11177bacf9c2d2914ca1b4f00b7e63574f4d7cabdbffb491fbf7c3b397e14476`.
+The normal production shim was restored before this run. Evidence is `tmp/metal-native/console-display-inset.log` and
+`tmp/cfprefsd/final-phone-state.log`; [the preferences notes](cfprefsd.md) retain the separate, still-unproven daemon IPC question.
+This establishes stock touch-marker rendering and the font correction, not a complete simulator boot or SpringBoard session.
+
+A separate LLDB run used host **82160** and backboardd **82168** and stalled around debugger image notification. It is not
+the normal-run first-frame evidence, and no debugger continuation is needed to explain the captured frame. Its artifacts
+are `tmp/metal-native/console-stock-framebuffer-lldb.log` and `tmp/framebuffer-server/lldb-stock-framebuffer-notifier.txt`.
