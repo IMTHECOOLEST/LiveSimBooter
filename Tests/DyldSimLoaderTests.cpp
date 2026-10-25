@@ -355,6 +355,8 @@ static SimSyscallHelpers fakeHelpers = {};
 void LSBPrepareHostPolicy() {}
 static const mach_header *debuggerExecutable;
 static std::string debuggerExecutablePath;
+static bool checkedFinalThreadCount;
+int LSBValidateHostThreadCount() { checkedFinalThreadCount = true; return 0; }
 int LSBPrepareHostDebugger(const mach_header *executable, const char *executablePath) {
     debuggerExecutable = executable;
     debuggerExecutablePath = executablePath;
@@ -383,8 +385,18 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
     check(argc == 2 && std::string(argv[0]) == "/RuntimeRoot/bin/df" && std::string(argv[1]) == "arg" && !argv[2], "copied argv and terminator");
     check(envp == argv + argc + 1, "environment follows argv contiguously");
     check(std::string(envp[0]) == "KEEP=value" && std::string(envp[1]) == "DYLD_ROOT_PATH=/RuntimeRoot", "root override preserves other environment");
-    check(std::string(envp[2]) == "DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld" && !envp[3], "cache directory override");
-    check(apple == envp + 4, "apple vector follows environment contiguously");
+    check(std::string(envp[2]) == "DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld", "cache directory override");
+    size_t environmentCount = 0, stderrSettings = 0;
+    for (; envp[environmentCount]; ++environmentCount) {
+        std::string value = envp[environmentCount];
+        check(value.rfind("DYLD_PRINT_TO_FILE=", 0) != 0, "inherited file logging cannot redirect simulator diagnostics");
+        if (value.rfind("DYLD_PRINT_TO_STDERR=", 0) == 0) {
+            ++stderrSettings;
+            check(value == "DYLD_PRINT_TO_STDERR=1", "simulator diagnostics override inherited setting");
+        }
+    }
+    check(stderrSettings == 1, "simulator diagnostic setting is not duplicated");
+    check(apple == envp + environmentCount + 1, "apple vector follows expanded environment contiguously");
     unsigned executablePaths = 0, preservedApple = 0, ptrMungeTokens = 0;
     for (const char *const *item = apple; *item; ++item) {
         std::string value = *item;
@@ -417,6 +429,7 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
 
 struct HandoffComplete {};
 int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
+    check(checkedFinalThreadCount, "native worker guard runs before destructive cache detachment");
     check(launch->thread.hostTSD == 0x1000 && launch->thread.simulatorTSD == 0x2000, "handoff receives prepared thread storage");
     // The real implementation never returns after entry. Model that boundary without detaching this test process's cache.
     uintptr_t startGlue = 0;
@@ -429,7 +442,8 @@ int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
 static void entryTest() {
     LSBMappedImage image = {&fakeDyld, 0, 42, reinterpret_cast<uintptr_t>(&fakeEntry)};
     const char *argv[] = {"/RuntimeRoot/bin/df", "arg", nullptr};
-    const char *envp[] = {"DYLD_ROOT_PATH=/old", "KEEP=value", "DYLD_SHARED_CACHE_DIR=/old-cache", nullptr};
+    const char *envp[] = {"DYLD_ROOT_PATH=/old", "KEEP=value", "DYLD_SHARED_CACHE_DIR=/old-cache", "DYLD_PRINT_TO_STDERR=0",
+                          "DYLD_PRINT_TO_FILE=/old.log", nullptr};
     const char *apple[] = {"executable_path=/app", "executable_file=0x123,0x456", "stack_guard=0x1234", "ptr_munge=", "ptr_munge=0x1234", nullptr};
     auto enter = [&] {
         return LSBEnterDyldSim(&image, &fakeExecutable, "/RuntimeRoot/bin/df", "/RuntimeRoot/usr/lib/dyld_sim", "/RuntimeRoot", 2, argv, envp, apple);
@@ -437,6 +451,8 @@ static void entryTest() {
     bool handedOff = false;
     try { enter(); } catch (const HandoffComplete &) { handedOff = true; }
     check(handedOff && entryCalls == 1 && mainCalls == 0, "entry is called without returning to host cleanup or invoking main");
+    check(std::string(envp[3]) == "DYLD_PRINT_TO_STDERR=0", "simulator diagnostic setup leaves host environment untouched");
+    check(std::string(envp[4]) == "DYLD_PRINT_TO_FILE=/old.log", "simulator logging leaves inherited host output path untouched");
     check(std::string(apple[3]) == "ptr_munge=" && std::string(apple[4]) == "ptr_munge=0x1234", "simulator token erasure leaves host apple data untouched");
     check(enter() == 1 && entryCalls == 1, "second entry is rejected");
 }

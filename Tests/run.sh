@@ -31,3 +31,28 @@ xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -arch arm64 -fno-bui
     -DLSB_DEBUGGER_NOTIFICATION_TESTING Tests/DebuggerNotificationTests.cpp LiveSimBooter/SimSyscallHelpers.cpp LiveSimBooter/LocalRuntime.cpp \
     LiveSimBooter/LocalPOSIX.cpp LiveSimBooter/LocalMach.cpp -o "$test_directory/DebuggerNotification"
 "$test_directory/DebuggerNotification"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SpawnPlanTests.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnPlan"
+"$test_directory/SpawnPlan"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
+    Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
+"$test_directory/SpawnTransport"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_GUEST_RUNTIME \
+    Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/GuestSpawnTransport"
+XPC_FLAGS=0x2 "$test_directory/GuestSpawnTransport"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WIRE_TESTING -dynamiclib \
+    Guest/XPCWireCompatibility.c -install_name "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/libXPCWireCompatibility.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    -DLSB_GUEST_RUNTIME -DLSB_XPC_WIRE_COMPATIBILITY -DLSB_XPC_WIRE_TESTING \
+    Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c \
+    "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/WireSpawnTransport"
+DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/WireSpawnTransport"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WIRE_TESTING \
+    Tests/XPCWireCompatibilityTests.c "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/XPCWireCompatibility"
+DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
+    Tests/BrokerTests.m ProcessSupport/SpawnPlan.c -framework Foundation -o "$test_directory/Broker"
+"$test_directory/Broker"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/ExtensionLauncherTests.m -framework Foundation -o "$test_directory/ExtensionLauncher"
+"$test_directory/ExtensionLauncher"

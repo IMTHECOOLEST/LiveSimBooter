@@ -7,15 +7,79 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A9B7C4100000000000000010 /* LiveProcess.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A9B7C4100000000000000001 /* LiveProcess.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A9B7C4100000000000000015 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A9B7C4100000000000000013 /* Foundation.framework */; };
+		A9B7C4100000000000000018 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A9B7C4100000000000000019 /* UIKit.framework */; };
 		E19AD585308BA95D00634F93 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = E19AD584308BA95D00634F93 /* README.md */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		A9B7C4100000000000000012 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E19AD543308A56D200634F93 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A9B7C4100000000000000002;
+			remoteInfo = LiveProcess;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A9B7C410000000000000000F /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			dstPath = "";
+			dstSubfolder = PlugIns;
+			files = (
+				A9B7C4100000000000000010 /* LiveProcess.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		A9B7C4100000000000000001 /* LiveProcess.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LiveProcess.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A9B7C4100000000000000013 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		A9B7C4100000000000000019 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		E19AD54B308A56D200634F93 /* LiveSimBooter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiveSimBooter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E19AD584308BA95D00634F93 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		A9B7C410000000000000000C /* Exceptions for "LiveProcess" folder in "LiveProcess" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = A9B7C4100000000000000002 /* LiveProcess */;
+		};
+		A9B7C410000000000000000D /* Exceptions for "LiveSimBooter" folder in "LiveProcess" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			additionalCompilerFlagsByRelativePath = {
+				CompactImageInfo.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				DebuggerBridge.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				LocalMach.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				LocalPOSIX.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				LocalRuntime.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				MainThreadBootstrap.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				SharedCacheHandoff.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+				SimSyscallHelpers.cpp = "-fno-builtin -fno-stack-protector -fno-exceptions -fno-rtti";
+			};
+			membershipExceptions = (
+				Assets.xcassets,
+				Info.plist,
+				main.m,
+			);
+			target = A9B7C4100000000000000002 /* LiveProcess */;
+		};
+		A9B7C410000000000000000E /* Exceptions for "Host" folder in "LiveSimBooter" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			additionalCompilerFlagsByRelativePath = {
+				Broker.m = "-fobjc-arc";
+				ExtensionLauncher.m = "-fobjc-arc";
+				HostApplication.m = "-fobjc-arc";
+				ViewController.m = "-fobjc-arc";
+			};
+			target = E19AD54A308A56D200634F93 /* LiveSimBooter */;
+		};
 		E19AD562308A56D300634F93 /* Exceptions for "LiveSimBooter" folder in "LiveSimBooter" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			additionalCompilerFlagsByRelativePath = {
@@ -36,10 +100,32 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		A9B7C4100000000000000009 /* Host */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				A9B7C410000000000000000E /* Exceptions for "Host" folder in "LiveSimBooter" target */,
+			);
+			path = Host;
+			sourceTree = "<group>";
+		};
+		A9B7C410000000000000000A /* ProcessSupport */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ProcessSupport;
+			sourceTree = "<group>";
+		};
+		A9B7C410000000000000000B /* LiveProcess */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				A9B7C410000000000000000C /* Exceptions for "LiveProcess" folder in "LiveProcess" target */,
+			);
+			path = LiveProcess;
+			sourceTree = "<group>";
+		};
 		E19AD54D308A56D200634F93 /* LiveSimBooter */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				E19AD562308A56D300634F93 /* Exceptions for "LiveSimBooter" folder in "LiveSimBooter" target */,
+				A9B7C410000000000000000D /* Exceptions for "LiveSimBooter" folder in "LiveProcess" target */,
 			);
 			path = LiveSimBooter;
 			sourceTree = "<group>";
@@ -52,19 +138,39 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A9B7C4100000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
 		E19AD548308A56D200634F93 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A9B7C4100000000000000015 /* Foundation.framework in Frameworks */,
+				A9B7C4100000000000000018 /* UIKit.framework in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		A9B7C4100000000000000017 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A9B7C4100000000000000013 /* Foundation.framework */,
+				A9B7C4100000000000000019 /* UIKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		E19AD542308A56D200634F93 = {
 			isa = PBXGroup;
 			children = (
 				E19AD584308BA95D00634F93 /* README.md */,
 				E19AD54D308A56D200634F93 /* LiveSimBooter */,
+				A9B7C4100000000000000009 /* Host */,
+				A9B7C410000000000000000A /* ProcessSupport */,
+				A9B7C410000000000000000B /* LiveProcess */,
+				A9B7C4100000000000000017 /* Frameworks */,
 				F4BC8A4C308B000100000001 /* unused */,
 				E19AD54C308A56D200634F93 /* Products */,
 			);
@@ -74,6 +180,7 @@
 			isa = PBXGroup;
 			children = (
 				E19AD54B308A56D200634F93 /* LiveSimBooter.app */,
+				A9B7C4100000000000000001 /* LiveProcess.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -81,6 +188,26 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A9B7C4100000000000000002 /* LiveProcess */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A9B7C4100000000000000006 /* Build configuration list for PBXNativeTarget "LiveProcess" */;
+			buildPhases = (
+				A9B7C4100000000000000003 /* Sources */,
+				A9B7C4100000000000000004 /* Frameworks */,
+				A9B7C4100000000000000005 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				A9B7C410000000000000000A /* ProcessSupport */,
+				A9B7C410000000000000000B /* LiveProcess */,
+				E19AD54D308A56D200634F93 /* LiveSimBooter */,
+			);
+			name = LiveProcess;
+			productName = LiveProcess;
+			productReference = A9B7C4100000000000000001 /* LiveProcess.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		E19AD54A308A56D200634F93 /* LiveSimBooter */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = E19AD563308A56D300634F93 /* Build configuration list for PBXNativeTarget "LiveSimBooter" */;
@@ -88,10 +215,16 @@
 				E19AD547308A56D200634F93 /* Sources */,
 				E19AD548308A56D200634F93 /* Frameworks */,
 				E19AD549308A56D200634F93 /* Resources */,
+				A9B7C410000000000000000F /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
+			dependencies = (
+				A9B7C4100000000000000011 /* PBXTargetDependency */,
+			);
 			fileSystemSynchronizedGroups = (
+				A9B7C4100000000000000009 /* Host */,
+				A9B7C410000000000000000A /* ProcessSupport */,
 				E19AD54D308A56D200634F93 /* LiveSimBooter */,
 			);
 			name = LiveSimBooter;
@@ -108,6 +241,9 @@
 				BuildIndependentTargetsInParallel = 1;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
+					A9B7C4100000000000000002 = {
+						CreatedOnToolsVersion = 27.0;
+					};
 					E19AD54A308A56D200634F93 = {
 						CreatedOnToolsVersion = 27.0;
 					};
@@ -128,11 +264,17 @@
 			projectRoot = "";
 			targets = (
 				E19AD54A308A56D200634F93 /* LiveSimBooter */,
+				A9B7C4100000000000000002 /* LiveProcess */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		A9B7C4100000000000000005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
 		E19AD549308A56D200634F93 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
@@ -142,6 +284,11 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A9B7C4100000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 		E19AD547308A56D200634F93 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
@@ -149,18 +296,109 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		A9B7C4100000000000000011 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A9B7C4100000000000000002 /* LiveProcess */;
+			targetProxy = A9B7C4100000000000000012 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		A9B7C4100000000000000007 /* Debug configuration for PBXNativeTarget "LiveProcess" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_LINK_OBJC_RUNTIME = NO;
+				CODE_SIGN_ENTITLEMENTS = LiveProcess/LiveProcess.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = UU7W52U79B;
+				ENABLE_DEBUG_DYLIB = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"OS_OBJECT_USE_OBJC=0",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/LiveSimBooter",
+					"$(SRCROOT)/ProcessSupport",
+				);
+				INFOPLIST_FILE = LiveProcess/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LiveProcess;
+				LD_ENTRY_POINT = _NSExtensionMain;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter.LiveProcess;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A9B7C4100000000000000008 /* Release configuration for PBXNativeTarget "LiveProcess" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_MODULES = NO;
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_LINK_OBJC_RUNTIME = NO;
+				CODE_SIGN_ENTITLEMENTS = LiveProcess/LiveProcess.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = UU7W52U79B;
+				ENABLE_DEBUG_DYLIB = NO;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"OS_OBJECT_USE_OBJC=0",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/LiveSimBooter",
+					"$(SRCROOT)/ProcessSupport",
+				);
+				INFOPLIST_FILE = LiveProcess/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LiveProcess;
+				LD_ENTRY_POINT = _NSExtensionMain;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter.LiveProcess;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 		E19AD564308A56D300634F93 /* Debug configuration for PBXNativeTarget "LiveSimBooter" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_OBJC_ARC = NO;
-				CLANG_LINK_OBJC_RUNTIME = NO;
+				CLANG_LINK_OBJC_RUNTIME = YES;
+				CODE_SIGN_ENTITLEMENTS = LiveSimBooter/LiveSimBooter.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = UU7W52U79B;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/Host",
+					"$(SRCROOT)/LiveSimBooter",
+					"$(SRCROOT)/ProcessSupport",
+				);
 				INFOPLIST_FILE = LiveSimBooter/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -184,11 +422,18 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CLANG_ENABLE_OBJC_ARC = NO;
-				CLANG_LINK_OBJC_RUNTIME = NO;
+				CLANG_LINK_OBJC_RUNTIME = YES;
+				CODE_SIGN_ENTITLEMENTS = LiveSimBooter/LiveSimBooter.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = UU7W52U79B;
 				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/Host",
+					"$(SRCROOT)/LiveSimBooter",
+					"$(SRCROOT)/ProcessSupport",
+				);
 				INFOPLIST_FILE = LiveSimBooter/Info.plist;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
@@ -325,6 +570,14 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A9B7C4100000000000000006 /* Build configuration list for PBXNativeTarget "LiveProcess" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A9B7C4100000000000000007 /* Debug configuration for PBXNativeTarget "LiveProcess" */,
+				A9B7C4100000000000000008 /* Release configuration for PBXNativeTarget "LiveProcess" */,
+			);
+			defaultConfigurationName = Release;
+		};
 		E19AD546308A56D200634F93 /* Build configuration list for PBXProject "LiveSimBooter" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

@@ -12,3 +12,6 @@ int LSBPrepareHostMainThread(lsb::MainThreadBootstrap *bootstrap);
 
 // Snapshot native debugger metadata and the shared-cache range before the handoff changes either.
 int LSBPrepareHostDebugger(const mach_header *executable, const char *executablePath);
+
+// Reject any remaining native worker immediately before switching TLS and removing its code mappings.
+int LSBValidateHostThreadCount();

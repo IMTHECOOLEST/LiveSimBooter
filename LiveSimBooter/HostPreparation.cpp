@@ -2,6 +2,7 @@
 #include "DebuggerBridge.h"
 #include "LocalPOSIX.h"
 #include "SimSyscallHelpers.h"
+#include "../ProcessSupport/SingleThreadGuard.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -11,6 +12,8 @@
 #include <mach-o/dyld.h>
 #include <pthread.h>
 #include <unistd.h>
+
+int LSBValidateHostThreadCount() { return LSBSingleThreadGuard(); }
 
 int LSBPrepareHostDebugger(const mach_header *executable, const char *executablePath) {
     task_dyld_info_data_t info = {};

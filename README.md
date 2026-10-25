@@ -1,9 +1,33 @@
 # LiveSimBooter
 
-Initial arm64 `dyld_sim` handoff from an iPhone app. `main()` maps `Documents/RuntimeRoot/usr/lib/dyld_sim` and
-`Documents/RuntimeRoot/bin/df`, then calls dyld_sim's entry point with df's mapped executable header.
-After preparation, it invokes the returned `start_sim` wrapper to run df and terminate through the simulator runtime.
-UIKit startup is commented out; the original delegates, controller and storyboards are in `unused/`, outside the app target.
+Experimental arm64 simulator runtime on an iPhone. The native app has a minimal UIKit foreground window and acts as a spawn broker.
+It discovers `LiveProcess.appex` through `NSExtension` and launches separate instances through PlugInKit's pkd launch operation.
+Its C entry receives a launch plan and descriptors through synchronous XPC,
+maps `dyld_sim` and the requested executable, detaches the native cache, then invokes `start_sim`.
+The native view starts `/bin/spawn-probe` once from `viewDidLoad`; app launch arguments can select another RuntimeRoot executable.
+The probe performs `posix_spawn` inside the simulator guest. UIKit is confined to the native host; the original delegates,
+controller and storyboards remain in `unused/`, outside the app target.
+
+`RuntimeRoot` lives inside App Group `group.com.kdt.LiveSimBooter`. On first launch, the broker moves an existing
+`Documents/RuntimeRoot` there if the destination does not exist. Both app and extension need matching App Group provisioning.
+The child contains no Objective-C imports; the native broker uses Foundation and UIKit. A simulator interposer
+forwards `posix_spawn`/`posix_spawnp` to the broker, including argv, environment, supported attributes and ordered FD actions.
+On the tested iPhone, the simulator probe spawned two separate `df` processes in sequence. Each child unloaded its native cache,
+ran from the rebuilt iOS 26 cache, and returned 2,268 bytes through redirected stdout before EOF. The foreground native host
+remained active after its launch assertion ended. Native preparation preserves a raw broker Mach send right for guest IPC,
+and the transport adapter handles the native/simulator XPC wire-magic difference.
+An LLDB run also completed a guest spawn with one thread at both IPC boundary breakpoints; simulator images were recognized
+while native-cache code remained inaccessible.
+See [multiprocess setup, progress, and limits](docs/multiprocess.md).
+
+Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and
+restores the normal idle timer when it becomes inactive. The earlier headless host was suspended once
+its launch assertion ended, and attaching LLDB alone did not prevent that suspension. The retained child assertion also depends
+on its host remaining active. `waitpid`, SIGCHLD, and guest exit-status collection are not implemented. The current test
+runtime keeps 219 loose cached dylibs in the reversible App Group backup `RuntimeLooseDylibs-multiprocess`, beside `RuntimeRoot`;
+the rebuilt cache supplies them. The detailed device results below describe the earlier direct-launch implementation.
+
+See [docs/](docs/README.md) for the handoff design, cache signing/rebuilding procedure, device debugging commands, and recorded test results.
 
 Place your signed images at those paths, preserving their Mach-O layout. The loader accepts `dyld_sim` as `MH_DYLINKER` or
 an experimental `MH_DYLIB` signing variant. df may be `MH_EXECUTE` or `MH_DYLIB`, and must retain arm64 iOS Simulator
@@ -17,9 +41,9 @@ maps its segments, and handles zero-fill. The executable's `__PAGEZERO` is exclu
 
 The entry receives df's mapped header, a persistent kernel-style argument block, and the version 18 syscall helper
 table from the pinned Apple ABI. Tracing and external Mach monitor callbacks are disabled while preserving their ABI slots.
-Image changes publish debugger metadata and call an app-resident notification function. `DYLD_ROOT_PATH` points to `Documents/RuntimeRoot`, and
+Image changes publish debugger metadata and call an app-resident notification function. `DYLD_ROOT_PATH` points to the App Group's `RuntimeRoot`, and
 `DYLD_SHARED_CACHE_DIR` points to its `System/Library/Caches/com.apple.dyld` directory. Adjust that directory for a different runtime layout.
-`argv[0]` and the apple vector's `executable_path` identify the actual df file, with no additional arguments. The host's
+The caller's argv is preserved, and the apple vector's `executable_path` identifies the resolved runtime executable. The host's
 `executable_file` metadata is removed so it cannot override df's path. dyld_sim handles df's fixups and dependencies.
 The loader replaces inherited `ptr_munge` entries with a fresh nonzero random token before handoff. Its apple-vector storage
 is writable because simulator libpthread consumes and erases that value; the original host apple strings remain untouched.
@@ -42,7 +66,7 @@ Simulator pthread finishes initializing the fresh object. No host TLS keys, clea
 All 67 helper callbacks now reside in the app. `LocalPOSIX.cpp` uses direct BSD syscalls; `LocalMach.cpp` uses Mach traps and
 local message clients. `LocalRuntime.cpp` supplies memory/string operations, per-thread errno, recursive lock bridging and
 stderr formatting without calling host libc, pthread, Objective-C, or C++ runtime functions. These files and the helper table
-compile without builtins, stack protectors, exceptions or RTTI. Startup uses C path handling without starting Foundation.
+compile without builtins, stack protectors, exceptions or RTTI. LiveProcess startup uses C path handling without starting Foundation.
 
 `HostPreparation.cpp` queries the actual host AMFI policy before detachment for the pinned simulator's input flags (1).
 The callback returns that saved result for identical flags; other inputs return `ENOSYS`. No host function pointer is retained
@@ -78,20 +102,52 @@ The snapshot writer also accepts cache images packed on 4 KiB boundaries and use
 address. It describes loaded cache images individually, including their actual segment coordinates. Cache-specific Atlas APIs
 and the cache image bitmap are not implemented; dyld_sim still owns the legacy shared-cache address, slide and UUID fields.
 
-The shared-cache experiment on 2026-10-24 built a matching iOS 26 cache containing 219 dylibs, using the runtime's
-`update_dyld_sim_shared_cache`. The single signed file is 292,749,312 bytes. On the tested iPhone, a genuinely signed cache
+The shared-cache experiment on 2026-10-24 rebuilt a matching iOS 26 cache containing 219 dylibs at `0x120000000`, using a patched
+copy of the runtime's `update_dyld_sim_shared_cache`. The single signed file is 292,749,312 bytes. On the tested iPhone, the signed cache
 with CodeDirectory v0x20400, no scatter table, 16 KiB SHA-256 pages, the app identifier/team, and no entitlements passes
-`F_ADDFILESIGS_RETURN` and the executable first-page mapping. Its complete 187,645,952-byte TEXT mapping also receives `r-x`
-at `0x120000000`, verified under LLDB without adding execute permission afterward. This establishes executable mapping of a
-signed cache; it does not establish execution of the cache at a relocated address.
+`F_ADDFILESIGS_RETURN`. Its complete 187,645,952-byte TEXT mapping receives `r-x`, without adding execute permission afterward.
+LLDB stopped inside cached `libSystem_initializer` at `0x129d4ff78`, then inside `getmntinfo` called by df through `start_sim`.
+The native dyld code remained inaccessible. df printed the filesystem table and exited with status 0, both under LLDB and in
+a fresh launch without a debugger. The initial run used two cached dylibs and loose RuntimeRoot overrides for the others.
+A follow-up temporarily moved all 219 loose dylibs outside RuntimeRoot and verified that all 46 loaded dependencies carried
+`MH_DYLIB_IN_CACHE` with headers inside the rebuilt cache. LLDB reached cached `__pthread_init` at `0x12b2688d8` and cached
+`getmntinfo` at `0x12b09e984`, recognized all 49 modules, and df again exited 0 with and without the debugger.
+AMFI reported no rejection. One TXM `selector: 38 | 23` event appeared during the LLDB run without preventing completion;
+the separate normal-launch capture had no TXM errors. Three subsequent traced LLDB runs did not reproduce it. Packet logs
+confirmed that internal pthread software breakpoints dirty two cache pages; requiring hardware breakpoints globally kept
+cache TEXT clean. This establishes the source of the dirty pages, but not the earlier TXM event. All 219 loose dylibs were
+restored after testing; the rebuilt cache remains enabled. See [the debugger comparison](docs/debugging.md#internal-breakpoint-investigation)
+and [the cache notes](docs/shared-cache.md) for evidence and limits.
+
+The rebuilt cache's full declared span is `[0x120000000, 0x135508000)`; LLDB confirmed the destination was free before mapping.
+Comparison with the original build verified the exact `-0x60000000` relocation across all 219 images, 864 Mach-O segments,
+4,564 sections, 765,301 section symbols and 63,525 pointer slots. The builder regenerates the addresses from the original dylibs.
 
 The stock simulator mapping at `0x180000000` instead receives `r--` despite requesting `r-x`. Execution then faults at the
 cached libSystem initializer. TXM logs `selector: 38 | 23`. The supplied TXM 182.0 binary identifies this as a registered code
 region overlap: nesting inserts the full shared-region interval into the parent, and ordinary VM unmapping does not remove
 that registration. Its selectors match the observed operations, although that supplied binary predates the device OS.
+A later hardware-only retest reproduced the original-base failure: signature registration returned `0`, TEXT was `r--`
+with zero dirty pages, and TXM logged `38 | 23`. Execution faulted in cached `LibSystemHelpers::version()` before cached-image
+publication. Packet logs contained no software breakpoints or writes to cache TEXT. The restored `0x120000000` cache again
+ran df to exit `0`; see [the retest evidence](docs/shared-cache.md#original-base-hardware-only-retest).
+
 This accounts for the different results inside and outside the former host shared region. Changing the cache header alone
-cannot relocate it: simulator caches have no slide information, and both the builder and dyld_sim mapper hardcode the base.
-A complete cache-backed launch therefore needs a rebuilt or fully relocated cache and matching mapper using an available address outside that interval.
+cannot relocate its payload: simulator caches have no slide information. The tested iOS 26 builder and dyld_sim mapper hardcode the base.
+The rebuilt iOS 26 cache avoids that interval, and the patched dyld_sim reads its mapping base and failure-cleanup bounds from the cache header.
+
+`Tools/patch-ios26-cache-base.py` creates the two patched tools from exact iOS 26 build 23A343 originals. It checks their SHA-256
+hashes, verifies the six instruction changes, refuses overwrites and writes a patch manifest. Use its builder only for arm64
+simulator inputs. Ad-hoc sign that builder for execution on the Mac, rebuild the cache, then sign the patched dyld_sim with the
+app identity/identifier and sign the cache using the tool below. The supplied runtime binaries remain outside Git.
+
+```sh
+python3 Tools/patch-ios26-cache-base.py --builder ORIGINAL_BUILDER --dyld-sim ORIGINAL_DYLD_SIM --output-dir tmp/cache-base-tools
+```
+
+The old executable-overlap heuristic remains in dyld_sim; df does not intersect either range and needs no environment override.
+Do not put `DYLD_SHARED_REGION=private` in the native app launch environment: native dyld processes it before main and its own
+private-cache mapping hits the TXM overlap error. Any future simulator-only override must be added after native startup.
 
 The installed iOS 27 runtime's arm64 cache consists of the main file and `.01`, with 11 mappings and 1,826 cached images.
 Its declared region runs from `0x1c0000000` to `0x2abccc000`. All mapping slide-info offsets/sizes and both `maxSlide` fields are zero;
@@ -101,6 +157,16 @@ pointers and address-bearing headers still need adjustment. The surviving v4 sym
 sites; they are not a complete rebase inventory. Relocating this cache without the original dylibs is therefore a reconstruction
 task, not just an instruction or header patch. The smaller cache's successful mapping at `0x120000000` does not establish a usable
 address range for this much larger layout.
+See [the concrete stale-pointer example and layout limits](docs/shared-cache.md#ios-27-relocation-limits).
+
+Two later iOS 27 mapping-only trials used the matching 24A434 dyld_sim and df with the host app's Increased Memory Limit entitlement.
+At `0x300000000`, both signatures passed and all 11 mappings completed, but TEXT received `r--` and TXM reported two overlap events.
+This address is still inside the current native shared-region reservation, `[0x180000000, 0xfc0000000)`.
+The first exception was a trie read at its stale address `0x26b010000`, before cached code execution.
+A repeat at `0x8000000000`, beyond the native reservation and SDK GPU carveout, passed both signatures but its first fixed mapping
+failed with `ENOMEM`; no TXM overlap was logged. This does not establish that another entitlement would make the mapping succeed.
+The original working iOS 26 runtime was restored and df exited `0`. See [both trial results](docs/shared-cache.md#first-forced-base-trial-inside-the-native-reservation)
+and [the provisioning cleanup repair](docs/provisioning-cleanup.md) that allowed the newly provisioned host build to install.
 
 Ordinary embedded `codesign` signing adds a scatter table that this TXM rejects (`0x70 | 0x28 | 1`). Its DSC writer also leaves
 `codeSignatureSize` stale when the signature grows. The header must contain `file size - codeSignatureOffset` before the final
@@ -116,8 +182,8 @@ python3 Tools/sign-dyld-cache.py UNSIGNED_CACHE SIGNED_CACHE \
 
 The tool uses `codesign` for the initial identity/requirements, then signs the adjusted CodeDirectory through Security.framework
 without exporting a private key. It checks the page hashes and final signature. It does not relocate the cache or change device
-policy. Runtime/cache binaries remain outside Git. The experimental device cache is retained as
-`dyld_sim_shared_cache_arm64.test-disabled`; with it disabled, the existing loose-library df launch still exits with status 0.
+policy. The relocated cache and patched dyld_sim are installed and active on the test iPhone. The earlier stock-base cache is
+retained as `dyld_sim_shared_cache_arm64.test-disabled`, and the previous dyld_sim is backed up as `dyld_sim.before-relocated-cache`.
 The existing handoff stack and commented UIKit startup are unchanged.
 
 macOS's simulator launch [keeps bootstrap dyld outside the shared cache](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp#L1191-L1195).
@@ -150,6 +216,10 @@ They never detach the test process's cache or execute a simulator runtime, and d
 
 Run `python3 Tests/audit-local-runtime.py` to compile the callback/handoff code for iPhone arm64 at `-O0` and `-O2` and reject
 any external imports. Pass an Xcode `Objects-normal/arm64` directory to audit the actual build objects instead.
+
+Simulator dyld diagnostics are enabled by default for library/segment loading, searches, loaders, initializers,
+API calls, and image notifications. They go to stderr in Xcode or `devicectl --console`; the variables are added only to the
+simulator's copied environment. See [the flags and capture workflow](docs/debugging.md#simulator-dyld-diagnostics).
 
 Launch with `--probe-dlopen-dyld-sim` to call host `dlopen()` once on `RuntimeRoot/usr/lib/dyld_sim`, print its result and
 `dlerror()`, close a successful handle, then exit. This diagnostic runs before image mapping or host-cache removal.

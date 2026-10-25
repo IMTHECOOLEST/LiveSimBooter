@@ -358,11 +358,25 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     static std::vector<std::string> arguments, environment, appleStrings;
     static std::vector<uintptr_t> kernelArgs;
     for (int i = 0; i < argc; ++i) arguments.emplace_back(argv[i]);
-    for (auto entry = envp; entry && *entry; ++entry) {
-        if (strncmp(*entry, "DYLD_ROOT_PATH=", 15) != 0 && strncmp(*entry, "DYLD_SHARED_CACHE_DIR=", 22) != 0) environment.emplace_back(*entry);
-    }
-    environment.emplace_back(std::string("DYLD_ROOT_PATH=") + rootPath);
-    environment.emplace_back(std::string("DYLD_SHARED_CACHE_DIR=") + rootPath + "/System/Library/Caches/com.apple.dyld");
+    for (auto entry = envp; entry && *entry; ++entry) environment.emplace_back(*entry);
+    auto removeEnvironment = [&](const char *name) {
+        std::string prefix = std::string(name) + "=";
+        environment.erase(std::remove_if(environment.begin(), environment.end(), [&](const std::string &item) {
+            return item.compare(0, prefix.size(), prefix) == 0;
+        }), environment.end());
+    };
+    auto setEnvironment = [&](const char *name, const std::string &value) {
+        removeEnvironment(name);
+        environment.emplace_back(std::string(name) + "=" + value);
+    };
+    setEnvironment("DYLD_ROOT_PATH", rootPath);
+    setEnvironment("DYLD_SHARED_CACHE_DIR", std::string(rootPath) + "/System/Library/Caches/com.apple.dyld");
+    // Configure only the simulator's copied environment, after native dyld has finished startup.
+    removeEnvironment("DYLD_PRINT_TO_FILE");
+    // DYLD_PRINT_BINDINGS is opt-in: loose runtime overrides can produce hundreds of thousands of fixup lines.
+    for (const char *name : {"DYLD_PRINT_TO_STDERR", "DYLD_PRINT_LIBRARIES", "DYLD_PRINT_SEGMENTS", "DYLD_PRINT_INITIALIZERS",
+                            "DYLD_PRINT_LOADERS", "DYLD_PRINT_SEARCHING", "DYLD_PRINT_APIS", "DYLD_PRINT_NOTIFICATIONS"})
+        setEnvironment(name, "1");
     for (auto entry = apple; entry && *entry; ++entry) {
         // executable_file identifies the host by FSID/inode and takes precedence over executable_path inside dyld.
         if (strncmp(*entry, "executable_path=", 16) != 0 && strncmp(*entry, "executable_file=", 16) != 0 && strncmp(*entry, "ptr_munge=", 10) != 0)
@@ -415,6 +429,11 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     fprintf(stderr, "Detaching host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n", reinterpret_cast<void *>(image->entry), image->header,
             static_cast<unsigned long long>(image->slide));
     fflush(stderr);
+    int workerError = LSBValidateHostThreadCount();
+    if (workerError) {
+        fprintf(stderr, "Refusing host-cache detachment with native workers: %s\n", strerror(workerError));
+        return 1;
+    }
     int detachError = LSBDetachHostCacheAndEnter(&launch);
     // The handoff returns only when detachment failed and host libraries are still mapped.
     fprintf(stderr, "Host shared-cache detach failed: %s\n", strerror(detachError));

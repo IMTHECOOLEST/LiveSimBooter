@@ -1,0 +1,28 @@
+#ifndef LSB_PRIVATE_XPC_H
+#define LSB_PRIVATE_XPC_H
+
+#include <mach/mach.h>
+#include <stdint.h>
+#include <xpc/xpc.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Private synchronous pipe interface exported by libSystem on the supported iOS runtime.
+extern xpc_object_t xpc_pipe_create_from_port(mach_port_t port, uint32_t flags);
+extern int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t message, xpc_object_t *reply);
+extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *message, uint64_t flags);
+extern int xpc_pipe_routine_reply(xpc_object_t reply);
+extern void xpc_dictionary_get_audit_token(xpc_object_t dictionary, audit_token_t *token);
+// Synchronous launchd startup notification; this does not initialize an NSXPC listener or extension context.
+extern void launch_extension_check_in_live_4UIKit(void);
+
+extern mach_port_t bootstrap_port;
+extern kern_return_t bootstrap_check_in(mach_port_t bootstrap, const char *name, mach_port_t *port);
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, mach_port_t *port);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
