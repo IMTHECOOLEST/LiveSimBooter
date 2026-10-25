@@ -4,6 +4,11 @@ A noninteractive Bash baseline runs in LiveProcess on `iphone-0xf-26-cua-duy.loc
 This establishes shell startup and builtins after native-cache removal. Full `fork`, `exec`, terminal creation, and interactive
 job control are not implemented or established by this test.
 
+A later [dyld platform-compatibility test](ios-platform.md) also ran the original iOS 7 platform version of this binary
+without `vtool` or rebuilding it. That separately signed copy is `RuntimeRoot/bin/bash-ios`; its original
+`LC_VERSION_MIN_IPHONEOS` bytes are unchanged. PID 79579 printed its version and 42, then returned exit 37. The earlier
+converted `bin/bash` and its historical results below remain intact.
+
 ## Runtime file
 
 The locally supplied source is plain arm64 Bash 3.2.57 from

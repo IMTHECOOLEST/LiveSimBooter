@@ -7,6 +7,7 @@ The current target is a minimal arm64 runtime handoff with brokered `posix_spawn
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.
 - [Bash](bash.md): noninteractive builtin baseline, terminal-access probes, and remaining fork/exec design requirements.
 - [Fish](fish.md): interim spawn-based shell experiments, executable-access findings, and source-port progress.
+- [iOS platform compatibility](ios-platform.md): the pinned dyld_sim patch for unchanged device-platform binaries and dependencies.
 - [Shared cache](shared-cache.md): signing format, TXM findings, the relocated iOS 26 cache, and reproduction commands.
 - [iOS 27 relocation](ios27-relocation.md): low-address capacity, missing relocation records, and pointer/instruction fixups.
 - [iOS 26 base comparison](ios26-base-comparison.md): minimum stock inputs, two rebuilt caches, and exact assembly/data differences.

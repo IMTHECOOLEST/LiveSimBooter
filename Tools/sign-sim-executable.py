@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Sign a thin arm64 simulator executable without CS_EXECSEG_MAIN_BINARY.
+"""Sign a thin arm64 runtime executable without CS_EXECSEG_MAIN_BINARY.
 
 The original MH_EXECUTE file is never edited. codesign supplies a SHA-256 signature with
 the selected identifier, then the existing CMS helper signs the same CodeDirectory after
-clearing its main-executable bit. Output must be a new file. No entitlements are added.
+clearing its main-executable bit. Explicit 16KB signing pages also handle legacy iOS binaries
+without modifying their platform commands. Output must be a new file. No entitlements are added.
 """
 
 import argparse
@@ -145,7 +146,7 @@ def sign_executable(args):
         executable, helper = work / 'executable', work / 'sign-code-directory'
         shutil.copy2(args.source, executable)
         run(['/usr/bin/codesign', '--force', '--sign', args.identity, '--identifier', args.identifier,
-             '--digest-algorithm=sha256', '--timestamp=none', executable])
+             '--digest-algorithm=sha256', '--pagesize', '16384', '--timestamp=none', executable])
         run(['/usr/bin/codesign', '--verify', '--verbose=4', executable])
         signed_bytes = executable.read_bytes()
         parsed = parse_signature(signed_bytes, args.identifier)

@@ -150,7 +150,7 @@ bool parseLayout(const FileMapping &file, Layout &layout, std::string &error, ui
 
     uint64_t cursor = sizeof(header), commandsEnd = cursor + header.sizeofcmds;
     uint64_t entryValue = 0;
-    bool hasEntry = false, entryIsFileOffset = false, hasText = false, hasSimulatorPlatform = false;
+    bool hasEntry = false, entryIsFileOffset = false, hasText = false, hasPlatform = false;
     for (uint32_t i = 0; i < header.ncmds; ++i) {
         if (!contains(commandsEnd, cursor, sizeof(load_command))) return fail(error, "Truncated load command");
         auto command = read<load_command>(bytes + cursor);
@@ -180,9 +180,16 @@ bool parseLayout(const FileMapping &file, Layout &layout, std::string &error, ui
             auto version = read<build_version_command>(data);
             if (!contains(command.cmdsize, sizeof(version), uint64_t(version.ntools) * sizeof(build_tool_version)))
                 return fail(error, "Truncated build tool versions");
-            if (version.platform != PLATFORM_IOSSIMULATOR || hasSimulatorPlatform)
-                return fail(error, "Simulator program requires a single iOS Simulator platform declaration");
-            hasSimulatorPlatform = true;
+            if ((version.platform != PLATFORM_IOSSIMULATOR && version.platform != PLATFORM_IOS) || hasPlatform)
+                return fail(error, "Program requires a single iOS or iOS Simulator platform declaration");
+            hasPlatform = true;
+        } else if (expectedType == MH_EXECUTE && (command.cmd == LC_VERSION_MIN_IPHONEOS || command.cmd == LC_VERSION_MIN_MACOSX
+                                                  || command.cmd == LC_VERSION_MIN_TVOS || command.cmd == LC_VERSION_MIN_WATCHOS)) {
+            if (command.cmdsize != sizeof(version_min_command)) return fail(error, "Invalid minimum OS version command");
+            if (command.cmd != LC_VERSION_MIN_IPHONEOS || hasPlatform)
+                return fail(error, "Program requires a single iOS or iOS Simulator platform declaration");
+            // For this arm64 image LC_VERSION_MIN_IPHONEOS declares device iOS. The patched dyld_sim handles its compatibility.
+            hasPlatform = true;
         } else if (command.cmd == LC_CODE_SIGNATURE) {
             if (command.cmdsize != sizeof(linkedit_data_command) || layout.signature.datasize) return fail(error, "Invalid code signature command");
             layout.signature = read<linkedit_data_command>(data);
@@ -213,8 +220,8 @@ bool parseLayout(const FileMapping &file, Layout &layout, std::string &error, ui
     }
     if (cursor != commandsEnd || !hasText || !hasEntry || !layout.signature.datasize)
         return fail(error, "Image requires valid load commands, __TEXT, an entry point and an embedded code signature");
-    if (expectedType == MH_EXECUTE && !hasSimulatorPlatform)
-        return fail(error, "Simulator program is missing an iOS Simulator LC_BUILD_VERSION");
+    if (expectedType == MH_EXECUTE && !hasPlatform)
+        return fail(error, "Program is missing an iOS or iOS Simulator platform declaration");
     if (expectedType == MH_EXECUTE && !entryIsFileOffset)
         return fail(error, "Simulator program must use LC_MAIN; legacy LC_UNIXTHREAD may start the program during preparation");
 

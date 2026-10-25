@@ -48,8 +48,12 @@ status with `waitpid`. See the [signaling scope and device results](docs/multipr
 See [docs/](docs/README.md) for the handoff design, cache signing/rebuilding procedure, device debugging commands, and recorded test results.
 
 Place your signed images at those paths, preserving their Mach-O layout. The loader accepts `dyld_sim` as `MH_DYLINKER` or
-an experimental `MH_DYLIB` signing variant. df may be `MH_EXECUTE` or `MH_DYLIB`, and must retain arm64 iOS Simulator
-`MH_PIE`, `LC_BUILD_VERSION`, and `LC_MAIN`. Validation follows the image's launch role regardless of its file type.
+an experimental `MH_DYLIB` signing variant. A program may be `MH_EXECUTE` or `MH_DYLIB`, and must retain plain arm64
+`MH_PIE` and `LC_MAIN`. Its single platform declaration may be iOS Simulator, iOS, or legacy `LC_VERSION_MIN_IPHONEOS`.
+Device iOS images require the [version-pinned dyld_sim compatibility patch](docs/ios-platform.md); their platform commands
+stay unchanged. The phone test ran an iOS executable with an iOS dylib and the existing iOS 7 Bash binary successfully after
+signing, without platform rewriting. Signing and available runtime APIs still constrain compatibility.
+Validation follows the image's launch role regardless of its file type.
 Change the file type before signing; the loader preserves the signed header in memory. `MH_DYLIB` acceptance here does not
 establish AMFI acceptance or compatibility with dyld_sim's own checks. In particular, a header-only `df` conversion lacks
 `LC_ID_DYLIB`, which the pinned dyld source requires when validating an `MH_DYLIB` main image during preparation.

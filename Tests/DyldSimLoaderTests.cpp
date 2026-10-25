@@ -252,8 +252,37 @@ static void executableParserTests() {
     parse(dylibVariant(bad), "MH_PIE", 0, MH_EXECUTE);
     bad = executable();
     edit<build_version_command>(bad, buildCommand, [](auto &build) { build.platform = PLATFORM_IOS; });
-    parse(bad, "iOS Simulator", 0, MH_EXECUTE);
-    parse(dylibVariant(bad), "iOS Simulator", 0, MH_EXECUTE);
+    parse(bad, nullptr, 0, MH_EXECUTE);
+    parse(dylibVariant(bad), nullptr, 0, MH_EXECUTE);
+    for (uint32_t platform : {PLATFORM_MACOS, PLATFORM_TVOS, PLATFORM_WATCHOS, PLATFORM_MACCATALYST, PLATFORM_TVOSSIMULATOR, 0, 99}) {
+        edit<build_version_command>(bad, buildCommand, [=](auto &build) { build.platform = platform; });
+        parse(bad, "single iOS or iOS Simulator", 0, MH_EXECUTE);
+    }
+    // Legacy device binaries keep their original load command rather than acquiring LC_BUILD_VERSION.
+    auto legacy = executable();
+    const size_t legacyPagezero = buildCommand + sizeof(version_min_command);
+    memmove(legacy.data() + legacyPagezero, legacy.data() + pagezeroCommand, sizeof(segment_command_64));
+    version_min_command minimum = {LC_VERSION_MIN_IPHONEOS, sizeof(minimum), 0x70000, 0};
+    put(legacy, buildCommand, minimum);
+    edit<mach_header_64>(legacy, 0, [](auto &header) { header.sizeofcmds -= sizeof(build_version_command) - sizeof(version_min_command); });
+    parse(legacy, nullptr, 0, MH_EXECUTE);
+    parse(dylibVariant(legacy), nullptr, 0, MH_EXECUTE);
+    for (uint32_t command : {LC_VERSION_MIN_MACOSX, LC_VERSION_MIN_TVOS, LC_VERSION_MIN_WATCHOS}) {
+        bad = legacy;
+        edit<load_command>(bad, buildCommand, [=](auto &load) { load.cmd = command; });
+        parse(bad, "single iOS or iOS Simulator", 0, MH_EXECUTE);
+    }
+    bad = executable();
+    edit<load_command>(bad, buildCommand, [](auto &command) { command.cmd = LC_VERSION_MIN_IPHONEOS; });
+    parse(bad, "Invalid minimum OS", 0, MH_EXECUTE);
+    for (auto bytes : {executable(), legacy}) {
+        auto header = read<mach_header_64>(bytes.data());
+        put(bytes, sizeof(header) + header.sizeofcmds, minimum);
+        ++header.ncmds;
+        header.sizeofcmds += sizeof(minimum);
+        put(bytes, 0, header);
+        parse(bytes, "single iOS or iOS Simulator", 0, MH_EXECUTE);
+    }
     bad = executable();
     edit<load_command>(bad, buildCommand, [](auto &command) { command.cmd = LC_UUID; });
     parse(bad, "iOS Simulator", 0, MH_EXECUTE);

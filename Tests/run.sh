@@ -52,6 +52,7 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutableAccessTests.c -o "$test_directory/ExecutableAccess"
 "$test_directory/ExecutableAccess"
+python3 -B Tests/PatchIOSPlatformTests.py
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
