@@ -3,6 +3,7 @@
 
 #include <mach/mach.h>
 #include <stdint.h>
+#include <uuid/uuid.h>
 #include <xpc/xpc.h>
 
 #ifdef __cplusplus
@@ -17,6 +18,9 @@ extern int xpc_pipe_routine_reply(xpc_object_t reply);
 extern void xpc_dictionary_get_audit_token(xpc_object_t dictionary, audit_token_t *token);
 // Synchronous launchd startup notification; this does not initialize an NSXPC listener or extension context.
 extern void launch_extension_check_in_live_4UIKit(void);
+// Native launchd service-instance signaling. Neither call requires activating the connection or starting an NSXPC handshake.
+extern void xpc_connection_set_oneshot_instance(xpc_connection_t connection, const uuid_t instance);
+extern void xpc_connection_kill(xpc_connection_t connection, int signal);
 
 extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_check_in(mach_port_t bootstrap, const char *name, mach_port_t *port);

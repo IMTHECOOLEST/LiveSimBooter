@@ -1,6 +1,9 @@
 #import <Foundation/Foundation.h>
 #include "Broker.h"
 #include "ExtensionLauncher.h"
+#include "ChildMonitor.h"
+#include "RunningBoardMonitor.h"
+#include "ChildStatus.h"
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
 #include <errno.h>
@@ -8,6 +11,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 enum { JobQueued, JobStarting, JobDispatched, JobRunning };
@@ -19,8 +23,25 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property pid_t extensionPID;
 @property LSBReceivedMessage *request;
 @property dispatch_source_t exitMonitor;
+@property (nonatomic, strong) LSBRunningBoardMonitor *runningBoardMonitor;
+@property audit_token_t audit;
+@property uint64_t parentIdentifier;
+@property LSBChildTicket parentTicket;
+@property BOOL parentStatusPublished;
+@property LSBChildStatus *childStatus;
+@property int statusFD, wakeReadFD, wakeWriteFD;
 @end
 @implementation LSBJob
+- (instancetype)init {
+    if ((self = [super init])) _statusFD = _wakeReadFD = _wakeWriteFD = -1;
+    return self;
+}
+- (void)dealloc {
+    if (_childStatus) munmap(_childStatus, LSB_CHILD_STATUS_MAPPING_SIZE);
+    if (_statusFD >= 0) close(_statusFD);
+    if (_wakeReadFD >= 0) close(_wakeReadFD);
+    if (_wakeWriteFD >= 0) close(_wakeWriteFD);
+}
 @end
 
 static NSMutableArray<LSBJob *> *jobs;
@@ -28,6 +49,7 @@ static LSBJob *startingJob;
 static NSString *runtimeRoot;
 static uint64_t nextIdentifier = 1;
 static BOOL launchLaneFailed;
+static unsigned finishingDepth;
 static void startNextJob(void);
 
 static LSBJob *findJob(uint64_t identifier) {
@@ -46,7 +68,40 @@ static void replyError(LSBReceivedMessage *message, int error) {
     disposeMessage(message);
 }
 
+static int prepareChildStatus(LSBJob *job) {
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/.child-status.XXXXXX", runtimeRoot.stringByDeletingLastPathComponent.fileSystemRepresentation);
+    if (length < 0 || (size_t)length >= sizeof(path)) return ENAMETOOLONG;
+    job.statusFD = mkstemp(path);
+    if (job.statusFD < 0) return errno;
+    int unlinkError = unlink(path) ? errno : 0;
+    if (unlinkError) return unlinkError;
+    if (fcntl(job.statusFD, F_SETFD, FD_CLOEXEC) < 0 || ftruncate(job.statusFD, LSB_CHILD_STATUS_MAPPING_SIZE) < 0) return errno;
+    void *mapping = mmap(NULL, LSB_CHILD_STATUS_MAPPING_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, job.statusFD, 0);
+    if (mapping == MAP_FAILED) return errno;
+    job.childStatus = mapping;
+    LSBChildStatusInitialize(job.childStatus);
+    int wake[2];
+    if (pipe(wake)) return errno;
+    job.wakeReadFD = wake[0];
+    job.wakeWriteFD = wake[1];
+    for (unsigned i = 0; i < 2; ++i) {
+        if (fcntl(wake[i], F_SETFD, FD_CLOEXEC) < 0 || fcntl(wake[i], F_SETFL, O_NONBLOCK) < 0) return errno;
+    }
+    if (fcntl(wake[1], F_SETNOSIGPIPE, 1) < 0) return errno;
+    return 0;
+}
+
+static void wakeParent(LSBJob *parent) {
+    const char hint = 1;
+    ssize_t written;
+    do { written = write(parent.wakeWriteFD, &hint, 1); } while (written < 0 && errno == EINTR);
+    if (written < 0 && errno != EAGAIN) fprintf(stderr, "[broker] Child wake failed: %s\n", strerror(errno));
+}
+
 static void finishJob(LSBJob *job, int error) {
+    if (!findJob(job.identifier)) return;
+    ++finishingDepth;
     fprintf(stderr, "[broker] request=%llu pid=%d finished error=%d\n", job.identifier, job.pid, error);
     // A timed-out launch can still start later. Never let that unbound child claim another request's plan.
     if (job.phase == JobStarting && !job.pid) {
@@ -59,10 +114,44 @@ static void finishJob(LSBJob *job, int error) {
         job.request = NULL;
     }
     if (job.exitMonitor) { dispatch_source_cancel(job.exitMonitor); job.exitMonitor = nil; }
+    if (job.runningBoardMonitor) { LSBRunningBoardMonitorCancel(job.runningBoardMonitor); job.runningBoardMonitor = nil; }
+    LSBJob *parent = findJob(job.parentIdentifier);
+    if (parent && !job.parentStatusPublished && !LSBChildStatusAbandon(parent.childStatus, job.parentTicket)) wakeParent(parent);
+    // No other process inherits the simulated parent's children. Running orphans retain their own monitor and ledger.
+    // Pending spawns have no surviving caller; cancel them before starting another queued extension.
+    for (LSBJob *child in [jobs copy]) {
+        if (child.parentIdentifier != job.identifier) continue;
+        child.parentIdentifier = 0;
+        if (child.phase != JobRunning) finishJob(child, ECANCELED);
+    }
     LSBReleaseExtension(job.identifier);
     if (startingJob == job) startingJob = nil;
     [jobs removeObject:job];
+    --finishingDepth;
     startNextJob();
+}
+
+static void recordChildExit(uint64_t identifier, int waitStatus) {
+    LSBJob *job = findJob(identifier);
+    if (!job) return;
+    fprintf(stderr, "[broker] request=%llu pid=%d exited wait-status=0x%x\n", identifier, job.pid, waitStatus);
+    LSBJob *parent = findJob(job.parentIdentifier);
+    if (job.phase == JobRunning && parent) {
+        int error = LSBChildStatusPublishExit(parent.childStatus, job.parentTicket, waitStatus);
+        if (error) fprintf(stderr, "[broker] Could not publish child status: %s\n", strerror(error));
+        else {
+            job.parentStatusPublished = YES;
+            wakeParent(parent);
+            audit_token_t identity = parent.audit;
+            int signalError = LSBChildSignal(&identity, SIGCHLD);
+            if (signalError == EACCES || signalError == EPERM) {
+                signalError = LSBSignalExtension(parent.identifier, SIGCHLD);
+                if (!signalError) fprintf(stderr, "[broker] SIGCHLD submitted through launchd for request=%llu pid=%d\n", parent.identifier, parent.pid);
+            }
+            if (signalError && signalError != ESRCH) fprintf(stderr, "[broker] SIGCHLD delivery failed: %s\n", strerror(signalError));
+        }
+    }
+    finishJob(job, job.phase == JobRunning ? 0 : ECHILD);
 }
 
 static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *context) {
@@ -77,7 +166,7 @@ static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *cont
 }
 
 static void startNextJob(void) {
-    if (startingJob) return;
+    if (startingJob || finishingDepth) return;
     if (launchLaneFailed) {
         for (LSBJob *job in [jobs copy]) if (job.phase == JobQueued) { finishJob(job, EBUSY); return; }
         return;
@@ -98,10 +187,19 @@ static void startNextJob(void) {
     }
 }
 
-static void enqueueSpawn(LSBReceivedMessage *message) {
+static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
     if (launchLaneFailed) { replyError(message, EBUSY); return; }
     if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
     LSBJob *job = [LSBJob new];
+    int error = prepareChildStatus(job);
+    if (error) { replyError(message, error); return; }
+    if (parent) {
+        LSBChildTicket ticket;
+        error = LSBChildStatusReserve(parent.childStatus, &ticket);
+        if (error) { replyError(message, error); return; }
+        job.parentIdentifier = parent.identifier;
+        job.parentTicket = ticket;
+    }
     job.identifier = nextIdentifier++;
     job.request = message;
     [jobs addObject:job];
@@ -116,7 +214,7 @@ static void handleMessage(LSBReceivedMessage *message) {
     switch (message->kind) {
         case LSB_REQUEST_SPAWN:
             if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
-            enqueueSpawn(message);
+            enqueueSpawn(message, sender);
             return;
         case LSB_REQUEST_CHECKIN: {
             // PlugInKit launches our registered extension. Match its PID to the kernel's sender identity; iOS denies
@@ -130,17 +228,46 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (job.extensionPID != pid) { replyError(message, EACCES); return; }
             job.pid = pid;
             job.pidVersion = generation;
+            job.audit = message->audit;
             job.phase = JobDispatched;
             uint64_t identifier = job.identifier;
-            job.exitMonitor = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid, DISPATCH_PROC_EXIT, dispatch_get_main_queue());
-            if (!job.exitMonitor) { replyError(message, ENOMEM); finishJob(job, ENOMEM); return; }
-            dispatch_source_set_event_handler(job.exitMonitor, ^{
-                LSBJob *exited = findJob(identifier);
-                if (exited) finishJob(exited, 0);
-            });
-            dispatch_resume(job.exitMonitor);
-            int error = LSBTransportReply(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
-                                          &job.request->plan, job.request->fds);
+            int monitor = -1;
+            int error = LSBChildMonitorCreate(pid, &monitor);
+            audit_token_t identity = job.audit;
+            if (error == EACCES || error == EPERM) {
+                LSBRunningBoardMonitor *fallback = nil;
+                error = LSBRunningBoardMonitorStart(&identity, ^(int waitStatus, int monitorError) {
+                    LSBJob *exited = findJob(identifier);
+                    if (!exited) return;
+                    if (monitorError) finishJob(exited, monitorError);
+                    else recordChildExit(identifier, waitStatus);
+                }, &fallback);
+                if (error) { replyError(message, error); finishJob(job, error); return; }
+                job.runningBoardMonitor = fallback;
+                fprintf(stderr, "[broker] Using RunningBoard exit monitor for pid=%d\n", pid);
+            } else {
+                if (error) { replyError(message, error); finishJob(job, error); return; }
+                // kqueue registers by PID. Verify the audited generation after registering; RBS already uses the full token.
+                error = LSBRunningBoardValidateIdentity(&identity);
+                if (error) { close(monitor); replyError(message, error); finishJob(job, error); return; }
+                job.exitMonitor = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)monitor, 0, dispatch_get_main_queue());
+                if (!job.exitMonitor) { close(monitor); replyError(message, ENOMEM); finishJob(job, ENOMEM); return; }
+                dispatch_source_set_cancel_handler(job.exitMonitor, ^{ close(monitor); });
+                dispatch_source_set_event_handler(job.exitMonitor, ^{
+                    LSBJob *exited = findJob(identifier);
+                    if (!exited) return;
+                    int waitStatus = 0;
+                    int monitorError = LSBChildMonitorRead(monitor, pid, &waitStatus);
+                    if (!monitorError) recordChildExit(identifier, waitStatus);
+                    else if (monitorError != EAGAIN) {
+                        fprintf(stderr, "[broker] Exit monitor failed: %s\n", strerror(monitorError));
+                        finishJob(exited, monitorError);
+                    }
+                });
+                dispatch_resume(job.exitMonitor);
+            }
+            error = LSBTransportReplyBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
+                                               &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD);
             disposeMessage(message);
             // Don't keep pipe writers alive while waiting for READY; the child now owns copies.
             for (unsigned i = 0; i < job.request->plan.fdCount; ++i) {
@@ -156,11 +283,20 @@ static void handleMessage(LSBReceivedMessage *message) {
                 replyError(message, ESRCH); return;
             }
             int error = message->error;
-            int replyError = LSBTransportReply(message, 0, pid, sender.identifier, NULL, NULL, NULL);
+            LSBJob *parent = findJob(sender.parentIdentifier);
+            // The child is still blocked in READY: capture its real group before it can run and exit.
+            if (!error && parent) {
+                pid_t group = getpgid(pid);
+                error = group < 0 ? errno : LSBChildStatusPublishRunning(parent.childStatus, sender.parentTicket, pid, group);
+            }
+            int replyError = LSBTransportReply(message, message->error ? 0 : error, pid, sender.identifier, NULL, NULL, NULL);
             disposeMessage(message);
             if (error || replyError) { finishJob(sender, error ? error : replyError); return; }
             sender.phase = JobRunning;
-            if (sender.request->object) LSBTransportReply(sender.request, 0, pid, sender.identifier, NULL, NULL, NULL);
+            if (sender.request->object) {
+                error = LSBTransportReply(sender.request, 0, pid, sender.identifier, NULL, NULL, NULL);
+                if (error) { finishJob(sender, error); return; }
+            }
             disposeMessage(sender.request);
             sender.request = NULL;
             fprintf(stderr, "[broker] spawn ready pid=%d request=%llu\n", pid, sender.identifier);
@@ -262,7 +398,7 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
                 dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { handleMessage(message); } });
             }
         });
-        enqueueSpawn(initial);
+        enqueueSpawn(initial, nil);
         return 0;
     }
 }

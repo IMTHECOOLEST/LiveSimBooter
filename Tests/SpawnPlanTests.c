@@ -8,6 +8,8 @@
 static unsigned transportCalls;
 static int transportFailure;
 static int pathSearch;
+static int internalWakeFD = -1;
+int LSBGuestChildWakeFD(void) { return internalWakeFD; }
 
 int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_t *pid) {
     assert(LSBValidateSpawnPlan(plan) == 0);
@@ -152,6 +154,25 @@ static void closeOnExecVariant(bool defaults) {
 static void normalCloseOnExec(void) { closeOnExecVariant(false); }
 static void defaultCloseOnExec(void) { closeOnExecVariant(true); }
 
+static void preservedInternalDescriptor(void) {
+    LSBSpawnPlan *plan = newPlan();
+    plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    int source = open("/dev/null", O_RDWR);
+    CHECK(source >= 0);
+    internalWakeFD = fcntl(source, F_DUPFD_CLOEXEC, 90);
+    CHECK(internalWakeFD >= 90);
+    int received[LSB_MAX_FDS];
+    emptyFDs(received);
+    importFD(plan, received, source, 60, 0);
+    CHECK(LSBApplySpawnPlanPreservingFD(plan, received, internalWakeFD) == 0);
+    CHECK(fcntl(internalWakeFD, F_GETFD) == FD_CLOEXEC);
+    CHECK(fcntl(60, F_GETFD) == -1 && errno == EBADF);
+    LSBSpawnPlan *snapshot = newPlan();
+    emptyFDs(received);
+    CHECK(snapshotFDs(snapshot, received) == 0 && snapshot->fdCount == 0);
+    CHECK(close(internalWakeFD) == 0);
+}
+
 static char workingDirectory[LSB_PATH_BYTES];
 static void opensAndDirectories(void) {
     LSBSpawnPlan *plan = newPlan();
@@ -261,6 +282,7 @@ int main(void) {
     runChild(cyclesAndOrdering, "descriptor cycles and ordered actions");
     runChild(normalCloseOnExec, "close-on-exec");
     runChild(defaultCloseOnExec, "close-on-exec default");
+    runChild(preservedInternalDescriptor, "internal wake descriptor survives and is not inherited");
     runChild(attributesAndFailure, "signal attributes and action errors");
     runChild(defaultProcessGroup, "default extension process group");
     strcpy(workingDirectory, "/tmp/LiveSimBooter-spawn-tests.XXXXXX");

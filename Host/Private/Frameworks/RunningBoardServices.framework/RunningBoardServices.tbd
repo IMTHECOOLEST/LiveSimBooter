@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-ios, arm64-ios-simulator, x86_64-ios-simulator ]
+install-name: '/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices'
+current-version: 1
+compatibility-version: 1
+exports:
+  - targets: [ arm64-ios, arm64-ios-simulator, x86_64-ios-simulator ]
+    objc-classes: [ RBSProcessHandle ]
+...

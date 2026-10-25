@@ -1,7 +1,7 @@
 # Simulator processes through LiveProcess
 
 The native `LiveSimBooter` app now has a minimal UIKit foreground window and acts as a launch broker. Every simulator program
-runs in a separate `LiveProcess.appex` instance. The first implementation intercepts `posix_spawn` and `posix_spawnp`; it does
+runs in a separate `LiveProcess.appex` instance. The implementation intercepts `posix_spawn`, `posix_spawnp`, `wait`, and `waitpid`; it does
 not implement a complete POSIX process tree or boot `launchd_sim`.
 
 The matching iOS 26 runtime remains the target. The spawn attribute and file-action decoder is pinned to the arm64 Darwin ABI
@@ -25,17 +25,20 @@ audited against that runtime's host-support libkernel. Recheck those layouts bef
    pending. It binds the kernel audit PID generation to the job, preventing another extension instance or a reused PID from
    acquiring that job's plan. No data is delivered before the launch PID matches. This does not rely on a child-supplied PID or
    a cross-process code-signature query.
-5. The child receives owned strings, scalar attributes, ordered actions, and XPC FD objects. It restores descriptors and process
+5. Before delivering the plan, the broker registers an exit monitor. The child receives owned strings, scalar attributes,
+   ordered actions, XPC FD objects, a shared child-status file, and a wake-pipe reader. It restores descriptors and process
    state, resolves the executable within RuntimeRoot, and maps it alongside `usr/lib/dyld_sim`.
 6. The native child retains one raw Mach send right to the broker and passes its numeric name in `LSB_BROKER_PORT`, replacing
    any inherited value. A READY exchange reports preparation success or its errno. After releasing native XPC objects, the child
    checks its thread count, performs the existing fresh-TSD/native-cache handoff, and enters dyld_sim. The loader checks again immediately before
    detachment. READY means preparation reached that point; it does not prove that dyld_sim or the guest program subsequently ran.
 7. The child inserts [libLiveSimSpawn.dylib](../Guest/SpawnShim.c) into the simulator environment. Its interposition tuples replace
-   public `posix_spawn` and `posix_spawnp`; a later guest spawn follows the same broker/extension path.
+   public `posix_spawn` and `posix_spawnp`; a later guest spawn follows the same broker/extension path. Its wait interposer
+   reads the shared status table directly, without guest XPC or a helper thread.
 
 The host calls declared private methods using normal Objective-C syntax. The narrow declarations live in
-[FoundationPrivate.h](../Host/Private/FoundationPrivate.h) and [PlugInKitPrivate.h](../Host/Private/PlugInKitPrivate.h).
+[FoundationPrivate.h](../Host/Private/FoundationPrivate.h), [PlugInKitPrivate.h](../Host/Private/PlugInKitPrivate.h), and
+[RunningBoardPrivate.h](../Host/Private/RunningBoardPrivate.h).
 [HostApplication.m](../Host/HostApplication.m) enters `UIApplicationMain`, supplies app/scene delegates and a native window,
 and retains the original command-line arguments for the view's one-time startup. Broker initialization returns without
 blocking, so UIKit owns the original main thread's run loop. The native host retains its cache. Keep the app foregrounded
@@ -173,13 +176,56 @@ counts open CLOEXEC descriptors too. Count/string overflow and descriptor exhaus
 
 Executable paths are resolved under RuntimeRoot and canonical paths escaping it are rejected. This is not a `chroot`: open/chdir
 file actions operate on the actual sandbox filesystem, and general guest filesystem-path virtualization is not implemented.
-The child replaces incoming `DYLD_INSERT_LIBRARIES` and `LSB_BROKER_PORT` values with its shim path and its own native broker
-send right. Interposition still depends on dyld's captured AMFI policy; `DYLD_PRINT_INTERPOSING=1` must show actual interposition.
+The child replaces incoming `DYLD_INSERT_LIBRARIES`, `LSB_BROKER_PORT`, `LSB_CHILD_STATUS`, and `LSB_CHILD_WAKE_FD` values with
+its own resources. Interposition still depends on dyld's captured AMFI policy; `DYLD_PRINT_INTERPOSING=1` must show actual interposition.
 
-Returned PIDs identify real extension processes, but the simulator caller is not their kernel parent. `waitpid`, `waitid`,
-SIGCHLD delivery, exit-status collection, parent-PID virtualization, fork, exec replacement, and full session/process-group
-inheritance are not implemented. A default child retains its system launch session/group. The broker watches process exit to
-release launch records; that is not guest wait emulation.
+Returned PIDs identify real extension processes, but the simulator caller is not their kernel parent. Parent-PID virtualization,
+fork, exec replacement, and full session/process-group inheritance remain unimplemented. A default child retains its system
+launch session/group; guest waiting is provided by the separate mechanism below.
+
+## Child status, waiting, and SIGCHLD
+
+Each guest receives a 4 KiB shared mapping with 16 child slots and a nonblocking wake-pipe reader. The host creates the backing
+file inside the App Group, unlinks it immediately, and transfers its descriptor at check-in. Native preparation maps it, closes
+the file descriptor, and preserves the reader outside file-action destinations and close sweeps. The mapping and FD survive
+cache detachment; no native object or callback is retained. The spawn shim excludes this private reader from ordinary FD inheritance.
+
+[ChildStatus.c](../ProcessSupport/ChildStatus.c) uses lock-free atomics and generation-tagged slots. A spawn reserves a slot in
+its simulated parent's table; READY publishes the real PID and current group before releasing the child. A failed spawn
+abandons the reservation. On exit the host publishes the raw wait status, writes a wake hint, and requests `SIGCHLD`. The guest
+claims each status once with compare-and-swap; the host can then reuse the slot. Completed statuses survive removal of host job
+records. Parent death cancels pending child launches and detaches running orphans, whose own exit monitors remain active.
+
+[ChildMonitor.c](../Host/ChildMonitor.c) first tries `EVFILT_PROC` with `NOTE_EXIT | NOTE_EXITSTATUS`. macOS tests collect exact
+statuses for non-child processes, but the iPhone sandbox rejects registration because XNU checks permission to send `SIGKILL`.
+The host therefore falls back to [RunningBoardMonitor.m](../Host/RunningBoardMonitor.m), using an audited PID-generation handle
+and hosted-process death subscription. Its `legacyCode` contains the raw wait4 status. A voluntary exit has a timestamp and
+type 1 even though its modern status object is nil; abnormal exits use type 2 with a valid status. Empty synthesized contexts
+and malformed values are rejected rather than converted to exit 0.
+
+Direct audited signaling is also denied on the tested phone. Apple's
+[libproc wrapper](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c) returns a positive
+errno on failure, which the host preserves. For `EACCES`/`EPERM`, the launch adapter asks launchd to signal the retained extension
+instance UUID through `xpc_connection_kill`. It does not resume an extension NSXPC service connection. A successful submission
+does not itself prove delivery; the device probe checks its handler. These notifications originate from the broker/launchd,
+so `siginfo_t` does not describe the simulated child with normal `CLD_*` provenance.
+The temporary native connection is canceled and activated in that canceled state before release, satisfying libxpc's lifecycle
+requirements without starting a peer handshake.
+
+[ChildWait.c](../Guest/ChildWait.c) supports exact PID, any child (`-1`), current group (`0`), and explicit negative-group selectors,
+plus `WNOHANG` and `wait()`. It preserves the raw status for `WIFEXITED`, `WEXITSTATUS`, `WIFSIGNALED`, and `WTERMSIG`. A second wait
+returns `ECHILD`; `WNOHANG` returns 0 without changing the status output when a matching child is still live. Blocking waits use
+the pipe only as a hint and rescan every 100 ms, so another waiter draining it cannot lose an exit. Waiting performs no XPC and
+starts no worker thread. Nonblocking reaping uses lock-free operations and is exercised from a signal handler.
+
+The current limits are:
+
+- `WUNTRACED` and `WCONTINUED` return `ENOTSUP`; other unknown option bits return `EINVAL`. Stop/continue events and `waitid` are unsupported.
+- Process-group selectors use the group captured at READY. Later guest `setpgid` changes are not reflected in stored child records.
+- A signal may interrupt a blocking wait with `EINTR` even with `SA_RESTART`; callers must retry. A status already available after interruption is returned first.
+- Interposed `sigaction`/`signal` mirror `SIG_IGN` and `SA_NOCLDWAIT` into the table and discard unreaped/future statuses.
+  Concurrent changes to the SIGCHLD disposition must be serialized by the caller.
+- This models the broker's simulated children only. It does not merge native kernel-child waits, synthesize child `siginfo_t`, or virtualize sessions and parent PIDs.
 
 ## Build and exercise
 
@@ -222,20 +268,21 @@ Those identifiers match the existing runtime signing set. The tested dyld_sim, c
 extension's App Group path. A newly signed executable still needs its own device validation.
 
 [SpawnProbe.c](../Guest/SpawnProbe.c) spawns `/bin/df -h`, redirects stdout through a transferred pipe, prints the returned PID,
-and reads until EOF with a 15-second deadline. It deliberately does not use `waitpid`; successful output and EOF exercise
-spawn preparation and descriptor lifetime independently of future wait emulation.
+and reads until EOF with a 15-second deadline. It then checks `waitpid`, raw exit status 0, SIGCHLD delivery, and `ECHILD` after reaping.
+`--verify-statuses` adds gated children that return 0, return 37, and terminate themselves with SIGTERM. Before opening each gate
+it verifies `WNOHANG=0`; subsequent waits include an any-child selector and check the exact exit/signal encoding.
 
 `--repeat N` runs between 1 and 16 sequential spawn/read/EOF iterations, defaulting to one. `--debug-delay N` waits 1–60 seconds
 after simulator startup before spawning, allowing LLDB to attach. Use `--debug-delay 60` for the verified device workflow:
 
 ```sh
 xcrun devicectl device process launch --device iphone-0x11-cua-duy --terminate-existing --console \
-  -- com.kdt.LiveSimBooter /bin/spawn-probe --debug-delay 60 --repeat 2
+  -- com.kdt.LiveSimBooter /bin/spawn-probe --debug-delay 60 --repeat 2 --verify-statuses
 ```
 
 `--stop-before-spawn` prints the probe PID and raises `SIGSTOP` once before the first spawn. Native stop/continue testing passed,
 but attaching to this already-stopped process failed in the device test; use the delay option there. Separate foreground device
-runs completed two spawn/read/EOF iterations and a spawn under LLDB with hardware breakpoints.
+runs completed two spawn/read/EOF iterations and a spawn under LLDB with hardware breakpoints before wait support was added.
 
 `Tests/run.sh` includes the spawn-plan and transport tests. They cover plan validation, ordered FD actions, inheritance flags,
 error propagation, pipe/FD ownership, malformed XPC payload cleanup, authenticated audit PID extraction, and detection of an
@@ -246,6 +293,11 @@ launch reply validation, fresh instance UUIDs, deferred callbacks, release suppr
 errno propagation with local mocks of the declared private interfaces. A second transport build exercises the guest's direct
 broker-port path with `XPC_FLAGS=0x2`, including malformed port names and rights validation.
 
+The wait tests cover actual non-child kqueue exit statuses on macOS, shared-slot reuse, concurrent reaping, blocking and lost
+wake hints, signal-handler reaping, discard policy, interrupted waits, RBS context validation, and canceled monitor callbacks.
+Broker tests also cover status ownership, failed reservations, parent death, and direct-signal denial falling back to the
+specific extension instance. These local tests do not establish iPhone sandbox permission or launchd delivery.
+
 The unsigned and signed app/extension builds passed, including the native UIKit shell used for the successful device run.
 The child binary's dependencies and entry point were inspected, and the nested signatures and profile entitlements were
 verified. Broker argument-preservation tests cover the default probe and explicit guest arguments/environment. The current
@@ -253,11 +305,33 @@ host links UIKit and Foundation; the child still links only libSystem and libc++
 
 ## Device progress, 2026-10-25
 
-The full foreground spawn path passed on the iPhone. Native host PID 9858 launched simulator probe PID 9859, which called
+The complete wait/SIGCHLD test passed under LLDB. Foreground host PID 9918 launched simulator parent PID 9919 with
+`--debug-delay 60 --repeat 2 --verify-statuses`:
+
+| Child | Result |
+| --- | --- |
+| df PIDs 9921 and 9922 | Each returned 2,268 stdout bytes followed by EOF and raw wait status `0x0`. |
+| Gated PID 9923 | `WNOHANG=0` while blocked, then exit 0 with raw status `0x0`. |
+| Gated PID 9924 | `WNOHANG=0` while blocked, then exit 37 with raw status `0x2500`; reaped using the any-child selector. |
+| Gated PID 9925 | `WNOHANG=0` while blocked, then SIGTERM with raw status `0xf`. |
+
+Every child produced an observed SIGCHLD, and a second wait returned `ECHILD`. LLDB and RBS both reported parent exit 0.
+Hardware breakpoints at `LSBWaitPID`, `childSignal`, and `finishWait` showed one guest thread. The signal handler received
+argument 20 through simulator `libsystem_platform.dylib::_sigtramp`; wait completion exposed the expected 0, `0x2500`, and
+`0xf` values. Native-cache code in `[0x180000000, 0x1ee31c000)` remained inaccessible. Evidence is
+`tmp/multiprocess/console-wait-lldb.log`, `tmp/multiprocess/wait-sigchld-lldb.txt`, and `tmp/multiprocess/syslog-wait.log`.
+The full local suite passed in `tmp/multiprocess/tests-wait-final.log`, and the installed signatures were audited.
+
+Earlier wait iterations established the fallback requirements: kqueue status registration and direct SIGCHLD were sandbox
+denied; RBS delivered real raw status; launchd delivered the notification. The first launchd run then trapped while releasing
+an inactive connection. The canceled-connection activation fix resolved that cleanup failure in the complete run above.
+The older `console-wait-rbs.log` and `console-wait-launchd.log` record those intermediate failures.
+
+The following spawn-only baseline predates wait support. Native host PID 9858 launched simulator probe PID 9859, which called
 `posix_spawn` twice in sequence and received child PIDs 9860 and 9861. Each child ran `/bin/df -h` from the rebuilt iOS 26 cache;
 the probe read 2,268 bytes from each redirected stdout pipe and reached EOF. Each broker job then finished with error 0.
 This verifies guest IPC, extension launch/check-in, argument and FD delivery, native-cache removal, simulator startup, repeated
-launches, and pipe-writer cleanup. Broker error 0 is not a substitute for guest exit-status collection, which is unimplemented.
+launches, and pipe-writer cleanup. Its broker error 0 did not itself establish the guest's exit status.
 
 The native host's launch assertion was dropped at 14:47:12.846327; SpringBoard still reported `running-active-Visible` at
 14:47:12.960300 and 14:47:13.152221. Its real UIKit foreground scene therefore fixed the observed headless suspension condition.
@@ -321,4 +395,4 @@ Remaining checks are:
 - Device coverage of launch errors and supported attributes/actions beyond the tested stdout redirection and repeated launches.
 - Longer-running and concurrent guest workloads, including resource cleanup at the configured job/FD limits.
 
-Background execution, guest wait/exit-status emulation, and broader runtime compatibility remain outside this first implementation.
+Background execution and broader runtime compatibility remain outside this implementation.

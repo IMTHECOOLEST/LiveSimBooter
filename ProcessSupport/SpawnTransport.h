@@ -10,6 +10,7 @@ enum LSBRequestKind { LSB_REQUEST_SPAWN = 1, LSB_REQUEST_CHECKIN = 2, LSB_REQUES
 typedef struct {
     uint64_t requestID;
     int32_t error, pid;
+    int statusFD, wakeFD;
     char runtimeRoot[LSB_PATH_BYTES];
     LSBSpawnPlan plan;
 } LSBBootstrapReply;
@@ -41,6 +42,10 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message);
 // Replies and releases the request object. Imported FDs remain owned by message until DisposeMessage is called.
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]);
+// Bootstrap additionally copies a shared status-file FD and nonblocking wake-pipe read FD; caller retains ownership.
+// A successful CheckIn returns these in reply.statusFD/wakeFD. The caller must close them separately from the plan FDs.
+int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                               const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD);
 // Only pass a message initialized by Receive, and do not reuse it for another Receive before disposal.
 void LSBTransportDisposeMessage(LSBReceivedMessage *message);
 // Reject handoff if a native transport worker remains; called after all native IPC objects have been released.

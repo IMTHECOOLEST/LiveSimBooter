@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/event.h>
+#include <sys/wait.h>
 #include "../Host/Broker.m"
 
 typedef struct {
@@ -21,8 +23,52 @@ typedef struct { unsigned identifier; int retainedFD; } TestMessageObject;
 static RecordedReply replies[128];
 static unsigned replyCount, disposedMessages, submittedLaunches, releasedLaunches, objectSequence;
 static pid_t reportedPID;
-static int submitError, readySendError;
+static int submitError, readySendError, monitorCreateError, identityCheckError, runningBoardError;
+static unsigned deliveredSignals, identityChecks, runningBoardStarts, runningBoardCancels;
+static unsigned submittedExtensionSignals;
+static uint64_t signaledRequest;
+static int directSignalError;
+static audit_token_t signaledAudit;
 static LSBExtensionEvent extensionCallback;
+
+int LSBRunningBoardValidateIdentity(const audit_token_t *audit) {
+    ++identityChecks;
+    assert(startingJob && audit->val[5] == (unsigned)startingJob.pid && audit->val[7] == startingJob.pidVersion);
+    return identityCheckError;
+}
+@interface LSBRunningBoardMonitor : NSObject
+@property (nonatomic, copy) LSBRunningBoardExitHandler completion;
+@end
+@implementation LSBRunningBoardMonitor
+@end
+int LSBRunningBoardMonitorStart(const audit_token_t *audit, LSBRunningBoardExitHandler handler, LSBRunningBoardMonitor **monitor) {
+    assert(audit && handler && monitor);
+    ++runningBoardStarts;
+    if (runningBoardError) return runningBoardError;
+    *monitor = [LSBRunningBoardMonitor new];
+    (*monitor).completion = handler;
+    return 0;
+}
+void LSBRunningBoardMonitorCancel(LSBRunningBoardMonitor *monitor) { monitor.completion = nil; ++runningBoardCancels; }
+
+int LSBChildMonitorCreate(pid_t pid, int *descriptor) {
+    assert(pid > 0 && descriptor);
+    *descriptor = -1;
+    if (monitorCreateError) return monitorCreateError;
+    *descriptor = kqueue();
+    assert(*descriptor >= 0);
+    return 0;
+}
+int LSBChildMonitorRead(int descriptor, pid_t pid, int *status) {
+    (void)descriptor; (void)pid; (void)status;
+    return EAGAIN;
+}
+int LSBChildSignal(const audit_token_t *audit, int signal) {
+    assert(audit && signal == SIGCHLD);
+    signaledAudit = *audit;
+    ++deliveredSignals;
+    return directSignalError;
+}
 
 static void releaseMessageObject(void *pointer) {
     TestMessageObject *object = pointer;
@@ -41,6 +87,12 @@ int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionE
 }
 pid_t LSBExtensionProcessIdentifier(uint64_t requestID) { assert(requestID); return reportedPID; }
 void LSBReleaseExtension(uint64_t requestID) { assert(requestID); ++releasedLaunches; }
+int LSBSignalExtension(uint64_t requestID, int signal) {
+    assert(requestID && signal == SIGCHLD);
+    signaledRequest = requestID;
+    ++submittedExtensionSignals;
+    return 0;
+}
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) { (void)port; (void)message; return ENOSYS; }
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
@@ -57,6 +109,13 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
     message->object = NULL;
     return sendError;
 }
+int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
+                               const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
+    assert(statusFD >= 0 && wakeFD >= 0 && (fcntl(wakeFD, F_GETFL) & O_NONBLOCK));
+    struct stat metadata;
+    assert(!fstat(statusFD, &metadata) && metadata.st_size == LSB_CHILD_STATUS_MAPPING_SIZE);
+    return LSBTransportReply(message, error, pid, requestID, root, plan, fds);
+}
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     assert(message);
     releaseMessageObject(message->object);
@@ -72,6 +131,8 @@ static void resetBroker(void) {
     for (LSBJob *job in jobs) {
         if (job.exitMonitor) dispatch_source_cancel(job.exitMonitor);
         job.exitMonitor = nil;
+        if (job.runningBoardMonitor) LSBRunningBoardMonitorCancel(job.runningBoardMonitor);
+        job.runningBoardMonitor = nil;
         if (job.request) disposeMessage(job.request);
         job.request = NULL;
     }
@@ -81,7 +142,14 @@ static void resetBroker(void) {
     nextIdentifier = 1;
     launchLaneFailed = NO;
     reportedPID = getpid();
-    submitError = readySendError = 0;
+    submitError = readySendError = monitorCreateError = identityCheckError = 0;
+    runningBoardError = EACCES;
+    deliveredSignals = identityChecks = finishingDepth = 0;
+    runningBoardStarts = runningBoardCancels = 0;
+    submittedExtensionSignals = 0;
+    signaledRequest = 0;
+    directSignalError = 0;
+    memset(&signaledAudit, 0, sizeof(signaledAudit));
     replyCount = disposedMessages = submittedLaunches = releasedLaunches = 0;
     memset(replies, 0, sizeof(replies));
 }
@@ -132,7 +200,7 @@ static void testIdentityAndSuccessfulHandoff(void) {
     resetBroker();
     int fd;
     unsigned parentObject;
-    enqueueSpawn(spawnRequest(&fd, &parentObject));
+    enqueueSpawn(spawnRequest(&fd, &parentObject), nil);
     assert(startingJob && startingJob.phase == JobStarting && submittedLaunches == 1);
     uint64_t identifier = startingJob.identifier;
     reportedPID = 0;
@@ -159,7 +227,7 @@ static void testReadySendFailure(void) {
     resetBroker();
     int fd;
     unsigned parentObject;
-    enqueueSpawn(spawnRequest(&fd, &parentObject));
+    enqueueSpawn(spawnRequest(&fd, &parentObject), nil);
     uint64_t identifier = startingJob.identifier;
     handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 3, 0));
     readySendError = EPIPE;
@@ -181,9 +249,9 @@ static void testChildReadyFailure(int childError) {
     TestMessageObject *object = request->object;
     object->retainedFD = dup(pipeFDs[1]);
     assert(object->retainedFD >= 0 && !fcntl(pipeFDs[0], F_SETFL, O_NONBLOCK));
-    enqueueSpawn(request);
+    enqueueSpawn(request, nil);
     uint64_t identifier = startingJob.identifier;
-    enqueueSpawn(spawnRequest(&nextFD, &nextObject));
+    enqueueSpawn(spawnRequest(&nextFD, &nextObject), nil);
     assert(jobs.count == 2 && submittedLaunches == 1);
 
     handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 3, 0));
@@ -219,9 +287,9 @@ static void testUnboundFailureStopsQueue(void) {
     int firstFD, secondFD, rejectedFD;
     unsigned firstObject, secondObject, rejectedObject;
     reportedPID = 0;
-    enqueueSpawn(spawnRequest(&firstFD, &firstObject));
+    enqueueSpawn(spawnRequest(&firstFD, &firstObject), nil);
     uint64_t identifier = startingJob.identifier;
-    enqueueSpawn(spawnRequest(&secondFD, &secondObject));
+    enqueueSpawn(spawnRequest(&secondFD, &secondObject), nil);
     assert(jobs.count == 2 && submittedLaunches == 1);
     extensionCallback(identifier, 0, ETIMEDOUT, NULL);
     assert(launchLaneFailed && !startingJob && !jobs.count && submittedLaunches == 1);
@@ -230,7 +298,7 @@ static void testUnboundFailureStopsQueue(void) {
     assertClosed(secondFD);
     handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 3, 0));
     assert(replies[replyCount - 1].error == ESRCH && !planReplies());
-    enqueueSpawn(spawnRequest(&rejectedFD, &rejectedObject));
+    enqueueSpawn(spawnRequest(&rejectedFD, &rejectedObject), nil);
     assert(replyFor(rejectedObject)->error == EBUSY && submittedLaunches == 1);
     assertClosed(rejectedFD);
 }
@@ -240,7 +308,7 @@ static void testSubmissionFailureAndSpawnAuthentication(void) {
     int fd;
     unsigned objectID;
     submitError = ENOENT;
-    enqueueSpawn(spawnRequest(&fd, &objectID));
+    enqueueSpawn(spawnRequest(&fd, &objectID), nil);
     assert(!launchLaneFailed && !jobs.count && replyFor(objectID)->error == ENOENT);
     assertClosed(fd);
 
@@ -249,6 +317,7 @@ static void testSubmissionFailureAndSpawnAuthentication(void) {
     parent.pid = getpid() + 100;
     parent.pidVersion = 8;
     parent.phase = JobRunning;
+    assert(!prepareChildStatus(parent));
     [jobs addObject:parent];
     LSBReceivedMessage *wrongGeneration = spawnRequest(&fd, &objectID);
     wrongGeneration->audit.val[7] = 9;
@@ -281,6 +350,120 @@ static void testInitialGuestArguments(void) {
     }
 }
 
+static LSBJob *runTestJob(LSBJob *parent, uint32_t generation) {
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    enqueueSpawn(request, parent);
+    assert(startingJob);
+    LSBJob *job = startingJob;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), generation, 0));
+    handleMessage(messageFor(LSB_REQUEST_READY, getpid(), generation, job.identifier));
+    assert(job.phase == JobRunning && !startingJob && replyFor(object) && !replyFor(object)->error);
+    return job;
+}
+
+static void testExitStatusesAndRepeatedReaping(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 10);
+    parent.audit = (audit_token_t){{1, 2, 3, 4, 5, (unsigned)getpid(), 7, 10}};
+    for (unsigned iteration = 0; iteration < LSB_CHILD_STATUS_CAPACITY + 3; ++iteration) {
+        LSBJob *child = runTestJob(parent, 11 + iteration);
+        pid_t waited = -1;
+        int status = -1;
+        assert(LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &waited, &status) == EAGAIN);
+        int expected = iteration % 2 ? SIGTERM : (42 << 8);
+        recordChildExit(child.identifier, expected);
+        assert(!findJob(child.identifier) && deliveredSignals == iteration + 1);
+        audit_token_t expectedAudit = parent.audit;
+        assert(!memcmp(&signaledAudit, &expectedAudit, sizeof(signaledAudit)));
+        char hint;
+        assert(read(parent.wakeReadFD, &hint, 1) == 1);
+        assert(!LSBChildStatusTryWait(parent.childStatus, child.pid, getpgrp(), &waited, &status));
+        assert(waited == child.pid && status == expected);
+        assert(iteration % 2 ? WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM : WIFEXITED(status) && WEXITSTATUS(status) == 42);
+        assert(LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &waited, &status) == ECHILD);
+    }
+    recordChildExit(parent.identifier, 0);
+    assert(!jobs.count);
+}
+
+static void testMonitorFailureAndEarlyExit(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 20);
+    for (unsigned earlyExit = 0; earlyExit < 2; ++earlyExit) {
+        int fd;
+        unsigned object;
+        enqueueSpawn(spawnRequest(&fd, &object), parent);
+        uint64_t identifier = startingJob.identifier;
+        monitorCreateError = earlyExit ? 0 : EACCES;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 21 + earlyExit, 0));
+        if (earlyExit) recordChildExit(identifier, 99 << 8);
+        assert(replyFor(object) && replyFor(object)->error == (earlyExit ? ECHILD : EACCES));
+        assert(!findJob(identifier) && jobs.count == 1 && !deliveredSignals);
+        pid_t waited;
+        int status;
+        assert(LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &waited, &status) == ECHILD);
+    }
+}
+
+static void testAuditedGenerationDisappearsBeforeBootstrap(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 25);
+    int fd;
+    unsigned object;
+    enqueueSpawn(spawnRequest(&fd, &object), parent);
+    uint64_t identifier = startingJob.identifier;
+    unsigned beforePlans = planReplies();
+    identityCheckError = ESRCH;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 26, 0));
+    assert(identityChecks == 2 && !findJob(identifier) && jobs.count == 1);
+    assert(planReplies() == beforePlans && replyFor(object)->error == ESRCH && !deliveredSignals);
+    assertClosed(fd);
+    pid_t waited;
+    int status;
+    assert(LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &waited, &status) == ECHILD);
+}
+
+static void testRunningBoardFallback(void) {
+    resetBroker();
+    monitorCreateError = EACCES;
+    runningBoardError = 0;
+    LSBJob *parent = runTestJob(nil, 27);
+    LSBJob *child = runTestJob(parent, 28);
+    assert(runningBoardStarts == 2 && !identityChecks && !child.exitMonitor && child.runningBoardMonitor);
+    directSignalError = EPERM;
+    child.runningBoardMonitor.completion(37 << 8, 0);
+    assert(!findJob(child.identifier) && runningBoardCancels == 1 && deliveredSignals == 1);
+    assert(submittedExtensionSignals == 1 && signaledRequest == parent.identifier);
+    pid_t pid;
+    int status;
+    assert(!LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &pid, &status));
+    assert(pid == child.pid && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+    LSBJob *unknown = runTestJob(parent, 29);
+    unknown.runningBoardMonitor.completion(0, EPROTO);
+    assert(!findJob(unknown.identifier) && deliveredSignals == 1);
+    assert(LSBChildStatusTryWait(parent.childStatus, -1, getpgrp(), &pid, &status) == ECHILD);
+}
+
+static void testParentDeathDetachesOrphans(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 30);
+    LSBJob *running = runTestJob(parent, 31);
+    int fd;
+    unsigned object;
+    enqueueSpawn(spawnRequest(&fd, &object), parent);
+    uint64_t pending = startingJob.identifier;
+    // Bind the pending process first so cancellation does not poison the unrelated launch lane.
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 32, 0));
+    recordChildExit(parent.identifier, SIGKILL);
+    assert(!findJob(parent.identifier) && !findJob(pending));
+    assert(replyFor(object)->error == ECANCELED && !running.parentIdentifier);
+    assert(jobs.count == 1 && !launchLaneFailed && !startingJob);
+    recordChildExit(running.identifier, 7 << 8);
+    assert(!jobs.count && !deliveredSignals);
+}
+
 int main(void) {
     @autoreleasepool {
         alarm(10);
@@ -291,8 +474,13 @@ int main(void) {
         testUnboundFailureStopsQueue();
         testSubmissionFailureAndSpawnAuthentication();
         testInitialGuestArguments();
+        testExitStatusesAndRepeatedReaping();
+        testMonitorFailureAndEarlyExit();
+        testAuditedGenerationDisappearsBeforeBootstrap();
+        testRunningBoardFallback();
+        testParentDeathDetachesOrphans();
         resetBroker();
-        puts("Broker: authentication, PID binding, state transitions, READY errors, queued recovery, and FD ownership passed");
+        puts("Broker: authentication, lifecycle, FD ownership, exact exit status, token-safe signals, repeated reap, and orphan cleanup passed");
     }
     return 0;
 }

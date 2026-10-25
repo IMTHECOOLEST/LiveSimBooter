@@ -115,7 +115,7 @@ static int replayActions(const LSBSpawnPlan *plan) {
     return 0;
 }
 
-int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
+int LSBApplySpawnPlanPreservingFD(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS], int preservedFD) {
     if (!receivedFDs) return EINVAL;
     uint32_t count = plan && plan->fdCount < LSB_MAX_FDS ? plan->fdCount : LSB_MAX_FDS;
     int error = LSBValidateSpawnPlan(plan);
@@ -127,6 +127,10 @@ int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
         if (action->kind != LSB_ACTION_CHDIR && action->fd > highest) highest = action->fd;
         if (action->kind == LSB_ACTION_DUP2 && action->target > highest) highest = action->target;
     }
+    if (preservedFD < -1 || (preservedFD >= 0 && (preservedFD <= highest || containsFD(receivedFDs, count, preservedFD)))) {
+        closeReceived(receivedFDs, count); return EINVAL;
+    }
+    if (preservedFD >= 0 && fcntl(preservedFD, F_GETFD) < 0) { error = errno; closeReceived(receivedFDs, count); return error; }
     if (highest >= limit - (int)count) { closeReceived(receivedFDs, count); return EMFILE; }
     int staged[LSB_MAX_FDS];
     for (uint32_t i = 0; i < LSB_MAX_FDS; ++i) staged[i] = -1;
@@ -136,7 +140,7 @@ int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
     }
     closeReceived(receivedFDs, count);
     // Imports are staged above every destination, including those used by later ordered file actions.
-    for (int fd = 0; fd < limit; ++fd) if (!containsFD(staged, count, fd)) close(fd);
+    for (int fd = 0; fd < limit; ++fd) if (fd != preservedFD && !containsFD(staged, count, fd)) close(fd);
     for (uint32_t i = 0; i < count; ++i) {
         if (dup2(staged[i], plan->fds[i].number) < 0 || fcntl(plan->fds[i].number, F_SETFD, plan->fds[i].flags)) {
             error = errno;
@@ -151,6 +155,7 @@ int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
     if (error) return error;
     // Darwin applies close-on-exec after actions. CLOEXEC_DEFAULT additionally retains only action destinations/INHERIT descriptors.
     for (int fd = 0; fd < limit; ++fd) {
+        if (fd == preservedFD) continue;
         int flags = fcntl(fd, F_GETFD);
         if (flags >= 0 && ((flags & FD_CLOEXEC) || ((plan->spawnFlags & POSIX_SPAWN_CLOEXEC_DEFAULT) && !explicitlyInherited(plan, fd)))) close(fd);
     }
@@ -169,4 +174,8 @@ int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
     }
     sigset_t mask = (sigset_t)plan->signalMask;
     return sigprocmask(SIG_SETMASK, &mask, NULL) ? errno : 0;
+}
+
+int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]) {
+    return LSBApplySpawnPlanPreservingFD(plan, receivedFDs, -1);
 }

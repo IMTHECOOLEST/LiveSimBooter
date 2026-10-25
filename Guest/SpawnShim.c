@@ -1,4 +1,5 @@
 #include "../ProcessSupport/SpawnTransport.h"
+#include "ChildWait.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -108,8 +109,10 @@ static int addVector(LSBSpawnPlan *plan, char *const vector[], uint32_t *count, 
 
 static int snapshotFDs(LSBSpawnPlan *plan, int descriptors[LSB_MAX_FDS]) {
     int limit = getdtablesize();
+    int wakeFD = LSBGuestChildWakeFD();
     int highest = 2;
     for (int fd = 0; fd < limit; ++fd) {
+        if (fd == wakeFD) continue;
         int flags = fcntl(fd, F_GETFD);
         if (flags < 0) { if (errno == EBADF) continue; return errno; }
         if (plan->fdCount == LSB_MAX_FDS) return EMFILE;

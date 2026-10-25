@@ -12,6 +12,7 @@ controller and storyboards remain in `unused/`, outside the app target.
 `Documents/RuntimeRoot` there if the destination does not exist. Both app and extension need matching App Group provisioning.
 The child contains no Objective-C imports; the native broker uses Foundation and UIKit. A simulator interposer
 forwards `posix_spawn`/`posix_spawnp` to the broker, including argv, environment, supported attributes and ordered FD actions.
+It also provides `wait`/`waitpid` over a shared child-status table and delivers `SIGCHLD` through the native host.
 On the tested iPhone, the simulator probe spawned two separate `df` processes in sequence. Each child unloaded its native cache,
 ran from the rebuilt iOS 26 cache, and returned 2,268 bytes through redirected stdout before EOF. The foreground native host
 remained active after its launch assertion ended. Native preparation preserves a raw broker Mach send right for guest IPC,
@@ -23,7 +24,9 @@ See [multiprocess setup, progress, and limits](docs/multiprocess.md).
 Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and
 restores the normal idle timer when it becomes inactive. The earlier headless host was suspended once
 its launch assertion ended, and attaching LLDB alone did not prevent that suspension. The retained child assertion also depends
-on its host remaining active. `waitpid`, SIGCHLD, and guest exit-status collection are not implemented. The current test
+on its host remaining active. The wait/SIGCHLD device test passed under LLDB: two df children, exits 0 and 37, and SIGTERM all
+produced the expected wait status, delivered SIGCHLD, and returned `ECHILD` after reaping. The guest remained single threaded
+at the wait and signal-handler breakpoints, with native-cache code inaccessible. The current test
 runtime keeps 219 loose cached dylibs in the reversible App Group backup `RuntimeLooseDylibs-multiprocess`, beside `RuntimeRoot`;
 the rebuilt cache supplies them. The detailed device results below describe the earlier direct-launch implementation.
 
@@ -184,7 +187,7 @@ The tool uses `codesign` for the initial identity/requirements, then signs the a
 without exporting a private key. It checks the page hashes and final signature. It does not relocate the cache or change device
 policy. The relocated cache and patched dyld_sim are installed and active on the test iPhone. The earlier stock-base cache is
 retained as `dyld_sim_shared_cache_arm64.test-disabled`, and the previous dyld_sim is backed up as `dyld_sim.before-relocated-cache`.
-The existing handoff stack and commented UIKit startup are unchanged.
+The loader keeps the existing handoff stack; UIKit now runs only in the separate native foreground host.
 
 macOS's simulator launch [keeps bootstrap dyld outside the shared cache](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp#L1191-L1195).
 Its handoff does not reset TLS. Simulator libpthread [adopts the existing main pthread](https://github.com/apple-oss-distributions/libpthread/blob/42d026df5b07825070f60134b980a1ec2552dfee/src/pthread.c#L2086-L2096),

@@ -37,6 +37,8 @@ int LSBPlanAddString(LSBSpawnPlan *plan, const char *value, uint32_t *offset);
 int LSBValidateSpawnPlan(const LSBSpawnPlan *plan);
 // Receives already-imported FD duplicates in plan order; consumes them on success or failure.
 int LSBApplySpawnPlan(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS]);
+// Keeps one internal descriptor across both close sweeps. It must be above every plan/action descriptor and remains caller-owned.
+int LSBApplySpawnPlanPreservingFD(const LSBSpawnPlan *plan, int receivedFDs[LSB_MAX_FDS], int preservedFD);
 #ifdef __cplusplus
 }
 #endif

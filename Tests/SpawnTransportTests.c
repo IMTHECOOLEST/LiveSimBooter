@@ -1,5 +1,6 @@
 #include "../ProcessSupport/SpawnTransport.h"
 #include "../ProcessSupport/PrivateXPC.h"
+#include "../ProcessSupport/ChildStatus.h"
 #if defined(LSB_XPC_WIRE_TESTING)
 #include "../Guest/XPCWireCompatibility.h"
 #endif
@@ -12,11 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
+static unsigned openDescriptorCount(void);
+enum { MalformedBootstrapCount = 11 };
 
 int LSBTestCopyBrokerPort(mach_port_t *port) {
     mach_port_array_t ports = NULL;
@@ -136,11 +140,30 @@ static int client(void) {
     assert(!LSBTransportCheckIn(&reply, received));
     assert(reply.requestID == 77 && !reply.error && !strcmp(reply.runtimeRoot, "/tmp/RuntimeRoot"));
     assert(!memcmp(&reply.plan, &plan, sizeof(plan)) && received[0] >= 0);
+    assert(reply.statusFD >= 0 && reply.wakeFD >= 0 && reply.statusFD != reply.wakeFD && reply.statusFD != received[0]);
+    assert((fcntl(reply.statusFD, F_GETFD) & FD_CLOEXEC) && (fcntl(reply.wakeFD, F_GETFD) & FD_CLOEXEC));
+    assert(fcntl(reply.wakeFD, F_GETFL) & O_NONBLOCK);
+    void *ledger = mmap(NULL, LSB_CHILD_STATUS_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, reply.statusFD, 0);
+    assert(ledger != MAP_FAILED && !memcmp(ledger, "ledger", 6));
+    memcpy(ledger, "shared", 6);
+    assert(!munmap(ledger, LSB_CHILD_STATUS_MAP_SIZE));
+    char wake = 0;
+    assert(read(reply.wakeFD, &wake, 1) == 1 && wake == 'w');
+    assert(read(reply.wakeFD, &wake, 1) == -1 && errno == EAGAIN);
+    close(reply.statusFD);
+    close(reply.wakeFD);
     for (unsigned i = 1; i < LSB_MAX_FDS; ++i) assert(received[i] == -1);
     char byte = 0;
     assert(read(received[0], &byte, 1) == 1 && byte == 'b' && lseek(fd, 0, SEEK_CUR) == 2);
     close(received[0]);
     assert(!LSBTransportReady(reply.requestID, 0));
+    for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportCheckIn(&reply, received) == EPROTO);
+        assert(reply.statusFD == -1 && reply.wakeFD == -1);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(received[i] == -1);
+        assert(openDescriptorCount() == before);
+    }
     assert(!LSBRequireSingleThread());
     assert(LSBTransportReady(0, 0) == EINVAL);
     plan.version = 0;
@@ -189,6 +212,72 @@ static unsigned openDescriptorCount(void) {
     return count;
 }
 
+typedef struct { int status, readOnlyStatus, shortStatus, wake[2], blockingWake[2]; } BootstrapFDs;
+
+static BootstrapFDs makeBootstrapFDs(void) {
+    BootstrapFDs result;
+    char path[] = "/tmp/LiveSimBooter-status.XXXXXX";
+    result.status = mkstemp(path);
+    assert(result.status >= 0 && !ftruncate(result.status, LSB_CHILD_STATUS_MAP_SIZE));
+    result.readOnlyStatus = open(path, O_RDONLY | O_CLOEXEC);
+    assert(result.readOnlyStatus >= 0 && !unlink(path));
+    assert(pwrite(result.status, "ledger", 6, 0) == 6);
+    char shortPath[] = "/tmp/LiveSimBooter-short-status.XXXXXX";
+    result.shortStatus = mkstemp(shortPath);
+    assert(result.shortStatus >= 0 && !unlink(shortPath));
+    assert(!pipe(result.wake) && !pipe(result.blockingWake));
+    assert(!fcntl(result.wake[0], F_SETFL, O_NONBLOCK));
+    assert(write(result.wake[1], "w", 1) == 1);
+    return result;
+}
+
+static void closeBootstrapFDs(BootstrapFDs *fds) {
+    close(fds->status);
+    close(fds->readOnlyStatus);
+    close(fds->shortStatus);
+    close(fds->wake[0]);
+    close(fds->wake[1]);
+    close(fds->blockingWake[0]);
+    close(fds->blockingWake[1]);
+}
+
+static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnPlan *plan, int planFD,
+                                    const BootstrapFDs *fds, unsigned variant) {
+    xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
+    assert(reply);
+    xpc_dictionary_set_uint64(reply, "version", 1);
+    xpc_dictionary_set_uint64(reply, "request-id", 77);
+    xpc_dictionary_set_int64(reply, "error", 0);
+    xpc_dictionary_set_int64(reply, "pid", 4242);
+    xpc_dictionary_set_string(reply, "runtime-root", "/tmp/RuntimeRoot");
+    xpc_dictionary_set_data(reply, "plan", plan, sizeof(*plan));
+    xpc_object_t array = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(planFD);
+    assert(array && descriptor);
+    xpc_array_append_value(array, descriptor);
+    xpc_dictionary_set_value(reply, "fds", array);
+    xpc_release(descriptor);
+    xpc_release(array);
+    if (variant == 10) xpc_dictionary_set_string(reply, "plan", "malformed plan");
+    if (variant == 1) xpc_dictionary_set_string(reply, "child-status-fd", "not a descriptor");
+    else if (variant != 0) {
+        int statusFD = variant == 4 ? fds->wake[0] : variant == 7 ? fds->readOnlyStatus : variant == 8 ? fds->shortStatus : fds->status;
+        descriptor = xpc_fd_create(statusFD);
+        assert(descriptor);
+        xpc_dictionary_set_value(reply, "child-status-fd", descriptor);
+        xpc_release(descriptor);
+    }
+    if (variant == 3) xpc_dictionary_set_string(reply, "child-wake-fd", "not a descriptor");
+    else if (variant != 2) {
+        int wakeFD = variant == 5 ? fds->wake[1] : variant == 6 ? fds->status : variant == 9 ? fds->blockingWake[0] : fds->wake[0];
+        descriptor = xpc_fd_create(wakeFD);
+        assert(descriptor);
+        xpc_dictionary_set_value(reply, "child-wake-fd", descriptor);
+        xpc_release(descriptor);
+    }
+    assert(!xpc_pipe_routine_reply(reply));
+    xpc_release(reply);
+}
+
 static int host(const char *executable) {
     mach_port_t port;
     assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port));
@@ -212,15 +301,27 @@ static int host(const char *executable) {
     assert(!pthread_join(worker, NULL));
     assert(pending.object == NULL && fcntl(pending.fds[0], F_GETFD) >= 0);
     LSBReceivedMessage message;
+    BootstrapFDs bootstrap = makeBootstrapFDs();
     assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
     assert(message.audit.val[5] == (unsigned)child);
-    assert(!LSBTransportReply(&message, 0, child, 77, "/tmp/RuntimeRoot", &pending.plan, pending.fds));
+    assert(!LSBTransportReplyBootstrap(&message, 0, child, 77, "/tmp/RuntimeRoot", &pending.plan, pending.fds, bootstrap.status, bootstrap.wake[0]));
+    assert(fcntl(bootstrap.status, F_GETFD) >= 0 && fcntl(bootstrap.wake[0], F_GETFD) >= 0);
     LSBTransportDisposeMessage(&message);
-    LSBTransportDisposeMessage(&pending);
-    assert(pending.fds[0] == -1);
     assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_READY && message.requestID == 77 && !message.error);
+    char shared[6];
+    assert(pread(bootstrap.status, shared, sizeof(shared), 0) == sizeof(shared) && !memcmp(shared, "shared", sizeof(shared)));
     assert(!LSBTransportReply(&message, 0, child, 77, NULL, NULL, NULL));
     LSBTransportDisposeMessage(&message);
+    for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
+        unsigned before = openDescriptorCount();
+        replyMalformedBootstrap(&message, &pending.plan, pending.fds[0], &bootstrap, variant);
+        LSBTransportDisposeMessage(&message);
+        assert(openDescriptorCount() == before);
+    }
+    closeBootstrapFDs(&bootstrap);
+    LSBTransportDisposeMessage(&pending);
+    assert(pending.fds[0] == -1);
 
     assert(!LSBTransportReceive(port, &message));
     assert(!LSBTransportReply(&message, EACCES, 0, 0, NULL, NULL, NULL));

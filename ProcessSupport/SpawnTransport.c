@@ -1,15 +1,18 @@
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
 #include "SingleThreadGuard.h"
+#include "ChildStatus.h"
 #if defined(LSB_XPC_WIRE_COMPATIBILITY)
 #include "../Guest/XPCWireCompatibility.h"
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if defined(LSB_TRANSPORT_TRACE)
 #include <stdio.h>
@@ -54,6 +57,25 @@ static void closeFDs(int fds[LSB_MAX_FDS]) {
         if (fds[i] >= 0) close(fds[i]);
         fds[i] = -1;
     }
+}
+
+static int validateBootstrapFDs(int statusFD, int wakeFD) {
+    struct stat status, wake;
+    if (fstat(statusFD, &status) || fstat(wakeFD, &wake)) return errno;
+    int statusFlags = fcntl(statusFD, F_GETFL), wakeFlags = fcntl(wakeFD, F_GETFL);
+    if (statusFlags < 0 || wakeFlags < 0) return errno;
+    if (!S_ISREG(status.st_mode) || status.st_size != LSB_CHILD_STATUS_MAP_SIZE || (statusFlags & O_ACCMODE) != O_RDWR ||
+        !S_ISFIFO(wake.st_mode) || (wakeFlags & O_ACCMODE) != O_RDONLY || !(wakeFlags & O_NONBLOCK)) return EPROTO;
+    return 0;
+}
+
+static int decodeBootstrapFD(xpc_object_t dictionary, const char *key, int *fd) {
+    xpc_object_t object = xpc_dictionary_get_value(dictionary, key);
+    if (!object || xpc_get_type(object) != XPC_TYPE_FD) return EPROTO;
+    *fd = xpc_fd_dup(object);
+    if (*fd < 0) return errno ? errno : EBADF;
+    if (fcntl(*fd, F_SETFD, FD_CLOEXEC)) return errno;
+    return 0;
 }
 
 static int encodePlan(xpc_object_t dictionary, const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
@@ -206,6 +228,7 @@ int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_
 int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
     if (!result || !fds) return EINVAL;
     memset(result, 0, sizeof(*result));
+    result->statusFD = result->wakeFD = -1;
     initializeFDs(fds);
     xpc_object_t request = createRequest(LSB_REQUEST_CHECKIN, 0, 0);
     if (!request) return ENOMEM;
@@ -227,9 +250,17 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
             else memcpy(result->runtimeRoot, xpc_string_get_string_ptr(root), xpc_string_get_length(root) + 1);
         }
         if (!error) error = decodePlan(reply, &result->plan, fds);
+        if (!error) error = decodeBootstrapFD(reply, "child-status-fd", &result->statusFD);
+        if (!error) error = decodeBootstrapFD(reply, "child-wake-fd", &result->wakeFD);
+        if (!error) error = validateBootstrapFDs(result->statusFD, result->wakeFD);
     }
     if (reply) xpc_release(reply);
-    if (error) closeFDs(fds);
+    if (error) {
+        closeFDs(fds);
+        if (result->statusFD >= 0) close(result->statusFD);
+        if (result->wakeFD >= 0) close(result->wakeFD);
+        result->statusFD = result->wakeFD = -1;
+    }
     return error;
 }
 
@@ -259,8 +290,8 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     closeFDs(message->fds);
 }
 
-int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
-                      const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
+static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                          const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD) {
     if (!message || !message->object || error < 0 || pid < 0) return EINVAL;
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     if (!reply) {
@@ -276,6 +307,19 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
             if (!encodingError) xpc_dictionary_set_string(reply, "runtime-root", runtimeRoot);
         }
     }
+    if (!error && !encodingError && bootstrap) {
+        encodingError = plan ? validateBootstrapFDs(statusFD, wakeFD) : EINVAL;
+        if (!encodingError) {
+            xpc_object_t status = xpc_fd_create(statusFD), wake = xpc_fd_create(wakeFD);
+            if (!status || !wake) encodingError = errno ? errno : EBADF;
+            else {
+                xpc_dictionary_set_value(reply, "child-status-fd", status);
+                xpc_dictionary_set_value(reply, "child-wake-fd", wake);
+            }
+            if (status) xpc_release(status);
+            if (wake) xpc_release(wake);
+        }
+    }
     if (encodingError) error = encodingError;
     xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(reply, "request-id", requestID);
@@ -286,6 +330,16 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
     xpc_release((xpc_object_t)message->object);
     message->object = NULL;
     return sendError ? sendError : encodingError;
+}
+
+int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                      const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1);
+}
+
+int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                               const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD);
 }
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {

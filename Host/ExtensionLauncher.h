@@ -18,6 +18,10 @@ int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionE
 // Call on the main thread. Returns the PID supplied by pkd after its launch reply, or 0 if unavailable.
 pid_t LSBExtensionProcessIdentifier(uint64_t requestID);
 
+// Call on the main thread for an active launched session. Signals its exact service instance through launchd.
+// Zero means submitted: the underlying private API returns no delivery result.
+int LSBSignalExtension(uint64_t requestID, int signal);
+
 // Call on the main thread. Stops callbacks and releases the retained launch and process assertion; does not send a termination request.
 void LSBReleaseExtension(uint64_t requestID);
 

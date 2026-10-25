@@ -34,6 +34,15 @@ xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -arch arm64 -fno-bui
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/SpawnPlanTests.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnPlan"
 "$test_directory/SpawnPlan"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ChildMonitorTests.c Host/ChildMonitor.c -o "$test_directory/ChildMonitor"
+"$test_directory/ChildMonitor"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ChildStatusTests.c ProcessSupport/ChildStatus.c -o "$test_directory/ChildStatus"
+"$test_directory/ChildStatus"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_WAIT_TESTING \
+    Tests/ChildWaitTests.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -o "$test_directory/ChildWait"
+"$test_directory/ChildWait"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
@@ -51,8 +60,11 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WI
     Tests/XPCWireCompatibilityTests.c "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/XPCWireCompatibility"
 DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
-    Tests/BrokerTests.m ProcessSupport/SpawnPlan.c -framework Foundation -o "$test_directory/Broker"
+    Tests/BrokerTests.m ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c -framework Foundation -o "$test_directory/Broker"
 "$test_directory/Broker"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/ExtensionLauncherTests.m -framework Foundation -o "$test_directory/ExtensionLauncher"
 "$test_directory/ExtensionLauncher"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/RunningBoardMonitorTests.m -framework Foundation -o "$test_directory/RunningBoardMonitor"
+"$test_directory/RunningBoardMonitor"

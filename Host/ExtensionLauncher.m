@@ -1,16 +1,19 @@
 #import "ExtensionLauncher.h"
 #import "Private/FoundationPrivate.h"
+#include "../ProcessSupport/PrivateXPC.h"
 
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 
 @interface LSBExtensionSession : NSObject
 @property (nonatomic, strong) NSExtension *extension;
 @property (nonatomic, strong) PKHostPlugIn *plugin;
 @property (nonatomic, strong) PKProcessAssertionProxy *assertion;
 @property (nonatomic, strong) NSUUID *instanceIdentifier;
+@property (nonatomic, copy) NSString *bundleIdentifier;
 @property (nonatomic) uint64_t requestID;
 @property (nonatomic) LSBExtensionEvent event;
 @property (nonatomic) void *context;
@@ -51,6 +54,28 @@ pid_t LSBExtensionProcessIdentifier(uint64_t requestID) {
     if (!pthread_main_np()) return 0;
     LSBExtensionSession *session = gSessions[@(requestID)];
     return session.active && !session.failed ? session.pid : 0;
+}
+
+int LSBSignalExtension(uint64_t requestID, int signal) {
+    if (!pthread_main_np()) return EDEADLK;
+    if (!requestID || signal < 0 || signal >= NSIG) return EINVAL;
+    LSBExtensionSession *session = gSessions[@(requestID)];
+    if (!session.active || session.failed || !session.completed || session.pid <= 0 ||
+        !session.instanceIdentifier || !session.bundleIdentifier.length) return ESRCH;
+    uuid_t instance;
+    [session.instanceIdentifier getUUIDBytes:instance];
+    xpc_connection_t connection = xpc_connection_create(session.bundleIdentifier.UTF8String, NULL);
+    if (!connection) return ENOMEM;
+    // PlugInKit uses the extension bundle identifier plus this unique instance UUID for its service connection.
+    // Signaling only needs the launchd job name, and the child has no NSXPC Hub implementation.
+    xpc_connection_set_oneshot_instance(connection, instance);
+    xpc_connection_kill(connection, signal);
+    // Releasing an inactive connection traps, even after cancel. Cancel before activation so cleanup cannot initiate a peer handshake.
+    xpc_connection_set_event_handler(connection, ^(xpc_object_t event) { (void)event; });
+    xpc_connection_cancel(connection);
+    xpc_connection_activate(connection);
+    // ARC releases the canceled native connection here; no state is passed to the guest.
+    return 0;
 }
 
 void LSBReleaseExtension(uint64_t requestID) {
@@ -127,6 +152,7 @@ int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionE
         session.extension = extension;
         session.plugin = plugin;
         session.instanceIdentifier = instanceIdentifier;
+        session.bundleIdentifier = bundleIdentifier;
         session.requestID = requestID;
         session.event = event;
         session.context = context;

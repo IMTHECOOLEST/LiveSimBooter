@@ -1,3 +1,25 @@
+#import <Foundation/Foundation.h>
+#include <xpc/xpc.h>
+
+static void TestNativeConnectionCleanup(void) {
+    @autoreleasepool {
+        xpc_connection_t connection = xpc_connection_create("com.kdt.LiveSimBooter.SignalLifecycleProbe", NULL);
+        xpc_connection_set_event_handler(connection, ^(xpc_object_t event) { (void)event; });
+        xpc_connection_cancel(connection);
+        xpc_connection_activate(connection);
+    }
+}
+
+static xpc_connection_t LSBMockXPCConnectionCreate(const char *name, dispatch_queue_t queue);
+static void LSBMockXPCConnectionSetEventHandler(xpc_connection_t connection, xpc_handler_t handler);
+static void LSBMockXPCConnectionCancel(xpc_connection_t connection);
+static void LSBMockXPCConnectionActivate(xpc_connection_t connection);
+#define xpc_connection_create LSBMockXPCConnectionCreate
+#define xpc_connection_set_oneshot_instance LSBMockXPCConnectionSetInstance
+#define xpc_connection_kill LSBMockXPCConnectionKill
+#define xpc_connection_set_event_handler LSBMockXPCConnectionSetEventHandler
+#define xpc_connection_cancel LSBMockXPCConnectionCancel
+#define xpc_connection_activate LSBMockXPCConnectionActivate
 #define NSExtension LSBMockExtension
 #define PKHost LSBMockHost
 #define PKHostPlugIn LSBMockHostPlugIn
@@ -16,6 +38,41 @@ static PKHostPlugIn *testPlugin;
 static PKProcessAssertionProxy *testAssertion;
 static void (^testInvalidation)(void);
 static unsigned assertionReleaseCount;
+static BOOL signalAllocationFails;
+static NSString *signaledService;
+static NSUUID *signaledInstance;
+static int signaledSignal;
+static unsigned signalCount;
+static unsigned signalConnectionStep;
+static __weak id signalConnection;
+
+static xpc_connection_t LSBMockXPCConnectionCreate(const char *name, dispatch_queue_t queue) {
+    assert(name && !queue);
+    signaledService = [NSString stringWithUTF8String:name];
+    if (signalAllocationFails) return nil;
+    xpc_connection_t connection = (xpc_connection_t)(id)[NSObject new];
+    signalConnection = connection;
+    signalConnectionStep = 1;
+    return connection;
+}
+void LSBMockXPCConnectionSetInstance(xpc_connection_t connection, const uuid_t instance) {
+    assert(connection && connection == signalConnection && signalConnectionStep++ == 1);
+    signaledInstance = [[NSUUID alloc] initWithUUIDBytes:instance];
+}
+void LSBMockXPCConnectionKill(xpc_connection_t connection, int signal) {
+    assert(connection && connection == signalConnection && signalConnectionStep++ == 2);
+    ++signalCount;
+    signaledSignal = signal;
+}
+static void LSBMockXPCConnectionSetEventHandler(xpc_connection_t connection, xpc_handler_t handler) {
+    assert(connection && connection == signalConnection && signalConnectionStep++ == 3 && handler);
+}
+static void LSBMockXPCConnectionCancel(xpc_connection_t connection) {
+    assert(connection && connection == signalConnection && signalConnectionStep++ == 4);
+}
+static void LSBMockXPCConnectionActivate(xpc_connection_t connection) {
+    assert(connection && connection == signalConnection && signalConnectionStep++ == 5);
+}
 
 @implementation LSBMockExtension
 + (instancetype)extensionWithIdentifier:(NSString *)identifier error:(NSError **)error {
@@ -87,18 +144,33 @@ static void Ready(void) { testReady(nil, @[@4242], @[testPluginUUID]); }
 
 int main(void) {
     @autoreleasepool {
+        TestNativeConnectionCleanup();
         testPluginUUID = [NSUUID UUID];
         assert(LSBLaunchExtension(NULL, 1, Record, &expectedContext) == EINVAL);
         assert(LSBLaunchExtension("test", 1, NULL, &expectedContext) == EINVAL);
         assert(LSBLaunchExtension("missing", 1, Record, &expectedContext) == ENOENT);
+        assert(LSBSignalExtension(0, SIGCHLD) == EINVAL);
+        assert(LSBSignalExtension(1, -1) == EINVAL);
+        assert(LSBSignalExtension(1, NSIG) == EINVAL);
+        assert(LSBSignalExtension(1, SIGCHLD) == ESRCH);
         assert(LSBLaunchExtension("test", 1, Record, &expectedContext) == 0);
         assert(LSBLaunchExtension("test", 1, Record, &expectedContext) == EEXIST);
         assert(LSBExtensionProcessIdentifier(1) == 0);
+        assert(LSBSignalExtension(1, SIGCHLD) == ESRCH);
         Ready();
         assert(count == 0);
         Drain();
         assert(count == 1 && lastRequest == 1 && lastPID == 4242 && lastError == 0);
         assert(LSBExtensionProcessIdentifier(1) == 4242);
+        @autoreleasepool {
+            assert(LSBSignalExtension(1, SIGCHLD) == 0);
+            assert(signalCount == 1 && signaledSignal == SIGCHLD);
+            assert([signaledService isEqualToString:@"test"] && [signaledInstance isEqual:lastInstanceUUID]);
+        }
+        assert(!signalConnection && signalConnectionStep == 6);
+        signalAllocationFails = YES;
+        assert(LSBSignalExtension(1, SIGCHLD) == ENOMEM && signalCount == 1);
+        signalAllocationFails = NO;
         Ready();
         Drain();
         assert(count == 1);
@@ -106,7 +178,9 @@ int main(void) {
         testInvalidation();
         Drain();
         assert(count == 2 && lastError == ECANCELED && lastPID == 0);
+        assert(LSBSignalExtension(1, SIGCHLD) == ESRCH);
         LSBReleaseExtension(1);
+        assert(LSBSignalExtension(1, SIGCHLD) == ESRCH);
         assert(assertionReleaseCount == 1 && LSBExtensionProcessIdentifier(1) == 0);
         assert(LSBLaunchExtension("test", 2, Record, &expectedContext) == 0);
         Ready();
@@ -122,6 +196,7 @@ int main(void) {
         Ready();
         Drain();
         assert(count == 3 && lastError == EACCES && LSBExtensionProcessIdentifier(4) == 0);
+        assert(LSBSignalExtension(4, SIGCHLD) == ESRCH);
         LSBReleaseExtension(4);
         testMode = 0;
         assert(LSBLaunchExtension("test", 5, Record, &expectedContext) == 0);
@@ -145,6 +220,9 @@ int main(void) {
         testReady(nil, @[@4242], nil);
         Drain();
         assert(count == 7 && lastError == 0 && lastPID == 4242 && LSBExtensionProcessIdentifier(8) == 4242);
+        NSUUID *previousSignaledInstance = signaledInstance;
+        assert(LSBSignalExtension(8, SIGCHLD) == 0 && signalCount == 2);
+        assert([signaledInstance isEqual:lastInstanceUUID] && ![signaledInstance isEqual:previousSignaledInstance]);
         LSBReleaseExtension(8);
         assert(LSBLaunchExtension("test", 9, Record, &expectedContext) == 0);
         testReady(nil, @[@4242], @[]);
