@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,8 +116,14 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
+    int stopBeforeHandoff = 0;
     for (unsigned i = 0; i < launch.plan.envc; ++i) {
         const char *entry = launch.plan.strings + launch.plan.envp[i];
+        const size_t debugPrefixLength = sizeof("LSB_DEBUG_STOP_BEFORE_HANDOFF=") - 1;
+        if (!strncmp(entry, "LSB_DEBUG_STOP_BEFORE_HANDOFF=", debugPrefixLength)) {
+            stopBeforeHandoff = !strcmp(entry + debugPrefixLength, "1");
+            continue;
+        }
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
             strncmp(entry, LSB_CHILD_STATUS_ENV "=", sizeof(LSB_CHILD_STATUS_ENV)) &&
             strncmp(entry, LSB_CHILD_WAKE_FD_ENV "=", sizeof(LSB_CHILD_WAKE_FD_ENV))) environment[count++] = entry;
@@ -127,6 +134,11 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     environment[count++] = wakeEnvironment;
     environment[count] = NULL;
     fprintf(stderr, "[LiveProcess] pid=%d entering %s with %u arguments\n", getpid(), executablePath, launch.plan.argc);
+    if (stopBeforeHandoff) {
+        fprintf(stderr, "[LiveProcess] pid=%d waiting for LLDB before simulator handoff\n", getpid());
+        fflush(stderr);
+        kill(getpid(), SIGSTOP);
+    }
     int result = LSBEnterDyldSim(&loader, executable.header, executablePath, dyldPath, launch.runtimeRoot,
                                (int)launch.plan.argc, arguments, environment, apple);
     // Successful detachment never returns; only native preparation/handoff failures reach this cleanup.

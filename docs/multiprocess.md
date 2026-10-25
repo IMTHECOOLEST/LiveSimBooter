@@ -10,10 +10,12 @@ audited against that runtime's host-support libkernel. Recheck those layouts bef
 
 ## Launch path
 
-1. [The native view](../Host/ViewController.m) starts the initial test once from `viewDidLoad`. [The broker](../Host/Broker.m)
+1. [The native view](../Host/ViewController.m) starts the initial guest once from `viewDidLoad`. [The broker](../Host/Broker.m)
    locates the shared runtime, registers `group.com.kdt.LiveSimBooter.spawn` with `bootstrap_check_in`, starts its receiver,
    and then submits the initial executable as a spawn plan. Arguments after the host executable name select the initial
-   guest; without arguments it selects `/bin/spawn-probe`. The actual `posix_spawn` call occurs inside that simulator guest.
+   guest; without arguments it selects interactive `/bin/fish` with the [fake terminal](fake-pty.md) and job control disabled.
+   `--terminal /bin/program ...` wraps an explicit guest in that terminal. Pass `/bin/spawn-probe` explicitly for the process
+   tests. The actual `posix_spawn` call occurs inside the simulator guest.
 2. [The launch adapter](../Host/ExtensionLauncher.m) uses `NSExtension` to discover `com.kdt.LiveSimBooter.LiveProcess`. It obtains
    the underlying `PKHostPlugIn` and creates a fresh instance UUID. `PKHost readyPlugIns:...ready:` asks pkd to launch that instance
    and returns its PID. Its optional registered-plugin UUID array is checked when present; the device normally omits it.
@@ -91,7 +93,7 @@ The runtime still needs appropriately signed dyld_sim, cache, executable, and sh
 their code signatures. Use the existing device-compatible `df` signing procedure for a new executable such as `spawn-probe`;
 ordinary executable signing can reintroduce the executable-segment/profile issue documented in the earlier loader experiments.
 
-For a fresh phone, the minimal cache-only runtime contains these five files, relative to the newly resolved App Group container:
+For a fresh phone, the explicit spawn-probe test needs these five files, relative to the newly resolved App Group container:
 
 | Local source | Destination inside `RuntimeRoot` |
 | --- | --- |
@@ -106,6 +108,11 @@ rebuilt iOS 26 cache at `0x120000000`; its patched dyld_sim reads that base. The
 the cache and need no loose copies. The old active root has no other data files or symlinks; the historical cache/dyld backups
 and empty library directories are not required for this test. The `tmp` artifacts are local and ignored by Git; rebuilding
 them follows [the cache procedure](shared-cache.md). Preserve any existing runtime on a replacement phone before overwriting it.
+
+The current default interactive launch additionally needs `bin/fish` from the [pristine Simulator build](fish.md) and the
+updated shim containing FakePTY and creation-mask tracking. The native host creates `RuntimeRoot/home/mobile` and a temporary
+terminal-state file alongside RuntimeRoot. Device-platform executables/dylibs additionally need the
+[iOS compatibility variant of dyld_sim](ios-platform.md); its relocated-cache support remains intact.
 
 ## Synchronous XPC and native-cache removal
 
@@ -194,10 +201,11 @@ A snapshot of a multithreaded caller's FD table is not atomic with concurrent cl
 
 [CreationMask.c](../Guest/CreationMask.c) checks the real `KERN_OSRELEASE` before selecting `getumask`. The transplanted support
 library exports that function, but iOS 26.1's Darwin 25.1 kernel lacks syscall 215; calling it caused SIGSYS before the first
-spawn. Darwin 26 or newer uses the query when available. Older kernels use a short `umask(0)`/restore sequence after blocking
-catchable signals and verifying that the guest has only one thread, then restore the signal mask. A multithreaded guest
-receives `EBUSY` on this fallback; it does not temporarily change its process mask. Focused tests cover both paths, restoration,
-signal deferral, and rejection of an actual second thread.
+spawn. Darwin 26 or newer uses the query when available. On older kernels, a constructor captures the inherited mask while
+the guest is still single threaded, and an `umask` interposer tracks subsequent changes. Later spawn reads use that shadow
+under a small lock with signal deferral; they do not temporarily change the kernel mask or reject guest worker threads.
+Initialization still fails if it cannot safely obtain a known value, and raw syscalls or calls bypassing interposition are
+unsupported. See [creation-mask tracking and tests](creation-mask.md) for initialization, concurrency, and failure behavior.
 
 Current limits are 256 argv entries, 256 environment entries, 64 file actions, 128 transferred descriptors, and 49,152 bytes of
 combined string storage. Executable/cwd/action paths must fit within 1,024 bytes including their terminator. The 128-FD limit
@@ -325,7 +333,7 @@ phone needs profiles containing its UDID. The generic-build result does not esta
 
 The shim builder produces `tmp/multiprocess/libLiveSimSpawn.dylib` and `tmp/multiprocess/spawn-probe` for arm64 iOS Simulator.
 After signing them using the runtime's established rules, place them at `RuntimeRoot/usr/lib/libLiveSimSpawn.dylib` and
-`RuntimeRoot/bin/spawn-probe`. The view starts this probe by default; an explicit first argument selects another guest.
+`RuntimeRoot/bin/spawn-probe`. The view now starts interactive Fish by default; use an explicit first argument for the probe.
 Launch the native host into the foreground:
 
 ```sh
@@ -333,7 +341,7 @@ xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --
   -- com.kdt.LiveSimBooter /bin/spawn-probe
 ```
 
-The phone must be unlocked for the launch. `/bin/spawn-probe` is now the default; pass `/bin/df` explicitly for the earlier
+The phone must be unlocked for the launch. Pass `/bin/spawn-probe` for the process test or `/bin/df` for the earlier
 single-program test. Keep the app window foregrounded during debugging pauses and longer runs. A debugger attachment alone
 does not establish that the native broker remains runnable, and a headless launch has no guaranteed background grace period.
 

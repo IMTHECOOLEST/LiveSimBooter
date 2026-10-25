@@ -1,8 +1,9 @@
 # Runtime handoff design
 
-`main()` in [main.m](../LiveSimBooter/main.m) starts in C, without Foundation or UIKit startup. It locates the app's
-`Documents/RuntimeRoot`, maps `usr/lib/dyld_sim` and `bin/df`, then enters the simulator runtime. The original delegates,
-controller, and storyboards remain in `unused/`, outside the app target.
+The native host runs UIKit and the process broker. Each guest starts separately in [LiveProcess/main.c](../LiveProcess/main.c),
+receives its launch plan, locates `RuntimeRoot` in the App Group, maps `usr/lib/dyld_sim` and the requested executable, and
+enters the simulator runtime. LiveProcess uses C for its native startup and releases native XPC objects before detachment.
+The original starter delegates, controller, and storyboards remain in `unused/`; the new host UI lives in `Host/`.
 
 ## Before host-cache removal
 
@@ -10,7 +11,7 @@ controller, and storyboards remain in `unused/`, outside the app target.
 `F_ADDFILESIGS_RETURN`, reserves the address range, and maps segments and zero-fill. It accepts thin arm64 images or an arm64
 universal slice. The executable's `__PAGEZERO` is excluded from its reservation. The mapped signed headers are preserved.
 
-The loader builds persistent kernel-style arguments for `df`, including its actual path in `argv[0]` and `executable_path`.
+The loader builds persistent kernel-style arguments for the requested program, including its actual path in `argv[0]` and `executable_path`.
 It sets `DYLD_ROOT_PATH` and `DYLD_SHARED_CACHE_DIR` to RuntimeRoot paths, removes stale host executable metadata, and replaces
 inherited `ptr_munge` values with a fresh nonzero random token. The apple vector is writable because simulator libpthread
 consumes and clears the token. [Dyld diagnostics](debugging.md#simulator-dyld-diagnostics) are disabled by default; explicit
@@ -39,13 +40,42 @@ and stderr formatting. These paths are built without builtins, stack protectors,
 
 The version 18 [helper ABI](../LiveSimBooter/SimSyscallHelpers.h) and argument block are passed to dyld_sim's prepare entry.
 For the supported `LC_MAIN` path, its returned `start_sim` wrapper receives the same argc/argv/environment/apple vectors,
-calls `df`, and exits through the simulator runtime. A raw exit handles an unexpected wrapper return without host cleanup.
+calls the guest program, and exits through the simulator runtime. A raw exit handles an unexpected wrapper return without host cleanup.
 A null prepare result exits `1`; unsupported startup glue exits `126`; failed restoration of host TSD exits `127`.
 Existing host frames remain below the simulator frames. The implementation does not reset the stack or remove those frames.
 
-Only the current main thread's storage is replaced. Existing host threads and kernel pthread/workqueue entry registrations
-are not migrated. The local callback bridge implements the pinned dyld's usage, not a complete replacement for host libc or pthread.
-That is why startup remains minimal and UIKit remains deferred.
+Only the current main thread's storage is replaced during this transition. Existing host threads are not migrated;
+the native host's UIKit and broker workers remain in the separate host process. The local callback bridge implements
+the pinned dyld's usage, not a complete replacement for host libc or pthread.
+
+## New guest pthreads
+
+Cache detachment does not replace XNU's recorded pthread entry point. The simulator's second `__bsdthread_register` fails
+with `EINVAL`, leaving the native startup PC registered. An interactive Fish worker consequently started in the unmapped
+host cache even though the main guest thread was running correctly.
+
+[Guest/ThreadBootstrap.c](../Guest/ThreadBootstrap.c) interposes the simulator's registration and creation syscall wrappers.
+It preserves the registration result. For the pinned layout (16 KiB pthread storage, TSD offset `0xe0`, Mach-self slot offset
+`0x18`), a rejected repeat registration records the simulator startup PC for subsequent explicit pthread creation. A
+successful native registration keeps the ordinary creation path. Unsupported layouts and creation modes fail explicitly.
+
+The fallback asks the real `__bsdthread_create` to create the custom-stack thread suspended. XNU still initializes its
+pthread port, TSD, QoS, argument registers, and stack. The shim fetches and validates that never-run thread's state, changes
+only its PC to the simulator's pthread entry, signs the replacement PC when required by the returned arm64 thread-state
+flags, and resumes it unless the caller requested suspension. It retains the other signed register fields. A failure
+terminates the suspended thread before returning an error; unrecoverable cleanup exits `126` so libpthread cannot free
+storage still referenced by a live kernel thread.
+
+This supports explicit pthread creation with the selected simulator libpthread's custom-stack ABI. Kernel workqueue
+registration and dispatch workqueue startup remain native and unsupported. The shim is loaded in the simulator, after
+the native single-thread guard and cache detachment; it does not introduce a native worker during handoff.
+
+The host tests cover registration validation, state preservation, PC signing, requested suspension, failures, and cleanup,
+including ASan/UBSan runs. An LLDB experiment on the phone redirected a suspended Fish worker and reached another worker
+creation. The integrated interposer then enabled interactive Fish to reach its prompt and run `df` successfully. Hardware
+breakpoints caught `LSBThreadCreate` and a new worker at simulator `_pthread_start` (`0x12b26e618`), with the host region
+still inaccessible and the low simulator cache executable with zero reported dirty pages. Interactive child statuses,
+Ctrl-C, editing, and clean Ctrl-D exit are recorded with the [terminal validation](fake-pty.md#device-checks-and-diagnostics).
 
 ## Debugger publication
 
@@ -73,6 +103,12 @@ xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration
 The host tests use synthetic images and substitute dangerous handoff operations. They do not detach the Mac test process's
 cache or establish device signing acceptance. The import audit checks the local callback/handoff code at `-O0` and `-O2`;
 it can also inspect an actual Xcode arm64 object directory. Device behavior requires the separate [debugging workflow](debugging.md).
+
+The loader tests also exercise short and large Fish-shaped startup vectors in isolated host test processes. They verify
+the argc/header prefix, contiguous argv/environment/apple layout, exact counts and null terminators, root overrides,
+one final fresh writable pointer token, and independent copies of every input string. The native preparation mocks alter
+the original strings and churn allocations before entry. This guards the handoff layout but does not reproduce the one
+observed on-device startup failure in which libpthread reported a zero pointer token.
 
 The implementation follows the pinned Apple dyld source described in the [root README](../README.md). Apple-derived files
 retain their APSL notices; the project's separate original code uses MIT.

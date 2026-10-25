@@ -1,13 +1,40 @@
 #import "ViewController.h"
 #include "HostApplication.h"
+#import "TerminalSession.h"
+#import "TerminalView.h"
 #include <string.h>
 
 @implementation LSBHostViewController
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    for (UIView *view in self.view.subviews) if ([view isKindOfClass:LSBTerminalView.class]) [view becomeFirstResponder];
+}
 - (void)viewDidLoad {
     [super viewDidLoad];
-    // The default simulator guest is spawn-probe, which performs posix_spawn through the full guest-to-host path.
     int startupError = LSBStartInitialGuest();
     self.view.backgroundColor = UIColor.systemBackgroundColor;
+    LSBTerminalSession *session = LSBHostTerminal();
+    if (!startupError && session) {
+        LSBTerminalView *terminal = [[LSBTerminalView alloc] initWithFrame:CGRectZero];
+        terminal.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.view addSubview:terminal];
+        UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [terminal.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+            [terminal.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+            [terminal.topAnchor constraintEqualToAnchor:safe.topAnchor],
+            [terminal.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor]
+        ]];
+        __weak LSBTerminalView *weakTerminal = terminal;
+        session.outputHandler = ^(NSData *data) { [weakTerminal appendOutput:data]; };
+        terminal.inputHandler = ^(NSData *data) {
+            int error = [session sendInput:data];
+            if (error) fprintf(stderr, "[terminal] input: %s\n", strerror(error));
+        };
+        terminal.resizeHandler = ^(unsigned short rows, unsigned short columns) { [session resizeRows:rows columns:columns]; };
+        [terminal becomeFirstResponder];
+        return;
+    }
     UILabel *title = [UILabel new];
     title.text = @"LiveSimBooter";
     title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleLargeTitle];

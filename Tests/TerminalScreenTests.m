@@ -1,0 +1,95 @@
+#define LSB_TERMINAL_SCREEN_TESTING
+#import "../Host/TerminalView.m"
+#include <assert.h>
+#include <stdio.h>
+
+static void feed(LSBTerminalScreen *screen, NSString *text) { [screen consume:[text dataUsingEncoding:NSUTF8StringEncoding]]; }
+
+static LSBTerminalScreen *screen(NSUInteger rows, NSUInteger columns) {
+    LSBTerminalScreen *screen = [LSBTerminalScreen new];
+    [screen resizeRows:rows columns:columns];
+    return screen;
+}
+
+int main(void) {
+    @autoreleasepool {
+        LSBTerminalScreen *editing = screen(3, 10);
+        feed(editing, @"abcdef\rXY\033[K");
+        assert([[editing text] isEqualToString:@"XY "] && editing.column == 2);
+        feed(editing, @"\bZ\033[2DX");
+        assert([[editing text] isEqualToString:@"XZ"] && editing.column == 1);
+        feed(editing, @"\033[2;4H!\033[6n");
+        assert(editing.row == 1 && editing.column == 4);
+        feed(editing, @"\033[2J\033[H");
+        assert([[editing text] isEqualToString:@" "] && !editing.row && !editing.column);
+
+        LSBTerminalScreen *wrapping = screen(3, 4);
+        feed(wrapping, @"ABCD\033[31mE\033[0m");
+        assert([[wrapping text] isEqualToString:@"ABCD\nE "] && wrapping.row == 1 && wrapping.column == 1);
+        feed(wrapping, @"\r\nF\r\nG");
+        assert([[wrapping text] isEqualToString:@"ABCD\nE\nF\nG "]);
+
+        LSBTerminalScreen *whole = screen(4, 20), *split = screen(4, 20);
+        NSString *sequence = @"hello é 🙂 e\u0301\033[2;2Hxyz\033]0;ignored title\033\\!\033Pignored query\033\\\033[2D!";
+        NSData *encoded = [sequence dataUsingEncoding:NSUTF8StringEncoding];
+        [whole consume:encoded];
+        for (NSUInteger index = 0; index < encoded.length; ++index) [split consume:[encoded subdataWithRange:NSMakeRange(index, 1)]];
+        assert([[whole text] isEqualToString:[split text]] && whole.row == split.row && whole.column == split.column);
+        assert([[split text] containsString:@"é 🙂 e\u0301"] && ![[split text] containsString:@"ignored"]);
+        const uint8_t invalid[] = {0xc0, 0xe2, 'a'};
+        [split consume:[NSData dataWithBytes:invalid length:sizeof(invalid)]];
+        assert([[split text] containsString:@"��a"]);
+
+        LSBTerminalScreen *replies = screen(3, 10);
+        NSMutableData *received = [NSMutableData new];
+        replies.reply = ^(NSData *data) { [received appendData:data]; };
+        feed(replies, @"abc\033[6n\033[c\033[>c\033[5n");
+        NSString *response = [[NSString alloc] initWithData:received encoding:NSUTF8StringEncoding];
+        assert([response isEqualToString:@"\033[1;4R\033[?1;2c\033[>0;1;0c\033[0n"]);
+        feed(replies, @"\033[?25l"); assert(!replies.cursorVisible);
+        feed(replies, @"\033[?25h"); assert(replies.cursorVisible);
+
+        LSBTerminalScreen *controlEcho = screen(3, 40);
+        __weak LSBTerminalScreen *weakControlEcho = controlEcho;
+        controlEcho.reply = ^(NSData *data) {
+            NSString *response = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            feed(weakControlEcho, [response stringByReplacingOccurrencesOfString:@"\033" withString:@"^["]);
+        };
+        feed(controlEcho, @"abc\033[6n");
+        assert([[controlEcho text] isEqualToString:@"abc^[[1;4R "]);
+
+        LSBTerminalScreen *rawEcho = screen(3, 40);
+        __weak LSBTerminalScreen *weakRawEcho = rawEcho;
+        __block unsigned echoedReplies = 0;
+        rawEcho.reply = ^(NSData *data) {
+            assert(++echoedReplies <= 6); // A DA response must not recursively produce another response.
+            [weakRawEcho consume:data];
+        };
+        feed(rawEcho, @"abc\033[6n\033[c\033[>c\033[0c\033[>0c\033[5n!");
+        assert(echoedReplies == 6 && [[rawEcho text] isEqualToString:@"abc! "]);
+
+        LSBTerminalScreen *partialReply = screen(3, 10);
+        __weak LSBTerminalScreen *weakPartialReply = partialReply;
+        partialReply.reply = ^(NSData *data) { (void)data; feed(weakPartialReply, @"\033[2;"); };
+        feed(partialReply, @"\033[6n3HX");
+        assert(partialReply.row == 1 && partialReply.column == 3 && [[partialReply text] isEqualToString:@"\n  X "]);
+
+        LSBTerminalScreen *characters = screen(3, 10);
+        feed(characters, @"abc\r\033[P\033[@");
+        assert([[characters text] isEqualToString:@" bc"]);
+        feed(characters, @"\033[2C\0337\033[3;9H!\0338X");
+        assert(characters.row == 0 && characters.column == 3 && [[characters text] hasPrefix:@" bX"]);
+        feed(characters, @"\033[2K");
+        assert([[characters text] hasPrefix:@"    \n"]);
+
+        LSBTerminalScreen *bounded = screen(3, 10);
+        for (unsigned index = 0; index < 1050; ++index) feed(bounded, @"line\r\n");
+        assert([[bounded text] componentsSeparatedByString:@"\n"].count <= 1003);
+        [bounded resizeRows:2 columns:5];
+        assert(bounded.row < 2 && bounded.column < 5);
+        feed(bounded, @"\033[3J\033[2J\033[H");
+        assert([[bounded text] isEqualToString:@" "]);
+    }
+    puts("TerminalScreen: split UTF-8/ANSI, cursor editing, scrolling, erase, reentrant terminal replies, and bounded resize passed");
+    return 0;
+}

@@ -3,7 +3,14 @@
 Unmodified Fish 4.9.3 source, built for iOS Simulator, runs noninteractive external commands through the brokered
 `posix_spawn` and `waitpid` paths on `iphone-0xf-26-cua-duy.local` (iOS 26.1, build `23B50`). The runtime supplies the required
 access-check and wait-option compatibility. Two df children and the shell exited 0 in the completed device test.
-This does not establish that all Fish execution paths avoid fork, or provide interactive job control or a PTY.
+This baseline does not establish that all Fish execution paths avoid fork, or provide full job control or a kernel PTY.
+
+The current app's default launch now selects interactive Fish with the [fake terminal](fake-pty.md), a native keyboard and
+display, and a pure-C terminal shim. It keeps the same pristine Fish executable and disables job control before presenting
+the prompt. The integrated worker shim and terminal have reached the prompt on iPhone, accepted editing keys, spawned `df`
+with exit 0 and original-platform Bash with exit 37, interrupted a looping child, and exited 0 on Ctrl-D. A builtin command
+substitution also produced 42. The [terminal results and limits](fake-pty.md#device-checks-and-diagnostics) contain the LLDB
+evidence and input/signal ordering limitation; the completed results below remain the earlier noninteractive baseline.
 
 To run from the broker's initial RuntimeRoot working directory:
 
@@ -103,8 +110,12 @@ The compatibility lives in the runtime, independently of Fish source:
   directory-relative `faccessat` requests and flags keep the original result. The [full scope](multiprocess.md#executable-access-checks)
   separates this preflight from the loader's actual image/code-signature validation.
 
-These tests run with job control disabled. On this older kernel, the creation-mask fallback also requires the guest to remain
-single-threaded when spawning; a multithreaded caller receives `EBUSY`. Accepted wait options do not add stopped/continued
-events. Full fork and exec emulation remain separate work, described in the [Bash notes](bash.md#process-model-questions).
-The guest and native host PTY probes there both rejected new PTY allocation. Shell pipelines, background jobs, substitutions,
-and other paths that may fork or start threads need separate validation; this result establishes sequential external commands.
+These tests ran with job control disabled. Their original Darwin 25 creation-mask fallback required a single-threaded guest
+at every spawn. The new [creation-mask tracker](creation-mask.md) initializes before guest workers start and interposes
+`umask`, so later reads no longer temporarily change the process mask or reject worker threads. Native preparation and cache
+detachment still require a single thread. Calls that bypass `umask` interposition do not update the tracked value.
+
+Accepted wait options do not add stopped/continued events. Full fork and exec emulation remain separate work, described in
+the [Bash notes](bash.md#process-model-questions). The guest and native host PTY probes there both rejected new PTY allocation;
+the new terminal supplies socket descriptors and guest controls instead. Shell pipelines, background jobs, substitutions,
+and other paths that may fork or start threads need separate validation; the completed device results establish sequential external commands.

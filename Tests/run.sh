@@ -53,6 +53,12 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutableAccessTests.c -o "$test_directory/ExecutableAccess"
 "$test_directory/ExecutableAccess"
 python3 -B Tests/PatchIOSPlatformTests.py
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_FAKE_PTY_TESTING \
+    Tests/FakePTYTests.c Guest/FakePTY.c ProcessSupport/FakePTY.c -o "$test_directory/FakePTY"
+"$test_directory/FakePTY"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ThreadBootstrapTests.c -o "$test_directory/ThreadBootstrap"
+"$test_directory/ThreadBootstrap"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
@@ -70,8 +76,16 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WI
     Tests/XPCWireCompatibilityTests.c "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/XPCWireCompatibility"
 DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
-    Tests/BrokerTests.m ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c -framework Foundation -o "$test_directory/Broker"
+    Tests/BrokerTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
+    -framework Foundation -o "$test_directory/Broker"
 "$test_directory/Broker"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
+    Tests/TerminalSessionTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c \
+    -framework Foundation -o "$test_directory/TerminalSession"
+"$test_directory/TerminalSession"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/TerminalScreenTests.m -framework Foundation -o "$test_directory/TerminalScreen"
+"$test_directory/TerminalScreen"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/ExtensionLauncherTests.m -framework Foundation -o "$test_directory/ExtensionLauncher"
 "$test_directory/ExtensionLauncher"

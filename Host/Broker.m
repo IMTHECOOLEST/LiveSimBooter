@@ -6,6 +6,8 @@
 #include "ChildStatus.h"
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
+#import "TerminalSession.h"
+#include "FakePTY.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -30,6 +32,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property BOOL parentStatusPublished;
 @property LSBChildStatus *childStatus;
 @property int statusFD, wakeReadFD, wakeWriteFD;
+@property BOOL terminalSession;
 @end
 @implementation LSBJob
 - (instancetype)init {
@@ -50,7 +53,10 @@ static NSString *runtimeRoot;
 static uint64_t nextIdentifier = 1;
 static BOOL launchLaneFailed;
 static unsigned finishingDepth;
+static LSBTerminalSession *hostTerminal;
 static void startNextJob(void);
+
+LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
 
 static LSBJob *findJob(uint64_t identifier) {
     for (LSBJob *job in jobs) if (job.identifier == identifier) return job;
@@ -127,6 +133,12 @@ static void finishJob(LSBJob *job, int error) {
     LSBReleaseExtension(job.identifier);
     if (startingJob == job) startingJob = nil;
     [jobs removeObject:job];
+    BOOL terminalAlive = NO;
+    for (LSBJob *remaining in jobs) if (remaining.terminalSession) terminalAlive = YES;
+    if (job.terminalSession && !terminalAlive) {
+        // Let the socket reader drain output before EOF closes its endpoint and removes the shared state file.
+        hostTerminal.signalHandler = nil;
+    }
     --finishingDepth;
     startNextJob();
 }
@@ -201,19 +213,13 @@ static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
         job.parentTicket = ticket;
     }
     job.identifier = nextIdentifier++;
+    job.terminalSession = parent ? parent.terminalSession : hostTerminal != nil;
     job.request = message;
     [jobs addObject:job];
     startNextJob();
 }
 
-static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
-    if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
-    if (targetPID <= 0) return ENOTSUP;
-    LSBJob *child = nil;
-    for (LSBJob *job in jobs) {
-        if (job.pid == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) { child = job; break; }
-    }
-    if (!child) return ESRCH;
+static int signalJob(LSBJob *child, int signalNumber) {
     audit_token_t identity = child.audit;
     // A retained job can outlive the process until its queued exit notification runs. Validate the full PID generation.
     // proc_signal_with_audittoken does not support signal 0, so the identity lookup also implements the existence check.
@@ -226,6 +232,31 @@ static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
                             signalNumber, child.identifier, child.pid);
     }
     return error;
+}
+
+static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
+    if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
+    if (targetPID <= 0) return ENOTSUP;
+    for (LSBJob *job in jobs) {
+        if (job.pid == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) return signalJob(job, signalNumber);
+    }
+    return ESRCH;
+}
+
+static int signalTerminal(pid_t foreground, int signalNumber) {
+    (void)foreground;
+    // This first terminal runs with job control disabled: the shell and its descendants share terminal signals.
+    // It does not implement kernel process groups or stopped/continued job notifications.
+    if (signalNumber != SIGINT && signalNumber != SIGQUIT && signalNumber != SIGWINCH) return ENOTSUP;
+    int firstError = 0;
+    BOOL found = NO;
+    for (LSBJob *job in jobs) {
+        if (!job.terminalSession || job.phase != JobRunning) continue;
+        found = YES;
+        int error = signalJob(job, signalNumber);
+        if (error && error != ESRCH && !firstError) firstError = error;
+    }
+    return found ? firstError : ESRCH;
 }
 
 static void handleMessage(LSBReceivedMessage *message) {
@@ -363,9 +394,12 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     LSBSpawnPlan *plan = &message->plan;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
     plan->version = LSB_PLAN_VERSION;
-    const char *defaultArgs[] = { "/bin/spawn-probe", NULL };
-    const char *const *arguments = argc > 1 ? argv + 1 : defaultArgs;
-    int count = argc > 1 ? argc - 1 : 1;
+    const char *defaultArgs[] = {"/bin/fish", "-i", "-N", "-P", "-C",
+        "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end", NULL};
+    BOOL terminal = argc == 1 || (argc > 1 && !strcmp(argv[1], "--terminal"));
+    int firstArgument = terminal && argc > 1 ? 2 : 1;
+    const char *const *arguments = argc > firstArgument ? argv + firstArgument : defaultArgs;
+    int count = argc > firstArgument ? argc - firstArgument : 6;
     int error = LSBPlanAddString(plan, arguments[0], &plan->path);
     if (!error) error = LSBPlanAddString(plan, runtimeRoot.fileSystemRepresentation, &plan->cwd);
     for (int i = 0; !error && i < count; ++i) {
@@ -373,12 +407,30 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
         error = LSBPlanAddString(plan, arguments[i], &plan->argv[plan->argc++]);
     }
     for (const char **item = envp; !error && item && *item; ++item) {
+        if (terminal && (!strncmp(*item, "TERM=", 5) || !strncmp(*item, "PATH=", 5) || !strncmp(*item, "HOME=", 5) ||
+                         !strncmp(*item, LSB_FAKE_PTY_ENV "=", sizeof(LSB_FAKE_PTY_ENV)))) continue;
         if (plan->envc == LSB_MAX_VECTOR) return E2BIG;
         error = LSBPlanAddString(plan, *item, &plan->envp[plan->envc++]);
     }
     plan->creationMask = 022;
     sigprocmask(0, NULL, (sigset_t *)&plan->signalMask);
-    for (int number = 0; !error && number < 3; ++number) {
+    if (terminal && !error) {
+        NSString *home = [runtimeRoot stringByAppendingPathComponent:@"home/mobile"];
+        NSError *directoryError = nil;
+        if (![NSFileManager.defaultManager createDirectoryAtPath:home withIntermediateDirectories:YES attributes:nil error:&directoryError])
+            error = EIO;
+        NSArray<NSString *> *environment = @[@"TERM=xterm-256color", [@"HOME=" stringByAppendingString:home],
+            [NSString stringWithFormat:@"PATH=%@/bin:%@/usr/bin", runtimeRoot, runtimeRoot]];
+        for (NSString *entry in environment) {
+            if (error) break;
+            if (plan->envc == LSB_MAX_VECTOR) { error = E2BIG; break; }
+            error = LSBPlanAddString(plan, entry.UTF8String, &plan->envp[plan->envc++]);
+        }
+        if (!error) hostTerminal = [[LSBTerminalSession alloc] initWithDirectory:runtimeRoot.stringByDeletingLastPathComponent error:&error];
+        if (!error) error = [hostTerminal attachToMessage:message];
+        if (error) { [hostTerminal close]; hostTerminal = nil; }
+    }
+    for (int number = 0; !terminal && !error && number < 3; ++number) {
         int flags = fcntl(number, F_GETFD);
         if (flags < 0) continue;
         int duplicate = fcntl(number, F_DUPFD_CLOEXEC, 3);
@@ -405,6 +457,8 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
         kern_return_t status = bootstrap_check_in(bootstrap_port, LSB_BROKER_SERVICE, &service);
         if (status) { disposeMessage(initial); fprintf(stderr, "[broker] bootstrap_check_in: %d\n", status); return EIO; }
         jobs = [NSMutableArray new];
+        hostTerminal.signalHandler = ^int(pid_t foreground, int number) { return signalTerminal(foreground, number); };
+        [hostTerminal start];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             unsigned receiveFailures = 0;
             for (;;) {

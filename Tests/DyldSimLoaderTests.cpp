@@ -8,6 +8,7 @@
 #include <libkern/OSByteOrder.h>
 #include <mach-o/fat.h>
 #include <string>
+#include <sys/wait.h>
 #include <vector>
 
 static bool rejectSegmentMapping = false;
@@ -381,7 +382,8 @@ static void executableMapping(const Bytes &bytes, uint64_t sliceOffset) {
 }
 
 static SimSyscallHelpers fakeHelpers = {};
-void LSBPrepareHostPolicy() {}
+static std::function<void(unsigned)> preparationAllocationHook;
+void LSBPrepareHostPolicy() { if (preparationAllocationHook) preparationAllocationHook(0); }
 static const mach_header *debuggerExecutable;
 static std::string debuggerExecutablePath;
 static bool checkedFinalThreadCount;
@@ -389,10 +391,12 @@ int LSBValidateHostThreadCount() { checkedFinalThreadCount = true; return 0; }
 int LSBPrepareHostDebugger(const mach_header *executable, const char *executablePath) {
     debuggerExecutable = executable;
     debuggerExecutablePath = executablePath;
+    if (preparationAllocationHook) preparationAllocationHook(2);
     return 0;
 }
 int LSBPrepareHostMainThread(lsb::MainThreadBootstrap *bootstrap) {
     *bootstrap = {0x1000, 0x2000};
+    if (preparationAllocationHook) preparationAllocationHook(1);
     return 0;
 }
 static const mach_header *initializedHeader = nullptr;
@@ -468,6 +472,136 @@ int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
     throw HandoffComplete{};
 }
 
+struct TerminalStartupFixture {
+    std::vector<std::string> arguments, environment, apple, expectedEnvironment, expectedApple;
+    std::vector<std::pair<uintptr_t, size_t>> inputRanges;
+    unsigned prepared = 0;
+
+    explicit TerminalStartupFixture(bool large) {
+        arguments = {"/RuntimeRoot/bin/fish", "-i", "-N", "-P", "-C",
+                     "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end"};
+        environment = {"TERM=xterm-256color", "HOME=/RuntimeRoot/home/mobile", "PATH=/RuntimeRoot/bin:/RuntimeRoot/usr/bin",
+                       "LSB_FAKE_PTY_STATE=/RuntimeRoot/.terminal-state", "DYLD_INSERT_LIBRARIES=/RuntimeRoot/usr/lib/libLiveSimSpawn.dylib",
+                       "DYLD_ROOT_PATH=/old", "DYLD_SHARED_CACHE_DIR=/old-cache"};
+        apple = {"executable_path=/app/LiveProcess", "executable_file=0x123,0x456", "stack_guard=0x1234",
+                 "main_stack=0x100000,0x10000", "ptr_munge=", "ptr_munge=0x1234"};
+        if (large) {
+            // Force repeated vector reallocations and both short-string and heap-backed storage.
+            for (unsigned i = 0; i < 240; ++i) {
+                arguments.emplace_back(i % 4 == 0 ? "" : std::string(i % 4 == 1 ? 15 : 257 + i, 'a' + i % 26));
+                environment.emplace_back("FILL_" + std::to_string(i) + "=" + std::string(i % 4 == 0 ? 0 : 23 + i * 7, 'A' + i % 26));
+                apple.emplace_back("extra_" + std::to_string(i) + "=" + std::string(i % 4 == 0 ? 0 : 17 + i * 5, '0' + i % 10));
+            }
+            environment.emplace_back("DYLD_ROOT_PATH=/second-old");
+            environment.emplace_back("DYLD_SHARED_CACHE_DIR=/second-old-cache");
+            apple.emplace_back("executable_path=/second-old-app");
+            apple.emplace_back("executable_file=0x789,0xabc");
+            apple.emplace_back("ptr_munge=0xffff");
+        }
+        for (const auto &item : environment)
+            if (item.rfind("DYLD_ROOT_PATH=", 0) != 0 && item.rfind("DYLD_SHARED_CACHE_DIR=", 0) != 0) expectedEnvironment.push_back(item);
+        expectedEnvironment.emplace_back("DYLD_ROOT_PATH=/RuntimeRoot");
+        expectedEnvironment.emplace_back("DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld");
+        for (const auto &item : apple)
+            if (item.rfind("executable_path=", 0) != 0 && item.rfind("executable_file=", 0) != 0 && item.rfind("ptr_munge=", 0) != 0)
+                expectedApple.push_back(item);
+        expectedApple.emplace_back("executable_path=/RuntimeRoot/bin/fish");
+        expectedApple.emplace_back("ptr_munge=0xa739c450e16b28df");
+    }
+
+    std::vector<const char *> pointers(std::vector<std::string> &strings) {
+        std::vector<const char *> result;
+        for (auto &item : strings) {
+            result.push_back(item.data());
+            inputRanges.emplace_back(reinterpret_cast<uintptr_t>(item.data()), item.size() + 1);
+        }
+        result.push_back(nullptr);
+        return result;
+    }
+
+    void checkVector(const char *const actual[], const std::vector<std::string> &expected, const char *message) const {
+        for (size_t i = 0; i < expected.size(); ++i) {
+            check(actual[i] != nullptr, "startup vector has no premature null entry");
+            check(strcmp(actual[i], expected[i].c_str()) == 0, message);
+            uintptr_t pointer = reinterpret_cast<uintptr_t>(actual[i]);
+            bool aliasesInput = false;
+            for (const auto &range : inputRanges) aliasesInput |= pointer >= range.first && pointer - range.first < range.second;
+            check(!aliasesInput, "startup strings own storage separate from every original vector");
+        }
+        check(actual[expected.size()] == nullptr, "startup vector has its final null terminator");
+    }
+};
+
+static TerminalStartupFixture *terminalFixture;
+static FakeMain terminalEntry(int argc, const char *const argv[], const char *const envp[], const char *const apple[], const mach_header *executable,
+                              const mach_header *dyld, uintptr_t slide, const SimSyscallHelpers *helpers, uintptr_t *startGlue) {
+    ++entryCalls;
+    auto &fixture = *terminalFixture;
+    check(fixture.prepared == 7, "all native preparation allocation stages completed before entry");
+    check(argc == static_cast<int>(fixture.arguments.size()), "terminal argument count survives native preparation");
+    const auto *kernelArgs = reinterpret_cast<const uintptr_t *>(argv) - 2;
+    check(kernelArgs[0] == reinterpret_cast<uintptr_t>(executable) && kernelArgs[1] == static_cast<uintptr_t>(argc), "terminal kernel-style prefix");
+    fixture.checkVector(argv, fixture.arguments, "terminal argument contents survive native allocation");
+    auto reconstructedEnvironment = argv + kernelArgs[1] + 1;
+    check(reconstructedEnvironment == envp, "dyld reconstructs the exact supplied environment pointer");
+    fixture.checkVector(envp, fixture.expectedEnvironment, "terminal environment contents and override order survive native allocation");
+    auto reconstructedApple = reconstructedEnvironment;
+    while (*reconstructedApple) ++reconstructedApple;
+    ++reconstructedApple;
+    check(reconstructedApple == apple, "dyld finds the exact supplied apple vector after scanning environment");
+    fixture.checkVector(apple, fixture.expectedApple, "terminal apple contents and replacement order survive native allocation");
+    check(randomCalls == 2, "terminal startup retries zero before generating a fresh pointer token");
+    size_t tokenIndex = fixture.expectedApple.size() - 1;
+    char *token = const_cast<char *>(apple[tokenIndex]);
+    check(strncmp(token, "ptr_munge=0x", 12) == 0 && !apple[tokenIndex + 1], "fresh pointer token is the final apple entry");
+    size_t tokenLength = strlen(token);
+    memset(token + 10, 0, tokenLength - 10);
+    check(strcmp(token, "ptr_munge=") == 0, "terminal pointer token remains writable for libpthread consumption");
+    check(apple[tokenIndex - 1] && !apple[tokenIndex + 1], "token erasure preserves adjacent vector entries and final terminator");
+    check(executable == &fakeExecutable && dyld == &fakeDyld && slide == 42 && helpers == &fakeHelpers, "terminal entry retains image and helper ABI");
+    check(debuggerExecutable == executable && debuggerExecutablePath == "/RuntimeRoot/bin/fish", "terminal debugger preparation receives the original path");
+    check(startGlue && *startGlue == 0, "terminal start glue is initialized");
+    *startGlue = 123;
+    return fakeMain;
+}
+
+static void terminalEntryTest(bool large) {
+    // Each child starts before the parent's one permitted handoff; this is host-test isolation, not guest fork support.
+    pid_t child = fork();
+    check(child >= 0, "create isolated terminal startup test");
+    if (child == 0) {
+        unsigned initialChecks = checks;
+        TerminalStartupFixture fixture(large);
+        terminalFixture = &fixture;
+        auto inputArguments = fixture.arguments, inputEnvironment = fixture.environment, inputApple = fixture.apple;
+        auto argv = fixture.pointers(inputArguments), envp = fixture.pointers(inputEnvironment), apple = fixture.pointers(inputApple);
+        preparationAllocationHook = [&](unsigned stage) {
+            check(stage < 3 && fixture.prepared == (1u << stage) - 1, "native allocation hooks run in handoff order");
+            fixture.prepared |= 1u << stage;
+            if (stage == 0) {
+                for (auto *strings : {&inputArguments, &inputEnvironment, &inputApple})
+                    for (auto &item : *strings) std::fill(item.begin(), item.end(), '!');
+            }
+            std::vector<std::string> churn;
+            for (unsigned i = 0; i < 512; ++i) churn.emplace_back((i * 37 + stage * 17) % 8192, 'A' + i % 26);
+            check(churn.size() == 512 && !churn.back().empty(), "native preparation exercises allocator growth and release");
+        };
+        LSBMappedImage image = {&fakeDyld, 0, 42, reinterpret_cast<uintptr_t>(&terminalEntry)};
+        bool handedOff = false;
+        try {
+            LSBEnterDyldSim(&image, &fakeExecutable, "/RuntimeRoot/bin/fish", "/RuntimeRoot/usr/lib/dyld_sim", "/RuntimeRoot",
+                           static_cast<int>(inputArguments.size()), argv.data(), envp.data(), apple.data());
+        } catch (const HandoffComplete &) { handedOff = true; }
+        check(handedOff && entryCalls == 1 && !mainCalls, "terminal prepare reaches the destructive handoff boundary exactly once");
+        printf("Terminal startup %s vector passed (%u checks).\n", large ? "large" : "short", checks - initialChecks);
+        fflush(stdout);
+        _exit(0);
+    }
+    int status = 0;
+    check(waitpid(child, &status, 0) == child, "wait for isolated terminal startup test");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "terminal startup vector survives native preparation allocations");
+}
+
 static void entryTest() {
     LSBMappedImage image = {&fakeDyld, 0, 42, reinterpret_cast<uintptr_t>(&fakeEntry)};
     const char *argv[] = {"/RuntimeRoot/bin/df", "arg", nullptr};
@@ -501,6 +635,8 @@ int main() {
     executableMapping(universal(true, true, executable()), page);
     executableMapping(dylibVariant(executable()), 0);
     executableMapping(universal(true, true, dylibVariant(executable())), page);
+    terminalEntryTest(false);
+    terminalEntryTest(true);
     entryTest();
     printf("DyldSimLoader host tests passed (%u checks). Signature authorization and device execution are not tested.\n", checks);
     return 0;

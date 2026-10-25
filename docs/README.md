@@ -1,12 +1,14 @@
 # Development notes
 
 These notes describe the runtime experiments and the multiprocess implementation added on 2026-10-25.
-The current target is a minimal arm64 runtime handoff with brokered `posix_spawn`; UIKit and a complete simulator boot remain later work.
+The current target is an arm64 runtime handoff with brokered `posix_spawn` and a native terminal host; a complete simulator boot remains later work.
 
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.
 - [Bash](bash.md): noninteractive builtin baseline, terminal-access probes, and remaining fork/exec design requirements.
-- [Fish](fish.md): interim spawn-based shell experiments, executable-access findings, and source-port progress.
+- [Fish](fish.md): unmodified-source shell results, executable-access compatibility, and interactive startup.
+- [Fake terminal](fake-pty.md): socket transport, pure-C guest terminal controls, native keyboard/display, and current limits.
+- [Creation mask](creation-mask.md): tracked `umask` state for spawning after guest worker threads start on Darwin 25.
 - [iOS platform compatibility](ios-platform.md): the pinned dyld_sim patch for unchanged device-platform binaries and dependencies.
 - [Shared cache](shared-cache.md): signing format, TXM findings, the relocated iOS 26 cache, and reproduction commands.
 - [iOS 27 relocation](ios27-relocation.md): low-address capacity, missing relocation records, and pointer/instruction fixups.

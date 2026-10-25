@@ -4,8 +4,8 @@ Experimental arm64 simulator runtime on an iPhone. The native app has a minimal 
 It discovers `LiveProcess.appex` through `NSExtension` and launches separate instances through PlugInKit's pkd launch operation.
 Its C entry receives a launch plan and descriptors through synchronous XPC,
 maps `dyld_sim` and the requested executable, detaches the native cache, then invokes `start_sim`.
-The native view starts `/bin/spawn-probe` once from `viewDidLoad`; app launch arguments can select another RuntimeRoot executable.
-The probe performs `posix_spawn` inside the simulator guest. UIKit is confined to the native host; the original delegates,
+The native view starts interactive `/bin/fish` with a socket-backed terminal once from `viewDidLoad`; app launch arguments can
+select another RuntimeRoot executable. Pass `/bin/spawn-probe` explicitly for the process tests. UIKit is confined to the native host; the original delegates,
 controller and storyboards remain in `unused/`, outside the app target.
 
 `RuntimeRoot` lives inside App Group `group.com.kdt.LiveSimBooter`. On first launch, the broker moves an existing
@@ -31,8 +31,13 @@ See [multiprocess setup, progress, and limits](docs/multiprocess.md).
 
 Unmodified Fish 4.9.3 source, built for iOS Simulator, now runs noninteractive external commands through this runtime.
 On the iOS 26.1 phone it spawned and waited for two df children, then separately verified a Bash child exiting 37. Fish exited 0
-in both runs. Runtime interposers handle its executable-access checks and wait options. See [Fish setup and results](docs/fish.md);
-interactive job control, PTY creation, and full fork/exec emulation remain unsupported.
+in both runs. Runtime interposers handle its executable-access checks and wait options. The new [fake terminal](docs/fake-pty.md)
+adds native keyboard/display handling and pure-C guest termios/ioctl compatibility. With the worker-start bridge, interactive
+Fish reached its prompt on the iPhone, accepted editing keys, spawned `df` with exit 0 and original-platform Bash with exit 37,
+interrupted a looping child with Ctrl-C, and exited 0 on Ctrl-D. LLDB caught a new worker entering simulator pthread while
+the host cache region remained inaccessible. Same-burst text/Ctrl-C flushing and other terminal limits are documented.
+Fish starts with job control disabled. Native PTY allocation, full job control, and fork/exec emulation remain unsupported.
+See [Fish setup and results](docs/fish.md) and [tracked creation masks for guest worker threads](docs/creation-mask.md).
 
 Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and
 restores the normal idle timer when it becomes inactive. The earlier headless host was suspended once

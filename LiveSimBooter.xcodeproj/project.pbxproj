@@ -77,6 +77,8 @@
 				ExtensionLauncher.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
+				TerminalSession.m = "-fobjc-arc";
+				TerminalView.m = "-fobjc-arc";
 				ViewController.m = "-fobjc-arc";
 			};
 			membershipExceptions = (
@@ -416,7 +418,11 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = ("$(inherited)", "-framework", RunningBoardServices);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					RunningBoardServices,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -456,7 +462,11 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = ("$(inherited)", "-framework", RunningBoardServices);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-framework",
+					RunningBoardServices,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

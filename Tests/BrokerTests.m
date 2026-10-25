@@ -337,6 +337,9 @@ static void testSubmissionFailureAndSpawnAuthentication(void) {
 
 static void testInitialGuestArguments(void) {
     resetBroker();
+    char directory[] = "/tmp/LiveSimBooter-terminal-test.XXXXXX";
+    assert(mkdtemp(directory));
+    runtimeRoot = [[NSString stringWithUTF8String:directory] stringByAppendingPathComponent:@"RuntimeRoot"];
     const char *environment[] = { "LSB_TEST=preserved", NULL };
     const char *defaultArguments[] = { "LiveSimBooter", NULL };
     const char *customArguments[] = { "LiveSimBooter", "/bin/df", "-h", NULL };
@@ -345,13 +348,25 @@ static void testInitialGuestArguments(void) {
         assert(initial);
         assert(!initialPlan(initial, custom ? 3 : 1, custom ? customArguments : defaultArguments, environment));
         LSBSpawnPlan *plan = &initial->plan;
-        assert(plan->argc == (custom ? 2 : 1) && plan->envc == 1);
-        assert(!strcmp(plan->strings + plan->path, custom ? "/bin/df" : "/bin/spawn-probe"));
+        assert(plan->argc == (custom ? 2 : 6) && plan->envc == (custom ? 1 : 5));
+        assert(!strcmp(plan->strings + plan->path, custom ? "/bin/df" : "/bin/fish"));
         assert(!strcmp(plan->strings + plan->argv[0], plan->strings + plan->path));
         if (custom) assert(!strcmp(plan->strings + plan->argv[1], "-h"));
+        else {
+            assert(hostTerminal && plan->fdCount == 3);
+            struct stat first, other;
+            assert(!fstat(initial->fds[0], &first) && S_ISSOCK(first.st_mode));
+            for (unsigned i = 1; i < 3; ++i) {
+                assert(!fstat(initial->fds[i], &other) && first.st_dev == other.st_dev && first.st_ino == other.st_ino);
+            }
+            assert(!strcmp(plan->strings + plan->argv[1], "-i"));
+            assert(!strncmp(plan->strings + plan->envp[4], LSB_FAKE_PTY_ENV "=", sizeof(LSB_FAKE_PTY_ENV)));
+        }
         assert(!strcmp(plan->strings + plan->envp[0], "LSB_TEST=preserved"));
         disposeMessage(initial);
+        [hostTerminal close]; hostTerminal = nil;
     }
+    assert([NSFileManager.defaultManager removeItemAtPath:[NSString stringWithUTF8String:directory] error:nil]);
 }
 
 static LSBJob *runTestJob(LSBJob *parent, uint32_t generation) {
