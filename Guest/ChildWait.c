@@ -62,7 +62,7 @@ static pid_t finishWait(pid_t child, int value, int *status, int savedErrno) {
 pid_t LSBWaitPID(pid_t selector, int *status, int options) {
     int savedErrno = errno;
     if (options & ~(WNOHANG | WUNTRACED | WCONTINUED)) { errno = EINVAL; return -1; }
-    if (options & (WUNTRACED | WCONTINUED)) { errno = ENOTSUP; return -1; }
+    // The ledger reports terminal states only. Accept standard options without fabricating stopped or continued events.
     LSBChildStatus *ledger = atomic_load_explicit(&childStatus, memory_order_acquire);
     if (!ledger) { errno = atomic_load_explicit(&configurationError, memory_order_relaxed); return -1; }
     pid_t group = selector == 0 ? getpgrp() : 0;

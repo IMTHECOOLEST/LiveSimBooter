@@ -384,18 +384,18 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
     check(kernelArgs[0] == reinterpret_cast<uintptr_t>(executable) && kernelArgs[1] == 2, "kernel-style prefix before argv");
     check(argc == 2 && std::string(argv[0]) == "/RuntimeRoot/bin/df" && std::string(argv[1]) == "arg" && !argv[2], "copied argv and terminator");
     check(envp == argv + argc + 1, "environment follows argv contiguously");
-    check(std::string(envp[0]) == "KEEP=value" && std::string(envp[1]) == "DYLD_ROOT_PATH=/RuntimeRoot", "root override preserves other environment");
-    check(std::string(envp[2]) == "DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld", "cache directory override");
-    size_t environmentCount = 0, stderrSettings = 0;
+    check(std::string(envp[0]) == "KEEP=value" && std::string(envp[3]) == "DYLD_ROOT_PATH=/RuntimeRoot", "root override preserves other environment");
+    check(std::string(envp[4]) == "DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld", "cache directory override");
+    size_t environmentCount = 0, diagnosticSettings = 0;
     for (; envp[environmentCount]; ++environmentCount) {
         std::string value = envp[environmentCount];
-        check(value.rfind("DYLD_PRINT_TO_FILE=", 0) != 0, "inherited file logging cannot redirect simulator diagnostics");
-        if (value.rfind("DYLD_PRINT_TO_STDERR=", 0) == 0) {
-            ++stderrSettings;
-            check(value == "DYLD_PRINT_TO_STDERR=1", "simulator diagnostics override inherited setting");
+        if (value.rfind("DYLD_PRINT_", 0) == 0) {
+            ++diagnosticSettings;
+            check(value == "DYLD_PRINT_TO_STDERR=0" || value == "DYLD_PRINT_TO_FILE=/old.log", "explicit diagnostic settings are preserved");
         }
     }
-    check(stderrSettings == 1, "simulator diagnostic setting is not duplicated");
+    check(diagnosticSettings == 2 && environmentCount == 5, "no default simulator diagnostics are injected");
+    check(std::string(envp[1]) == "DYLD_PRINT_TO_STDERR=0" && std::string(envp[2]) == "DYLD_PRINT_TO_FILE=/old.log", "diagnostic output is unchanged");
     check(apple == envp + environmentCount + 1, "apple vector follows expanded environment contiguously");
     unsigned executablePaths = 0, preservedApple = 0, ptrMungeTokens = 0;
     for (const char *const *item = apple; *item; ++item) {
@@ -451,7 +451,7 @@ static void entryTest() {
     bool handedOff = false;
     try { enter(); } catch (const HandoffComplete &) { handedOff = true; }
     check(handedOff && entryCalls == 1 && mainCalls == 0, "entry is called without returning to host cleanup or invoking main");
-    check(std::string(envp[3]) == "DYLD_PRINT_TO_STDERR=0", "simulator diagnostic setup leaves host environment untouched");
+    check(std::string(envp[3]) == "DYLD_PRINT_TO_STDERR=0", "simulator environment copy leaves host diagnostics untouched");
     check(std::string(envp[4]) == "DYLD_PRINT_TO_FILE=/old.log", "simulator logging leaves inherited host output path untouched");
     check(std::string(apple[3]) == "ptr_munge=" && std::string(apple[4]) == "ptr_munge=0x1234", "simulator token erasure leaves host apple data untouched");
     check(enter() == 1 && entryCalls == 1, "second entry is rejected");

@@ -13,8 +13,8 @@ universal slice. The executable's `__PAGEZERO` is excluded from its reservation.
 The loader builds persistent kernel-style arguments for `df`, including its actual path in `argv[0]` and `executable_path`.
 It sets `DYLD_ROOT_PATH` and `DYLD_SHARED_CACHE_DIR` to RuntimeRoot paths, removes stale host executable metadata, and replaces
 inherited `ptr_munge` values with a fresh nonzero random token. The apple vector is writable because simulator libpthread
-consumes and clears the token. It also enables [dyld diagnostics](debugging.md#simulator-dyld-diagnostics) in the copied
-simulator environment, with stderr output and no inherited file redirection. Native launch settings are untouched.
+consumes and clears the token. [Dyld diagnostics](debugging.md#simulator-dyld-diagnostics) are disabled by default; explicit
+diagnostic variables and output destinations are copied unchanged into the simulator environment. Native launch settings are untouched.
 
 [MainThreadBootstrap.cpp](../LiveSimBooter/MainThreadBootstrap.cpp) supplies an aligned, zeroed 16 KiB app-owned block for
 the main pthread and TSD. It initializes only self, errno, and the kernel thread ID after validating the host layout.

@@ -212,6 +212,21 @@ Returned PIDs identify real extension processes, but the simulator caller is not
 fork, exec replacement, and full session/process-group inheritance remain unimplemented. A default child retains its system
 launch session/group; guest waiting is provided by the separate mechanism below.
 
+## Executable access checks
+
+[ExecutableAccess.c](../Guest/ExecutableAccess.c) interposes `access` and `faccessat` for the guest's executable preflight.
+It first performs the native query. Only an `EPERM` result for a valid mode containing `X_OK` can use the fallback: the
+canonical file must be strictly inside canonical `DYLD_ROOT_PATH`, be a readable regular plain-arm64 `MH_EXECUTE` with
+`MH_PIE` and bounded load commands, and have the applicable owner/group/other execute bit. `access` uses real IDs;
+`faccessat` with `AT_EACCESS` uses effective IDs. Supplementary groups are included, and native read/write checks remain
+required for the requested mode, with readability also required by the loader.
+
+The `faccessat` fallback supports absolute paths or paths relative to `AT_FDCWD`, with flags 0 or `AT_EACCESS`. Unsupported
+relative directory FDs/flags, other errors, paths outside RuntimeRoot, escaping symlinks, scripts, dylibs, and ineligible
+permissions retain the original failure. This supplies executable preflight for manual loading; it does not approve native
+exec or skip the broker/loader's subsequent image and code-signature validation. The [unmodified Fish test](fish.md) passed
+with these runtime checks and the accepted standard wait options; general filesystem-path virtualization is still absent.
+
 ## Signaling a simulated child
 
 [ChildKill.c](../Guest/ChildKill.c) interposes `kill`. The initial scope is exact positive PIDs belonging to the caller's direct
@@ -275,7 +290,9 @@ starts no worker thread. Nonblocking reaping uses lock-free operations and is ex
 
 The current limits are:
 
-- `WUNTRACED` and `WCONTINUED` return `ENOTSUP`; other unknown option bits return `EINVAL`. Stop/continue events and `waitid` are unsupported.
+- `WUNTRACED` and `WCONTINUED` are accepted alongside `WNOHANG`; unknown option bits return `EINVAL`. The ledger still
+  reports terminal exits only. A live child yields 0 under `WNOHANG`, and normal/signal exits remain reapable with these flags.
+  Stop/continue events are not synthesized or reported, so this is not full job-control support. `waitid` remains unsupported.
 - Process-group selectors use the group captured at READY. Later guest `setpgid` changes are not reflected in stored child records.
 - A signal may interrupt a blocking wait with `EINTR` even with `SA_RESTART`; callers must retry. A status already available after interruption is returned first.
 - Interposed `sigaction`/`signal` mirror `SIG_IGN` and `SA_NOCLDWAIT` into the table and discard unreaped/future statuses.
@@ -364,7 +381,8 @@ launch reply validation, fresh instance UUIDs, deferred callbacks, release suppr
 errno propagation with local mocks of the declared private interfaces. A second transport build exercises the guest's direct
 broker-port path with `XPC_FLAGS=0x2`, including malformed port names and rights validation.
 
-The wait tests cover actual non-child kqueue exit statuses on macOS, shared-slot reuse, concurrent reaping, blocking and lost
+The wait tests cover accepted standard option combinations without invented events, actual non-child kqueue exit statuses on macOS,
+shared-slot reuse, concurrent reaping, blocking and lost
 wake hints, signal-handler reaping, discard policy, interrupted waits, RBS context validation, and canceled monitor callbacks.
 Broker tests also cover status ownership, failed reservations, parent death, and direct-signal denial falling back to the
 specific extension instance. These local tests do not establish iPhone sandbox permission or launchd delivery.

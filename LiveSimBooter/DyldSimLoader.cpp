@@ -371,12 +371,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     };
     setEnvironment("DYLD_ROOT_PATH", rootPath);
     setEnvironment("DYLD_SHARED_CACHE_DIR", std::string(rootPath) + "/System/Library/Caches/com.apple.dyld");
-    // Configure only the simulator's copied environment, after native dyld has finished startup.
-    removeEnvironment("DYLD_PRINT_TO_FILE");
-    // DYLD_PRINT_BINDINGS is opt-in: loose runtime overrides can produce hundreds of thousands of fixup lines.
-    for (const char *name : {"DYLD_PRINT_TO_STDERR", "DYLD_PRINT_LIBRARIES", "DYLD_PRINT_SEGMENTS", "DYLD_PRINT_INITIALIZERS",
-                            "DYLD_PRINT_LOADERS", "DYLD_PRINT_SEARCHING", "DYLD_PRINT_APIS", "DYLD_PRINT_NOTIFICATIONS"})
-        setEnvironment(name, "1");
+    // Diagnostic variables remain opt-in and are copied unchanged, including their output destination.
     for (auto entry = apple; entry && *entry; ++entry) {
         // executable_file identifies the host by FSID/inode and takes precedence over executable_path inside dyld.
         if (strncmp(*entry, "executable_path=", 16) != 0 && strncmp(*entry, "executable_file=", 16) != 0 && strncmp(*entry, "ptr_munge=", 10) != 0)

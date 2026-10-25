@@ -1,0 +1,225 @@
+#include "../Guest/ExecutableAccess.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <mach-o/loader.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int nativeResult, nativeError, remainingResult, remainingError;
+static unsigned accessCalls, atCalls, openCalls, remainingCalls;
+static int lastMode, lastDirectory, lastFlags;
+static uid_t realUser, effectiveUser;
+static gid_t realGroup, effectiveGroup, supplementary[NGROUPS_MAX];
+static int supplementaryCount;
+static bool denyOpen;
+static char lastPath[PATH_MAX];
+
+static int nativeCheck(const char *path, int mode) {
+    if (path) snprintf(lastPath, sizeof(lastPath), "%s", path);
+    else lastPath[0] = 0;
+    lastMode = mode;
+    if (mode & X_OK) { errno = nativeError; return nativeResult; }
+    ++remainingCalls;
+    errno = remainingError;
+    return remainingResult;
+}
+
+static int testAccess(const char *path, int mode) { ++accessCalls; return nativeCheck(path, mode); }
+static int testFAccessAt(int directory, const char *path, int mode, int flags) {
+    ++atCalls;
+    lastDirectory = directory;
+    lastFlags = flags;
+    return nativeCheck(path, mode);
+}
+static int testOpen(const char *path, int flags) {
+    ++openCalls;
+    if (denyOpen) { errno = EACCES; return -1; }
+    return open(path, flags);
+}
+static int testFstat(int descriptor, struct stat *metadata) {
+    int result = fstat(descriptor, metadata);
+    if (!result) { metadata->st_uid = 501; metadata->st_gid = 20; }
+    return result;
+}
+static uid_t testGetuid(void) { return realUser; }
+static uid_t testGeteuid(void) { return effectiveUser; }
+static gid_t testGetgid(void) { return realGroup; }
+static gid_t testGetegid(void) { return effectiveGroup; }
+static int testGetgroups(int capacity, gid_t *groups) {
+    if (supplementaryCount < 0) { errno = EIO; return -1; }
+    assert(capacity >= supplementaryCount);
+    memcpy(groups, supplementary, (size_t)supplementaryCount * sizeof(*groups));
+    return supplementaryCount;
+}
+
+#define LSB_EXECUTABLE_ACCESS_TESTING
+#define access testAccess
+#define faccessat testFAccessAt
+#define open testOpen
+#define fstat testFstat
+#define getuid testGetuid
+#define geteuid testGeteuid
+#define getgid testGetgid
+#define getegid testGetegid
+#define getgroups testGetgroups
+#include "../Guest/ExecutableAccess.c"
+#undef access
+#undef faccessat
+#undef open
+#undef fstat
+#undef getuid
+#undef geteuid
+#undef getgid
+#undef getegid
+#undef getgroups
+
+static void reset(void) {
+    nativeResult = -1; nativeError = EPERM;
+    remainingResult = 0; remainingError = ENOTTY;
+    accessCalls = atCalls = openCalls = remainingCalls = 0;
+    realUser = effectiveUser = 501;
+    realGroup = effectiveGroup = 20;
+    supplementaryCount = 0;
+    denyOpen = false;
+    errno = EDOM;
+}
+
+static void writeImage(const char *path, const struct mach_header_64 *header) {
+    int descriptor = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0700);
+    assert(descriptor >= 0);
+    assert(write(descriptor, header, sizeof(*header)) == sizeof(*header));
+    struct load_command command = {.cmd = LC_MAIN, .cmdsize = sizeof(command)};
+    assert(write(descriptor, &command, sizeof(command)) == sizeof(command));
+    assert(!close(descriptor) && !chmod(path, 0755));
+}
+
+static void expectDenied(const char *path) {
+    errno = ERANGE;
+    assert(LSBAccess(path, X_OK) == -1 && errno == EPERM);
+}
+
+static void testNativeBehavior(const char *path) {
+    reset();
+    nativeResult = 0; nativeError = ENOTTY;
+    assert(!LSBAccess("/outside/native-success", X_OK) && errno == ENOTTY && accessCalls == 1 && !openCalls);
+    const int errors[] = {EACCES, ENOENT, ENOTDIR, EINVAL, EFAULT};
+    for (unsigned index = 0; index < sizeof(errors) / sizeof(*errors); ++index) {
+        reset(); nativeError = errors[index];
+        assert(LSBAccess(path, X_OK) == -1 && errno == errors[index] && accessCalls == 1 && !openCalls);
+    }
+    reset(); remainingResult = -1; remainingError = EPERM;
+    assert(LSBAccess(path, R_OK | W_OK) == -1 && errno == EPERM && accessCalls == 1 && !openCalls);
+    reset();
+    assert(LSBAccess(path, X_OK | 0x1000) == -1 && errno == EPERM && accessCalls == 1 && !openCalls);
+    reset();
+    assert(LSBAccess(NULL, X_OK) == -1 && errno == EPERM && accessCalls == 1 && !openCalls);
+    reset();
+    assert(!LSBAccess(path, X_OK | R_OK | W_OK) && errno == EDOM && accessCalls == 2 && remainingCalls == 1);
+    assert(lastMode == (R_OK | W_OK) && !strcmp(lastPath, path));
+    reset(); remainingResult = -1; remainingError = EROFS;
+    assert(LSBAccess(path, X_OK | W_OK) == -1 && errno == EPERM && accessCalls == 2 && !openCalls);
+    reset(); denyOpen = true;
+    expectDenied(path);
+    assert(openCalls == 1);
+}
+
+static void testModes(const char *path) {
+    reset(); assert(!chmod(path, 0411)); expectDenied(path); // Owner permissions take precedence over group/other.
+    reset(); assert(!chmod(path, 0500)); assert(!LSBAccess(path, X_OK));
+    reset(); realUser = 502; assert(!chmod(path, 0410)); assert(!LSBAccess(path, X_OK));
+    reset(); realUser = 502; assert(!chmod(path, 0401)); expectDenied(path); // Group selection takes precedence over other.
+    reset(); realUser = 502; realGroup = 21; supplementary[0] = 20; supplementaryCount = 1;
+    assert(!chmod(path, 0410)); assert(!LSBAccess(path, X_OK));
+    reset(); realUser = 502; realGroup = 21; supplementary[0] = 20; supplementaryCount = 1;
+    assert(!chmod(path, 0401)); expectDenied(path);
+    reset(); realUser = 502; realGroup = 21;
+    assert(!chmod(path, 0401)); assert(!LSBAccess(path, X_OK));
+    reset(); realUser = 502; realGroup = 21; supplementaryCount = -1; expectDenied(path);
+    reset(); realUser = 0; assert(!chmod(path, 0401)); assert(!LSBAccess(path, X_OK));
+    assert(!chmod(path, 0400)); expectDenied(path);
+    assert(!chmod(path, 0755));
+}
+
+static void testAt(const char *root, const char *path) {
+    reset(); effectiveUser = 502; effectiveGroup = 21;
+    assert(!chmod(path, 0500));
+    assert(!LSBFAccessAt(AT_FDCWD, path, X_OK, 0) && errno == EDOM);
+    assert(atCalls == 2 && !accessCalls && lastFlags == 0 && lastMode == R_OK);
+    reset(); effectiveUser = 502; effectiveGroup = 21;
+    assert(LSBFAccessAt(AT_FDCWD, path, X_OK, AT_EACCESS) == -1 && errno == EPERM);
+    reset(); realUser = 502; realGroup = 21;
+    assert(!LSBFAccessAt(AT_FDCWD, path, X_OK, AT_EACCESS) && errno == EDOM && lastFlags == AT_EACCESS);
+    reset();
+    assert(LSBFAccessAt(AT_FDCWD, path, X_OK, AT_SYMLINK_NOFOLLOW) == -1 && errno == EPERM && atCalls == 1);
+    reset();
+    assert(LSBFAccessAt(AT_FDCWD, path, X_OK, 0x40000000) == -1 && errno == EPERM && atCalls == 1);
+    reset();
+    assert(!LSBFAccessAt(-123, path, X_OK, 0) && errno == EDOM && lastDirectory == -123); // Absolute paths ignore dirfd.
+    assert(!chdir(root));
+    reset(); assert(!LSBAccess("bin/df", X_OK) && errno == EDOM);
+    reset(); assert(!LSBFAccessAt(AT_FDCWD, "bin/df", X_OK, 0) && errno == EDOM);
+    reset(); assert(LSBFAccessAt(3, "bin/df", X_OK, 0) == -1 && errno == EPERM && atCalls == 1 && !openCalls);
+    reset(); nativeResult = 0; nativeError = ENOTTY;
+    assert(!LSBFAccessAt(3, "bin/df", X_OK, AT_SYMLINK_NOFOLLOW) && errno == ENOTTY && atCalls == 1);
+    reset(); remainingResult = -1; remainingError = EACCES;
+    assert(LSBFAccessAt(AT_FDCWD, "bin/df", X_OK | W_OK, AT_EACCESS) == -1 && errno == EPERM && lastMode == (R_OK | W_OK));
+    assert(!chmod(path, 0755));
+}
+
+int main(void) {
+    char previousDirectory[PATH_MAX];
+    assert(getcwd(previousDirectory, sizeof(previousDirectory)));
+    char directory[] = "/tmp/LiveSimBooter-access.XXXXXX";
+    assert(mkdtemp(directory));
+    char root[PATH_MAX], bin[PATH_MAX], path[PATH_MAX], outside[PATH_MAX], escape[PATH_MAX], rootLink[PATH_MAX], insideLink[PATH_MAX];
+    snprintf(root, sizeof(root), "%s/RuntimeRoot", directory);
+    snprintf(bin, sizeof(bin), "%s/bin", root);
+    snprintf(path, sizeof(path), "%s/df", bin);
+    snprintf(outside, sizeof(outside), "%s/RuntimeRoot-other", directory);
+    snprintf(escape, sizeof(escape), "%s/escape", root);
+    snprintf(rootLink, sizeof(rootLink), "%s/root-link", directory);
+    snprintf(insideLink, sizeof(insideLink), "%s/inside-link", root);
+    assert(!mkdir(root, 0700) && !mkdir(bin, 0700));
+    struct mach_header_64 header = {.magic = MH_MAGIC_64, .cputype = CPU_TYPE_ARM64, .cpusubtype = CPU_SUBTYPE_ARM64_ALL,
+        .filetype = MH_EXECUTE, .ncmds = 1, .sizeofcmds = sizeof(struct load_command), .flags = MH_PIE};
+    writeImage(path, &header); writeImage(outside, &header);
+    assert(!symlink(outside, escape) && !symlink(root, rootLink) && !symlink(path, insideLink));
+    assert(!setenv("DYLD_ROOT_PATH", root, 1));
+    reset(); assert(!LSBAccess(path, X_OK) && errno == EDOM);
+    reset(); expectDenied(outside); expectDenied(root); expectDenied(escape);
+    assert(accessCalls == 3 && !remainingCalls && !openCalls);
+    reset(); assert(!LSBAccess(insideLink, X_OK));
+    assert(!setenv("DYLD_ROOT_PATH", rootLink, 1));
+    reset(); assert(!LSBAccess(path, X_OK));
+    assert(!unsetenv("DYLD_ROOT_PATH")); reset(); expectDenied(path);
+    assert(!setenv("DYLD_ROOT_PATH", "/", 1)); reset(); expectDenied(path);
+    assert(!setenv("DYLD_ROOT_PATH", root, 1));
+    testNativeBehavior(path); testModes(path); testAt(root, path);
+    for (unsigned variant = 0; variant < 8; ++variant) {
+        struct mach_header_64 bad = header;
+        switch (variant) {
+            case 0: bad.magic = MH_CIGAM_64; break;
+            case 1: bad.cputype = CPU_TYPE_X86_64; break;
+            case 2: bad.cpusubtype = CPU_SUBTYPE_ARM64E; break;
+            case 3: bad.filetype = MH_DYLIB; break;
+            case 4: bad.flags = 0; break;
+            case 5: bad.ncmds = 0; break;
+            case 6: bad.ncmds = 2; break;
+            case 7: bad.sizeofcmds = UINT32_MAX; break;
+        }
+        writeImage(path, &bad); reset(); expectDenied(path);
+    }
+    assert(!truncate(path, 4)); reset(); expectDenied(path);
+    assert(!chdir(previousDirectory));
+    assert(!unlink(insideLink) && !unlink(rootLink) && !unlink(escape) && !unlink(outside) && !unlink(path));
+    assert(!rmdir(bin) && !rmdir(root) && !rmdir(directory));
+    puts("ExecutableAccess: native forwarding, EPERM confinement, readable Mach-O roles, identities/groups, faccessat modes, and errno passed");
+    return 0;
+}

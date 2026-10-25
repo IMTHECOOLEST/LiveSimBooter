@@ -60,7 +60,8 @@ execution result. A successful `mmap` return can still be `r--` when TXM refused
 
 ## Simulator dyld diagnostics
 
-The loader enables these variables in the simulator's copied environment, after native dyld has completed startup:
+Simulator dyld diagnostics are disabled by default. To enable them, include the desired variables in the environment
+passed to the guest launch. For example:
 
 ```text
 DYLD_PRINT_TO_STDERR=1
@@ -74,16 +75,15 @@ DYLD_PRINT_NOTIFICATIONS=1
 ```
 
 They show cache and segment mapping, dependency searches, loader selection, initializers, API calls, and image
-notifications. Output goes to stderr, visible in Xcode's debug console or the `devicectl --console` captures below.
-The loader removes an inherited `DYLD_PRINT_TO_FILE` from that copied environment so it cannot redirect the capture.
+notifications. `DYLD_PRINT_TO_STDERR=1` sends output to stderr, visible in Xcode's debug console or `devicectl --console`.
+The loader preserves explicit diagnostic settings, including `DYLD_PRINT_TO_FILE`, without forcing an output destination.
 Native environment strings are untouched. Dyld still applies the real AMFI policy's `allowEnvVarsPrint` gate.
 
-These flags are presence switches: assigning `0` still enables them. To disable a category, remove its name from the
-diagnostic list in [DyldSimLoader.cpp](../LiveSimBooter/DyldSimLoader.cpp). `DYLD_PRINT_BINDINGS` is optional; add it to that list
-to log every fixup. The first loose-library launch with that flag emitted 867,477 console lines (49 MB) and ended with
-SIGKILL before `df` ran. The capture does not establish the kill's cause. It is omitted from the default list to limit output.
+These flags are presence switches: assigning `0` still enables them. To disable a category, omit its variable from the
+guest environment. `DYLD_PRINT_BINDINGS=1` logs every fixup. The first loose-library launch with that flag emitted
+867,477 console lines (49 MB) and ended with SIGKILL before `df` ran. The capture does not establish the kill's cause.
 
-The final device test on 2026-10-24 (PID 5630) printed 2,983 console lines and ran `df` to exit `0` after host-cache removal.
+An earlier device test with diagnostics enabled on 2026-10-24 (PID 5630) printed 2,983 console lines and ran `df` to exit `0` after host-cache removal.
 The log shows the working cache at `0x120000000` and loose libraries overriding cached images; this was not a cache-only test.
 The concurrent SSH capture contained no AMFI signature rejection or TXM failure. Runtime files were preserved during the
 in-place app update. Evidence is in `tmp/dyld-diagnostics/console.log`, `launch.json`, and `security.log`; the earlier verbose

@@ -13,6 +13,7 @@ controller and storyboards remain in `unused/`, outside the app target.
 The child contains no Objective-C imports; the native broker uses Foundation and UIKit. A simulator interposer
 forwards `posix_spawn`/`posix_spawnp` to the broker, including argv, environment, supported attributes and ordered FD actions.
 It also provides `wait`/`waitpid` over a shared child-status table and delivers `SIGCHLD` through the native host.
+Waiting accepts `WUNTRACED` and `WCONTINUED`, but reports terminal exits only; stopped/continued events and job control remain unsupported.
 The `kill` interposer sends signals to the caller's direct simulated children through the broker; positive self PIDs use native
 signaling. Signal 0 checks a child's current identity, and nonpositive PID selectors return `ENOTSUP`. The cross-process path
 uses synchronous XPC and is not async-signal-safe. The native app and extension target iOS 26.0 or later.
@@ -27,6 +28,11 @@ the spawn/signal/wait probe with exit 0. The bridge
 retains the newer format on hosts that require it. Native preparation preserves a raw broker Mach send right for guest IPC,
 and the transport adapter handles the native/simulator XPC wire-magic difference.
 See [multiprocess setup, progress, and limits](docs/multiprocess.md).
+
+Unmodified Fish 4.9.3 source, built for iOS Simulator, now runs noninteractive external commands through this runtime.
+On the iOS 26.1 phone it spawned and waited for two df children, then separately verified a Bash child exiting 37. Fish exited 0
+in both runs. Runtime interposers handle its executable-access checks and wait options. See [Fish setup and results](docs/fish.md);
+interactive job control, PTY creation, and full fork/exec emulation remain unsupported.
 
 Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and
 restores the normal idle timer when it becomes inactive. The earlier headless host was suspended once
@@ -229,9 +235,8 @@ They never detach the test process's cache or execute a simulator runtime, and d
 Run `python3 Tests/audit-local-runtime.py` to compile the callback/handoff code for iPhone arm64 at `-O0` and `-O2` and reject
 any external imports. Pass an Xcode `Objects-normal/arm64` directory to audit the actual build objects instead.
 
-Simulator dyld diagnostics are enabled by default for library/segment loading, searches, loaders, initializers,
-API calls, and image notifications. They go to stderr in Xcode or `devicectl --console`; the variables are added only to the
-simulator's copied environment. See [the flags and capture workflow](docs/debugging.md#simulator-dyld-diagnostics).
+Simulator dyld diagnostics are disabled by default. Explicit `DYLD_PRINT_*` variables and their output destination are
+preserved in the simulator's copied environment. See [the flags and capture workflow](docs/debugging.md#simulator-dyld-diagnostics).
 
 Launch with `--probe-dlopen-dyld-sim` to call host `dlopen()` once on `RuntimeRoot/usr/lib/dyld_sim`, print its result and
 `dlerror()`, close a successful handle, then exit. This diagnostic runs before image mapping or host-cache removal.

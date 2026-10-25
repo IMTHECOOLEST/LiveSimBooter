@@ -36,16 +36,18 @@ static void testNoHangAndSelectors(void) {
     int status = 0x1234;
     errno = EDOM;
     assert(LSBWaitPID(100, &status, WNOHANG) == 0 && status == 0x1234 && errno == EDOM);
+    assert(LSBWaitPID(100, &status, WNOHANG | WUNTRACED) == 0 && status == 0x1234 && errno == EDOM);
+    assert(LSBWaitPID(100, &status, WNOHANG | WCONTINUED) == 0 && status == 0x1234 && errno == EDOM);
+    assert(LSBWaitPID(100, &status, WNOHANG | WUNTRACED | WCONTINUED) == 0 && status == 0x1234 && errno == EDOM);
     assert(LSBWaitPID(999, &status, WNOHANG) == -1 && errno == ECHILD && status == 0x1234);
-    assert(LSBWaitPID(100, &status, WUNTRACED) == -1 && errno == ENOTSUP);
-    assert(LSBWaitPID(100, &status, WCONTINUED) == -1 && errno == ENOTSUP);
-    assert(LSBWaitPID(100, &status, 0x40000000) == -1 && errno == EINVAL);
+    assert(LSBWaitPID(100, &status, WNOHANG | WUNTRACED | WCONTINUED | 0x40000000) == -1 && errno == EINVAL && status == 0x1234);
     assert(!LSBChildStatusPublishExit(&ledger, first, 0));
     errno = ERANGE;
-    assert(LSBWaitPID(0, &status, WNOHANG) == 100 && status == 0 && errno == ERANGE);
-    assert(LSBWaitPID(100, &status, WNOHANG) == -1 && errno == ECHILD);
+    assert(LSBWaitPID(0, &status, WUNTRACED | WCONTINUED) == 100 && status == 0 && errno == ERANGE);
+    assert(LSBWaitPID(100, &status, WNOHANG | WUNTRACED | WCONTINUED) == -1 && errno == ECHILD);
     assert(!LSBChildStatusPublishExit(&ledger, second, SIGTERM));
-    assert(LSBWaitPID(-222, &status, WNOHANG) == 101 && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+    assert(LSBWaitPID(-222, &status, WNOHANG | WUNTRACED | WCONTINUED) == 101 && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+    assert(LSBWaitPID(101, &status, WUNTRACED | WCONTINUED) == -1 && errno == ECHILD);
     assert(LSBWait(NULL) == -1 && errno == ECHILD);
 }
 
@@ -65,7 +67,8 @@ static void testBlockingWait(void) {
         pthread_t worker;
         assert(!pthread_create(&worker, NULL, completeLater, &completion));
         int status;
-        assert(LSBWaitPID(-1, &status, 0) == 201 && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+        int options = wake ? WUNTRACED | WCONTINUED : 0;
+        assert(LSBWaitPID(-1, &status, options) == 201 && WIFEXITED(status) && WEXITSTATUS(status) == 37);
         assert(!pthread_join(worker, NULL));
     }
 }
@@ -142,6 +145,6 @@ int main(void) {
     testSignalHandlerReapAndDiscard();
     testInterruptedWait();
     close(wakeFDs[0]); close(wakeFDs[1]);
-    puts("ChildWait: WNOHANG, PID/groups, exit/signal status, blocking/lost wakes, signal-handler reaping, discard policy and EINTR passed");
+    puts("ChildWait: standard options, PID/groups, terminal exit/signal status, blocking/lost wakes, signal-handler reaping, discard policy and EINTR passed");
     return 0;
 }
