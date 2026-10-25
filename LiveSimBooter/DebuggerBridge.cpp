@@ -63,6 +63,8 @@ int prepareDebuggerBridge(dyld_all_image_infos *sim, dyld_all_image_infos *host,
     if (inCache && simAddress < replacementEnd && simAddress + sizeof(*sim) > replacementBase) return EINVAL;
     if (lsb::copyString(sBridge.appPath, appPath, sizeof(sBridge.appPath)) >= sizeof(sBridge.appPath)) return ENAMETOOLONG;
     if (lsb::copyString(sBridge.executablePath, executablePath, sizeof(sBridge.executablePath)) >= sizeof(sBridge.executablePath)) return ENAMETOOLONG;
+    int error = lsb::configureCompactImageInfo(reinterpret_cast<const void *>(host->compact_dyld_image_info_addr), host->compact_dyld_image_info_size);
+    if (error) return error;
 
     sBridge.sim = sim;
     sBridge.host = host;
@@ -79,7 +81,7 @@ int prepareDebuggerBridge(dyld_all_image_infos *sim, dyld_all_image_infos *host,
     sim->initialImageCount = 2;
     sim->notification = &LSBDebuggerImageNotification;
     sim->dyldAllImageInfosAddress = sim;
-    int error = lsb::publishCompactImageInfo(sim);
+    error = lsb::publishCompactImageInfo(sim);
     if (error) return error;
     sBridge.phase = BridgePhase::prepared;
     return 0;

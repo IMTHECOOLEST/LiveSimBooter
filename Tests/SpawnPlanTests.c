@@ -9,10 +9,19 @@ static unsigned transportCalls;
 static int transportFailure;
 static int pathSearch;
 static int internalWakeFD = -1;
+static int creationMaskError;
+static uint32_t capturedCreationMask = 027;
 int LSBGuestChildWakeFD(void) { return internalWakeFD; }
+// CreationMaskTests exercises the kernel-aware snapshot; this suite verifies serialization and error propagation.
+int LSBReadCreationMask(uint32_t *mask) {
+    if (creationMaskError) return creationMaskError;
+    *mask = capturedCreationMask;
+    return 0;
+}
 
 int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_t *pid) {
     assert(LSBValidateSpawnPlan(plan) == 0);
+    assert(plan->creationMask == capturedCreationMask);
     for (uint32_t i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
     ++transportCalls;
     if (pathSearch) {
@@ -267,6 +276,12 @@ static void shimSerialization(void) {
     pid_t pid = 123;
     errno = EDOM;
     assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, NULL, argv, environment) == 0 && pid == 4242 && errno == EDOM);
+    unsigned beforeCalls = transportCalls;
+    creationMaskError = EBUSY;
+    pid = 123;
+    assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, NULL, argv, environment) == EBUSY && pid == 123 && errno == EDOM);
+    assert(transportCalls == beforeCalls);
+    creationMaskError = 0;
     transportFailure = EACCES;
     pid = 123;
     assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, NULL, argv, environment) == EACCES && pid == 123 && errno == EDOM);

@@ -175,6 +175,39 @@ The debugger metadata pages can remain readable independently, so readable metad
 For image-source checks, cached Mach-O headers carry `MH_DYLIB_IN_CACHE` (`0x80000000`); count those separately from total LLDB modules.
 Avoid calling host libc, pthread, or Objective-C expressions after cache detachment.
 
+## Compact image format compatibility
+
+The debugger reads native dyld's compact archive through the device's own reader, so the archive must match that reader even
+when the loaded libraries come from a different simulator runtime. iOS 26.1 uses an Apple Archive `CKSF` field with a POSIX
+`cksum`; newer hosts use a `com.apple.dyld.crc32c` extended attribute. Sending the newer representation to the tested iOS 26.1
+reader produced `aarDecoderError.badMagic(34)` and LLDB's `Unable to create dyld_process_info`. Using `CKSF` everywhere is not a
+compatible workaround: the newer task-reading path requires the CRC32C attribute.
+
+The bridge now validates native dyld's existing archive before removing its cache and retains the detected encoding. Later
+simulator image notifications use the matching encoding with app-owned storage. Unsupported or malformed native metadata
+fails preparation before detachment. The compact descriptor stays populated; clearing it previously left the legacy reader
+with only three scavenged images and did not provide complete simulator discovery.
+
+Validate this behavior with a fresh attach after the guest reaches its `--debug-delay` interval. Select the current device and
+attach to the simulator probe's `LiveProcess` PID, without a pre-created module target, `target modules add`, or descriptor
+edits. Keep the global hardware-breakpoint setting enabled before attach:
+
+```text
+settings set -g target.require-hardware-breakpoint true
+device select CURRENT_COREDEVICE_IDENTIFIER
+device process attach -p CURRENT_SIMULATOR_PID
+image list -o -f
+breakpoint set -H -n LSBKill
+breakpoint set -H -n LSBTransportKill
+breakpoint set -H -n finishWait
+```
+
+On the replacement iOS 26.1 phone, the fresh attach selected `spawn-probe`, listed 48 modules, and resolved these named
+breakpoints automatically. The native-cache range was inaccessible, and the rebuilt simulator cache retained executable
+TEXT with zero dirty pages. The [multiprocess results](multiprocess.md#ios-26-automatic-image-discovery-2026-10-25) record the
+process IDs, completion checks, and transcript. Keep the cached runtime and local shim/probe symbols matched when repeating
+the test; image count alone does not verify that every dependency came from the cache.
+
 ## Internal breakpoint investigation
 
 LLDB temporarily enables pthread thread-creation breakpoints while stepping over its dyld notification breakpoint.

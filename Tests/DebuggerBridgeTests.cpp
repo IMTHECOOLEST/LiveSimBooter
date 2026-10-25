@@ -12,8 +12,8 @@ dyld_all_image_infos simulator;
 dyld_all_image_infos *host, *registeredInfo, *activeInfo;
 dyld_image_info originalImages[2];
 mach_header appHeader = {}, simHeader = {}, hostDyldHeader = {}, executableHeader = {};
-int syscallError, mapError, localError, compactError;
-unsigned publishCalls, mapCalls, compactCalls;
+int syscallError, mapError, localError, compactError, configureError;
+unsigned publishCalls, mapCalls, compactCalls, configureCalls;
 bool wrongMapAddress;
 struct Event { bool host; dyld_image_mode mode; uint32_t count; dyld_image_notifier registeredNotifier; };
 std::vector<Event> events;
@@ -40,6 +40,8 @@ void reset(size_t offset = 64) {
     host->dyldAllImageInfosAddress = host;
     host->dyldPath = "/usr/lib/dyld";
     host->sharedCacheBaseAddress = address(hostPages);
+    host->compact_dyld_image_info_addr = address(hostPages + 4096);
+    host->compact_dyld_image_info_size = 128;
     simulator.version = 17;
     simulator.notification = &LSBDebuggerImageNotification;
     simulator.dyldImageLoadAddress = &simHeader;
@@ -47,8 +49,8 @@ void reset(size_t offset = 64) {
     simulator.dyldAllImageInfosAddress = &simulator;
     registeredInfo = host;
     activeInfo = &simulator;
-    syscallError = mapError = localError = compactError = 0;
-    publishCalls = mapCalls = compactCalls = 0;
+    syscallError = mapError = localError = compactError = configureError = 0;
+    publishCalls = mapCalls = compactCalls = configureCalls = 0;
     wrongMapAddress = false;
     events.clear();
 }
@@ -80,7 +82,15 @@ extern "C" void LSBDebuggerImageNotification(dyld_image_mode mode, uint32_t coun
 void LSBSetSimProcessInfo(dyld_all_image_infos *info) { activeInfo = info; }
 
 namespace lsb {
+int configureCompactImageInfo(const void *archive, size_t size) {
+    ++configureCalls;
+    check(archive == reinterpret_cast<const void *>(host->compact_dyld_image_info_addr) && size == host->compact_dyld_image_info_size,
+          "reader format is selected from the native host archive");
+    check(!publishCalls && !mapCalls && events.empty(), "encoding selection precedes debugger registration and cache removal");
+    return configureError;
+}
 int publishCompactImageInfo(dyld_all_image_infos *info, uint64_t state) {
+    check(configureCalls && !configureError, "native encoding is configured before initial publication");
     check(state == 0, "prepare infers the initial debugger state");
     ++compactCalls;
     check(info == &simulator && info->infoArrayCount == 2, "initial compact snapshot contains both executable images");
@@ -135,6 +145,10 @@ int main() {
     check(prepare(true, "app", overlong) == ENAMETOOLONG, "oversized simulator executable path rejected");
     check(!publishCalls && !mapCalls && events.empty(), "preparation failures make no externally visible changes");
 
+    configureError = ENOTSUP;
+    check(prepare() == ENOTSUP && !compactCalls && sBridge.phase == BridgePhase::empty, "unknown host encoding stops before first publication");
+    check(simulator.infoArrayCount == 0 && !publishCalls && !mapCalls && events.empty(), "encoding failure preserves simulator and debugger metadata");
+    configureError = 0;
     compactError = ENOMEM;
     check(prepare() == ENOMEM && sBridge.phase == BridgePhase::empty, "compact snapshot failure aborts preparation before bridge is ready");
     check(!publishCalls && !mapCalls && events.empty(), "compact failure does not change debugger registration");

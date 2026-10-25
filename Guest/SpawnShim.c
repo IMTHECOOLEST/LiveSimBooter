@@ -1,7 +1,7 @@
 #include "../ProcessSupport/SpawnTransport.h"
 #include "ChildWait.h"
+#include "CreationMask.h"
 
-#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -140,9 +140,7 @@ static int spawnOne(pid_t *pid, const char *path, const posix_spawn_file_actions
     char directory[LSB_PATH_BYTES];
     if (!error && !getcwd(directory, sizeof(directory))) error = errno;
     if (!error) error = LSBPlanAddString(plan, directory, &plan->cwd);
-    mode_t (*queryMask)(void) = (mode_t (*)(void))dlsym(RTLD_DEFAULT, "getumask");
-    if (!error && !queryMask) error = ENOTSUP;
-    if (!error) plan->creationMask = queryMask();
+    if (!error) error = LSBReadCreationMask(&plan->creationMask);
     if (!error) error = addVector(plan, argv, &plan->argc, plan->argv);
     if (!error) error = addVector(plan, envp, &plan->envc, plan->envp);
     if (!error) error = readAttributes(plan, attributes);

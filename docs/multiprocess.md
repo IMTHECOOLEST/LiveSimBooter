@@ -4,7 +4,8 @@ The native `LiveSimBooter` app now has a minimal UIKit foreground window and act
 runs in a separate `LiveProcess.appex` instance. The implementation intercepts `posix_spawn`, `posix_spawnp`, `wait`, `waitpid`, and `kill`; it does
 not implement a complete POSIX process tree or boot `launchd_sim`.
 
-The matching iOS 26 runtime remains the target. The spawn attribute and file-action decoder is pinned to the arm64 Darwin ABI
+The native app and extension have an iOS 26.0 deployment target. The matching iOS 26 runtime remains the guest target.
+The spawn attribute and file-action decoder is pinned to the arm64 Darwin ABI
 audited against that runtime's host-support libkernel. Recheck those layouts before using another runtime.
 
 ## Launch path
@@ -80,10 +81,31 @@ keeps Increased Memory Limit. The initial child profile lacked that entitlement,
 be added to its signature without a matching profile. The signed build was verified with certificate SHA-1
 `D7610EDC80D34A9B1A3D3C8563D66A5CD4716293`, team `UU7W52U79B`, matching embedded profiles, and `get-task-allow` for both targets.
 No machine-specific provisioning UUID is stored in the project.
+For ordinary provisioning on a replacement phone, both profiles must include its UDID. The profiles used for the earlier tests
+only included `00008150-0006505C1428401C`; they do not authorize the replacement `00008130-00021D122680011C`. In the recorded
+replacement-device experiment, Xcode reported `No Accounts` and could not refresh them. A generic signed build using the
+cached profiles nevertheless installed on that configured phone. This installation result does not establish acceptance on
+an ordinarily provisioned device whose UDID is absent from the profile.
 
 The runtime still needs appropriately signed dyld_sim, cache, executable, and shim files. Sharing the directory does not alter
 their code signatures. Use the existing device-compatible `df` signing procedure for a new executable such as `spawn-probe`;
 ordinary executable signing can reintroduce the executable-segment/profile issue documented in the earlier loader experiments.
+
+For a fresh phone, the minimal cache-only runtime contains these five files, relative to the newly resolved App Group container:
+
+| Local source | Destination inside `RuntimeRoot` |
+| --- | --- |
+| `tmp/dsc-relocated/signed/dyld_sim` | `usr/lib/dyld_sim` |
+| `tmp/dsc-relocated/signed/dyld_sim_shared_cache_arm64` | `System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64` |
+| `tmp/ios26-runtime/signed/bin/df` | `bin/df` |
+| Newly built and signed spawn shim | `usr/lib/libLiveSimSpawn.dylib` |
+| Newly built and signed probe | `bin/spawn-probe` |
+
+The first three local files were SHA-256 compared with the working original phone before redeployment. The cache is the
+rebuilt iOS 26 cache at `0x120000000`; its patched dyld_sim reads that base. The three host-support libraries are included in
+the cache and need no loose copies. The old active root has no other data files or symlinks; the historical cache/dyld backups
+and empty library directories are not required for this test. The `tmp` artifacts are local and ignored by Git; rebuilding
+them follows [the cache procedure](shared-cache.md). Preserve any existing runtime on a replacement phone before overwriting it.
 
 ## Synchronous XPC and native-cache removal
 
@@ -169,6 +191,13 @@ FD imports are first staged above every destination and action FD, so restoring 
 source. The broker closes its imported FD numbers after dispatching the plan and releases the original XPC request, which
 also owns FD objects, when it replies at READY. Keeping either pipe writer would prevent the guest parent from seeing EOF.
 A snapshot of a multithreaded caller's FD table is not atomic with concurrent close/open calls.
+
+[CreationMask.c](../Guest/CreationMask.c) checks the real `KERN_OSRELEASE` before selecting `getumask`. The transplanted support
+library exports that function, but iOS 26.1's Darwin 25.1 kernel lacks syscall 215; calling it caused SIGSYS before the first
+spawn. Darwin 26 or newer uses the query when available. Older kernels use a short `umask(0)`/restore sequence after blocking
+catchable signals and verifying that the guest has only one thread, then restore the signal mask. A multithreaded guest
+receives `EBUSY` on this fallback; it does not temporarily change its process mask. Focused tests cover both paths, restoration,
+signal deferral, and rejection of an actual second thread.
 
 Current limits are 256 argv entries, 256 environment entries, 64 file actions, 128 transferred descriptors, and 49,152 bytes of
 combined string storage. Executable/cwd/action paths must fit within 1,024 bytes including their terminator. The 128-FD limit
@@ -265,13 +294,25 @@ xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration
   CODE_SIGNING_ALLOWED=NO build
 ```
 
+The replacement-device experiment used this signed generic build with the existing cached profiles:
+
+```sh
+DEVICE=00008130-00021D122680011C # iphone-0xf-26-cua-duy.local
+xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration Debug \
+  -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath tmp/multiprocess-device-build build
+```
+
+This build installed on the configured test phone. A device-destination build with automatic provisioning refresh failed
+because Xcode reported `No Accounts`; the cached profiles lack this phone's UDID. An ordinarily provisioned replacement
+phone needs profiles containing its UDID. The generic-build result does not establish that those cached profiles authorize it.
+
 The shim builder produces `tmp/multiprocess/libLiveSimSpawn.dylib` and `tmp/multiprocess/spawn-probe` for arm64 iOS Simulator.
 After signing them using the runtime's established rules, place them at `RuntimeRoot/usr/lib/libLiveSimSpawn.dylib` and
 `RuntimeRoot/bin/spawn-probe`. The view starts this probe by default; an explicit first argument selects another guest.
 Launch the native host into the foreground:
 
 ```sh
-xcrun devicectl device process launch --device iphone-0x11-cua-duy --terminate-existing --console \
+xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console \
   -- com.kdt.LiveSimBooter /bin/spawn-probe
 ```
 
@@ -303,10 +344,10 @@ raw status `0x000f`, SIGCHLD, `ECHILD` on a second wait, and `ESRCH` from `kill(
 their gate release and include an any-child wait selector.
 
 `--repeat N` runs between 1 and 16 sequential spawn/read/EOF iterations, defaulting to one. `--debug-delay N` waits 1–60 seconds
-after simulator startup before spawning, allowing LLDB to attach. Use `--debug-delay 60` for the verified device workflow:
+after simulator startup before spawning, allowing LLDB to attach. Use `--debug-delay 60` as in the earlier device tests:
 
 ```sh
-xcrun devicectl device process launch --device iphone-0x11-cua-duy --terminate-existing --console \
+xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console \
   -- com.kdt.LiveSimBooter /bin/spawn-probe --debug-delay 60 --repeat 2 --verify-statuses
 ```
 
@@ -337,10 +378,92 @@ The child binary's dependencies and entry point were inspected, and the nested s
 verified. Broker argument-preservation tests cover the default probe and explicit guest arguments/environment. The current
 host links UIKit and Foundation; the child still links only libSystem and libc++, with no Objective-C imports or sections.
 
+## Replacement-device kill test, 2026-10-25
+
+The replacement `iphone-0xf-26-cua-duy.local` is an iPhone16,2 running iOS 26.1 (`23B50`), UDID
+`00008130-00021D122680011C`. The native app was installed and all five runtime files above were copied into App Group
+`461A0448-469E-4EB7-86A7-66D9A21B6A5D`; SHA-256 verification confirmed the deployed files. The active root uses only the rebuilt
+cache for its standard dependencies. The code now targets native iOS 26.0, and the creation-mask fallback above resolves this
+phone's missing `getumask` syscall.
+
+Foreground host PID 79242 launched simulator parent PID 79243 with `--debug-delay 60 --repeat 2 --verify-statuses`. The completed
+LLDB run produced:
+
+| Child | Result |
+| --- | --- |
+| df PIDs 79245 and 79246 | Each returned 1,501 stdout bytes followed by EOF and exit 0. |
+| Gated PID 79247 | Exit 0 with raw wait status `0x0000`. |
+| Gated PID 79248 | Exit 37 with raw wait status `0x2500`. |
+| Gated PID 79249 | Readiness observed; `kill(pid, 0)` succeeded; the parent issued SIGTERM; `waitpid` returned raw status `0x000f`. |
+
+The broker submitted SIGTERM through the retained extension instance's launchd path. Hardware breakpoints at `LSBKill` and
+`LSBTransportKill` both showed PID 79249 and signal 15; `finishWait` showed that PID and raw status 15. Each stop had one guest
+thread. SIGCHLD was observed, the repeated wait returned `ECHILD`, and the post-reap signal-0 check returned `ESRCH`. LLDB and
+RunningBoard both reported that the simulator parent exited 0. The original native-cache range
+`[0x180000000, 0x300000000)` was inaccessible; simulator TEXT at `[0x120000000, 0x12b2f4000)` was `r-x` with zero dirty pages.
+
+The initial kill test exposed an automatic-module-discovery failure on this iOS 26 debugger: it returned an empty image list and
+`Unable to create dyld_process_info`. A diagnostic temporarily cleared the compact descriptor, allowing the legacy scavenger
+to find three images; all 16 descriptor bytes were restored before continuing the test. No production debugger-bridge change
+was made during that initial test. The later compatibility fix below supersedes this limitation. The initial successful test
+used hardware address breakpoints derived from the locally built shim's symbols and its mapped
+base, `0x1015e0000`, rather than relying on named remote modules.
+
+Evidence is in `tmp/kill-device/console-final.log`, `tmp/kill-device/kill-lldb.txt`, and
+`tmp/kill-device/security-targeted.log`. The full local suite passed in `tmp/kill-device/tests-final.log`.
+
+A separate run without LLDB also passed. Parent PID 79251 received 1,501 bytes and exit 0 from each df child (79252 and 79253),
+then observed gated child exits 0 (79254), 37 (79255), and parent-issued SIGTERM (79256). The probe checked SIGCHLD, `WNOHANG`,
+`ECHILD` after reaping, and post-reap `kill(pid, 0) == -1` with `ESRCH`; the parent exited 0. The normal-run evidence is
+`tmp/kill-device/console-normal.log`. Final signatures verified, and deployed shim/probe hashes matched their local signed
+copies. The targeted security capture contained no matching amfid rejection or TXM selector event.
+
+## iOS 26 automatic image discovery, 2026-10-25
+
+The failure came from the compact-image archive format. The bridge always emitted the newer Apple Archive representation,
+which stores a `com.apple.dyld.crc32c` extended attribute. The iOS 26.1 native reader rejected that archive with
+`aarDecoderError.badMagic(34)`; it expects a `CKSF` header containing the POSIX `cksum` of `process.plist`. Clearing the compact
+descriptor was insufficient: the legacy fallback discovered only three images. Nor can the bridge emit the older format
+universally: the newer task-reading path requires the CRC32C attribute even when its standalone data decoder accepts `CKSF`.
+
+[CompactImageInfo.cpp](../LiveSimBooter/CompactImageInfo.cpp) now validates native dyld's current archive before native-cache
+removal and records its encoding. The parser checks record lengths, paths, checksum, and the expected binary plist signature;
+an unknown or malformed archive stops preparation while native error handling is still available. It retains only the format
+choice, then emits each simulator snapshot into app-owned buffers using that encoding. It does not modify native metadata,
+clear the compact descriptor, call host code after detachment, or depend on a hard-coded OS version. The usual legacy image
+array and compact descriptor continue to be published together.
+
+A fresh LLDB attach to simulator parent PID 79294 after cache detachment selected `spawn-probe` automatically and listed
+48 modules, including dyld_sim, LiveProcess, the spawn shim, and simulator-cache images. No manual module registration or
+metadata writes were used. Named hardware breakpoints resolved for `LSBKill`, `LSBTransportKill`, and `finishWait`.
+`jGetDyldProcessState` reported 80 (`program_running`). The native-cache range `[0x180000000, 0x300000000)` was inaccessible;
+simulator TEXT `[0x120000000, 0x12b2f4000)` remained `r-x` with zero dirty pages.
+
+The same run completed the probe's full spawn, signal, and wait checks:
+
+| Child | Result |
+| --- | --- |
+| df PIDs 79299 and 79300 | Each returned 1,501 stdout bytes, EOF, and exit 0. |
+| Gated PID 79301 | Exit 0 with raw wait status `0x0000`. |
+| Gated PID 79302 | Exit 37 with raw wait status `0x2500`. |
+| Gated PID 79303 | Parent-issued SIGTERM with raw wait status `0x000f`. |
+
+The named `LSBKill` stop showed PID 79303 first with signal 0, then with SIGTERM; `LSBTransportKill` showed the same PID and
+signal 15, and `finishWait` showed that PID with status `0x000f`. Every stop had one guest thread. The probe observed SIGCHLD,
+verified `WNOHANG`, `ECHILD` after reaping, and post-reap `kill(pid, 0)` returning `ESRCH`. LLDB reported parent exit 0.
+This confirms that automatic image discovery and named breakpoints work throughout the successful parent-to-child signal test.
+
+The LLDB evidence is saved in `tmp/ios26-image-discovery/automatic-images-lldb.txt`; its launch output is `console.log` in the
+same directory. The complete local suite passed in `tests-final.log`, and the signed Xcode build passed in `build.log`.
+The audit of Xcode's built post-detachment objects found no external imports; LiveProcess still links only libSystem and
+libc++. The concurrent security capture contained no matching amfid rejection or TXM selector event.
+See [debugger format compatibility](debugging.md#compact-image-format-compatibility) for the verification steps.
+
 ## Original-device progress, 2026-10-25
 
-The following recorded tests predate the cross-process `kill` interposer. Their SIGTERM status case used a self-issued
-signal; they validate waiting and notification, not parent-to-child signaling.
+The following recorded tests used the original `iphone-0x11-cua-duy` device, UDID `00008150-0006505C1428401C`, before the
+cross-process `kill` interposer was added. Their SIGTERM status case used a self-issued signal. They do not validate the
+replacement phone or parent-to-child signaling.
 
 The complete wait/SIGCHLD test passed under LLDB. Foreground host PID 9918 launched simulator parent PID 9919 with
 `--debug-delay 60 --repeat 2 --verify-statuses`:
@@ -391,7 +514,7 @@ checks; the Begin breakpoint was inspected live before that transcript was saved
 The earlier cache-only test, child PID 9695, already established that the pure-C extension could run simulator df after the
 App Group migration and native-cache handoff. The final test adds simulator-parent IPC and two independently launched children.
 
-The current runtime has all 219 loose cached dylibs moved, with their relative paths preserved, to the reversible backup
+The original phone has all 219 loose cached dylibs moved, with their relative paths preserved, to the reversible backup
 `<app-group-container>/RuntimeLooseDylibs-multiprocess`. The active `RuntimeRoot` retains dyld_sim, the rebuilt cache, the spawn
 shim, and the executables. This forces cached dependencies to come from the rebuilt cache; it does not delete their backups.
 The successful run published 217 cached images, with delayed initialization and only the needed initializer calls. Local

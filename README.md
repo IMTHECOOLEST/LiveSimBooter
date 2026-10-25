@@ -15,13 +15,17 @@ forwards `posix_spawn`/`posix_spawnp` to the broker, including argv, environment
 It also provides `wait`/`waitpid` over a shared child-status table and delivers `SIGCHLD` through the native host.
 The `kill` interposer sends signals to the caller's direct simulated children through the broker; positive self PIDs use native
 signaling. Signal 0 checks a child's current identity, and nonpositive PID selectors return `ENOTSUP`. The cross-process path
-uses synchronous XPC and is not async-signal-safe.
-On the tested iPhone, the simulator probe spawned two separate `df` processes in sequence. Each child unloaded its native cache,
-ran from the rebuilt iOS 26 cache, and returned 2,268 bytes through redirected stdout before EOF. The foreground native host
-remained active after its launch assertion ended. Native preparation preserves a raw broker Mach send right for guest IPC,
+uses synchronous XPC and is not async-signal-safe. The native app and extension target iOS 26.0 or later.
+The replacement iPhone on iOS 26.1 passed the parent-issued SIGTERM test under LLDB: the child reported readiness, the parent
+called `kill(child, SIGTERM)`, and `waitpid` returned raw status `0x000f` with SIGCHLD observed. Two df children exited 0, an
+additional child exited 37, and the probe itself exited 0. The guest remained single threaded at the kill/transport/wait
+breakpoints, with native-cache code inaccessible. A separate run without LLDB passed the same checks.
+The rebuilt simulator cache supplied the runtime's dependencies.
+The debugger bridge now selects the compact image archive format supported by native dyld before cache removal. A fresh late
+LLDB attach on the iOS 26.1 phone discovered 48 modules automatically, resolved named simulator breakpoints, and completed
+the spawn/signal/wait probe with exit 0. The bridge
+retains the newer format on hosts that require it. Native preparation preserves a raw broker Mach send right for guest IPC,
 and the transport adapter handles the native/simulator XPC wire-magic difference.
-An LLDB run also completed a guest spawn with one thread at both IPC boundary breakpoints; simulator images were recognized
-while native-cache code remained inaccessible.
 See [multiprocess setup, progress, and limits](docs/multiprocess.md).
 
 Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and
@@ -29,11 +33,11 @@ restores the normal idle timer when it becomes inactive. The earlier headless ho
 its launch assertion ended, and attaching LLDB alone did not prevent that suspension. The retained child assertion also depends
 on its host remaining active. The earlier wait/SIGCHLD device test passed under LLDB: two df children, exits 0 and 37, and self-issued SIGTERM all
 produced the expected wait status, delivered SIGCHLD, and returned `ECHILD` after reaping. The guest remained single threaded
-at the wait and signal-handler breakpoints, with native-cache code inaccessible. The current test
+at the wait and signal-handler breakpoints, with native-cache code inaccessible. The original phone's test
 runtime keeps 219 loose cached dylibs in the reversible App Group backup `RuntimeLooseDylibs-multiprocess`, beside `RuntimeRoot`;
 the rebuilt cache supplies them. The detailed device results below describe the earlier direct-launch implementation.
 The current `--verify-statuses` probe has the parent send SIGTERM after its child reports readiness, then checks the signal
-status with `waitpid`. See the [signaling scope](docs/multiprocess.md#signaling-a-simulated-child).
+status with `waitpid`. See the [signaling scope and device results](docs/multiprocess.md#signaling-a-simulated-child).
 
 See [docs/](docs/README.md) for the handoff design, cache signing/rebuilding procedure, device debugging commands, and recorded test results.
 

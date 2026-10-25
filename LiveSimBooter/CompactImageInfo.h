@@ -1,11 +1,17 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mach-o/dyld_images.h>
 
 namespace lsb {
 
-// Publish an Apple Archive process.plist snapshot for modern dyld introspection. The legacy array remains owned by dyld_sim.
+// Select the reader-compatible archive format from native dyld metadata while the host cache is still mapped.
+// Only the encoding choice is retained. Unknown formats return ENOTSUP; malformed archives return EBADMSG.
+// Must succeed before first publication; later calls return EBUSY. Native metadata is never modified.
+int configureCompactImageInfo(const void *nativeArchive, size_t nativeArchiveSize);
+
+// Publish an Apple Archive process.plist snapshot for the native debugger's dyld introspection. The legacy array remains owned by dyld_sim.
 // At most 1024 distinct images, including dyld, are supported. Calls serialize through an app-local lock.
 // Two app-owned buffers retain the current and previous snapshots; no pointers refer into the host cache.
 // This serves LLDB while the process is stopped. Readers spanning two later publications need their own retry protocol.

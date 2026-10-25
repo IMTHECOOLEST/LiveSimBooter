@@ -23,6 +23,7 @@
 
 // Modified 2026-10-24: emit bounded Apple Archive / process.plist snapshots with executable-local storage and primitives.
 // Modified 2026-10-24: describe loaded cache images directly, including their packed headers and relocated segment addresses.
+// Modified 2026-10-25: negotiate legacy POSIX-cksum or CRC32C-xattr archives against the native host reader before cache removal.
 // Format follows Apple's framework/AtlasSchema.swift, common/PropertyList.cpp and the native dyld atlas CRC attribute.
 #include "CompactImageInfo.h"
 #include "LocalPOSIX.h"
@@ -38,8 +39,10 @@ namespace {
 constexpr size_t kMaxImages = 1024, kMaxSegments = 32;
 constexpr size_t kMaxObjects = 64 + kMaxImages * (8 + 8 * kMaxSegments);
 constexpr size_t kBufferSize = 256 + kMaxImages * (2 * PATH_MAX + 192 + kMaxSegments * 192);
-constexpr size_t kArchiveHeaderSize = 44;
+constexpr size_t kModernHeaderSize = 44, kLegacyHeaderSize = 46, kMaxNativeArchiveSize = 64 * 1024 * 1024;
 constexpr uintptr_t kPageSize = 16384;
+enum class ArchiveEncoding { unconfigured, posixChecksum, crc32cAttribute };
+ArchiveEncoding sEncoding;
 enum Key : uint32_t { Proc, Plat, Time, Stat, Init, Flag, Flags, Imgs, Addr, File, UUID, Segs, Padr, Name, Size, Fsze, Foff, Perm, KeyCount };
 const char *const kKeys[] = {"proc", "plat", "time", "stat", "init", "flag", "flags", "imgs", "addr", "file", "uuid", "segs",
                            "padr", "name", "size", "fsze", "foff", "perm"};
@@ -84,6 +87,7 @@ struct Writer {
     size_t size;
     uint32_t objectCount;
     bool valid;
+    size_t headerSize;
 
     void byte(uint8_t value) {
         if (size == kBufferSize) { valid = false; return; }
@@ -101,7 +105,7 @@ struct Writer {
     }
     uint32_t object() {
         if (objectCount == kMaxObjects) { valid = false; return 0; }
-        sObjectOffsets[objectCount] = static_cast<uint32_t>(size - kArchiveHeaderSize);
+        sObjectOffsets[objectCount] = static_cast<uint32_t>(size - headerSize);
         return objectCount++;
     }
     void marker(uint8_t type, size_t count) {
@@ -154,6 +158,106 @@ uint32_t crc32c(const uint8_t *bytes, size_t size) {
         for (unsigned bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((0u - (crc & 1)) & 0x82f63b78u);
     }
     return ~crc;
+}
+
+uint32_t posixChecksum(const uint8_t *bytes, size_t size) {
+    uint32_t crc = 0;
+    auto update = [&crc](uint8_t byte) {
+        crc ^= static_cast<uint32_t>(byte) << 24;
+        for (unsigned bit = 0; bit < 8; ++bit) crc = (crc << 1) ^ ((0u - (crc >> 31)) & 0x04c11db7u);
+    };
+    for (size_t index = 0; index < size; ++index) update(bytes[index]);
+    for (size_t remaining = size; remaining; remaining >>= 8) update(static_cast<uint8_t>(remaining));
+    return ~crc;
+}
+
+uint64_t readLittle(const uint8_t *bytes, unsigned count) {
+    uint64_t result = 0;
+    for (unsigned index = 0; index < count; ++index) result |= static_cast<uint64_t>(bytes[index]) << (8 * index);
+    return result;
+}
+
+template <size_t Size> bool equalBytes(const uint8_t *bytes, const char (&text)[Size], size_t count = Size - 1) {
+    if (count > Size) return false;
+    for (size_t index = 0; index < count; ++index) if (bytes[index] != static_cast<uint8_t>(text[index])) return false;
+    return true;
+}
+
+int detectEncoding(const uint8_t *bytes, size_t size, ArchiveEncoding &encoding) {
+    if (!bytes || !size) return EINVAL;
+    if (size > kMaxNativeArchiveSize) return E2BIG;
+    if (reinterpret_cast<uintptr_t>(bytes) > UINTPTR_MAX - size) return EOVERFLOW;
+    size_t offset = 0, records = 0;
+    bool foundProcess = false;
+    encoding = ArchiveEncoding::unconfigured;
+    while (offset < size) {
+        if (++records > 1024) return E2BIG;
+        if (size - offset < 6) return EBADMSG;
+        const uint8_t *record = bytes + offset;
+        if (!equalBytes(record, "AA01")) return ENOTSUP;
+        size_t headerSize = static_cast<size_t>(readLittle(record + 4, 2));
+        if (headerSize < 6 || headerSize > size - offset) return EBADMSG;
+        uint64_t dataSize = 0, attributeSize = 0;
+        uint32_t checksum = 0;
+        bool hasType = false, hasPath = false, hasData = false, hasChecksum = false, hasAttribute = false, process = false;
+        size_t position = 6;
+        while (position < headerSize) {
+            if (headerSize - position < 4) return EBADMSG;
+            const uint8_t *key = record + position;
+            position += 4;
+            if (equalBytes(key, "TYP1")) {
+                if (hasType || position == headerSize) return EBADMSG;
+                if (record[position++] != 'F') return ENOTSUP;
+                hasType = true;
+            } else if (equalBytes(key, "PATP")) {
+                if (hasPath || headerSize - position < 2) return EBADMSG;
+                size_t length = static_cast<size_t>(readLittle(record + position, 2));
+                position += 2;
+                if (!length || length > headerSize - position) return EBADMSG;
+                process = length == 13 && equalBytes(record + position, "process.plist");
+                position += length;
+                hasPath = true;
+            } else if (equalBytes(key, "CKSF")) {
+                if (hasChecksum || headerSize - position < 4) return EBADMSG;
+                checksum = static_cast<uint32_t>(readLittle(record + position, 4));
+                position += 4;
+                hasChecksum = true;
+            } else if (equalBytes(key, "DAT", 3) || equalBytes(key, "XAT", 3)) {
+                bool data = key[0] == 'D';
+                if (data ? hasData : hasAttribute) return EBADMSG;
+                if (key[3] < 'A' || key[3] > 'C') return ENOTSUP;
+                unsigned width = 2u << (key[3] - 'A');
+                if (headerSize - position < width) return EBADMSG;
+                uint64_t length = readLittle(record + position, width);
+                position += width;
+                if (data) { hasData = true; dataSize = length; }
+                else { hasAttribute = true; attributeSize = length; }
+            } else return ENOTSUP;
+        }
+        if (!hasType || !hasPath || !hasData || dataSize > size - offset - headerSize) return EBADMSG;
+        size_t dataEnd = offset + headerSize + static_cast<size_t>(dataSize);
+        if (attributeSize > size - dataEnd) return EBADMSG;
+        size_t end = dataEnd + static_cast<size_t>(attributeSize);
+        ArchiveEncoding current;
+        if (hasChecksum && !hasAttribute) {
+            if (posixChecksum(record + headerSize, static_cast<size_t>(dataSize)) != checksum) return EBADMSG;
+            current = ArchiveEncoding::posixChecksum;
+        } else if (hasAttribute && !hasChecksum) {
+            if (attributeSize != 34) return ENOTSUP;
+            const uint8_t *attribute = bytes + dataEnd;
+            if (readLittle(attribute, 4) != 34 || !equalBytes(attribute + 4, "com.apple.dyld.crc32c", 22)) return ENOTSUP;
+            if (readLittle(attribute + 26, 4) != end || crc32c(bytes, end - 4) != readLittle(attribute + 30, 4)) return EBADMSG;
+            current = ArchiveEncoding::crc32cAttribute;
+        } else return ENOTSUP;
+        if (encoding != ArchiveEncoding::unconfigured && encoding != current) return ENOTSUP;
+        encoding = current;
+        if (process) {
+            if (foundProcess || dataSize < 8 || !equalBytes(record + headerSize, "bplist00")) return EBADMSG;
+            foundProcess = true;
+        }
+        offset = end;
+    }
+    return foundProcess ? 0 : ENOTSUP;
 }
 
 void copyImage(Image &destination, const Image &source) {
@@ -273,10 +377,13 @@ int buildSnapshot(dyld_all_image_infos *info, Writer &writer, uint64_t timestamp
         }
         copyImage(sImages[position], value);
     }
-    // One uncompressed AA01 regular-file record. DATB is a 32-bit data length; XATA holds a 16-bit xattr length.
-    writer.bytes("AA01", 4); writer.little(kArchiveHeaderSize, 2);
+    // Match the native reader: iOS 26 uses POSIX cksum in CKSF; newer readers require the trailing CRC32C xattr on task reads.
+    bool modern = sEncoding == ArchiveEncoding::crc32cAttribute;
+    writer.bytes("AA01", 4); writer.little(writer.headerSize, 2);
     writer.bytes("TYP1FPATP", 9); writer.little(13, 2); writer.bytes("process.plist", 13);
-    writer.bytes("DATB", 4); writer.little(0, 4); writer.bytes("XATA", 4); writer.little(34, 2);
+    if (!modern) { writer.bytes("CKSF", 4); writer.little(0, 4); }
+    writer.bytes("DATB", 4); writer.little(0, 4);
+    if (modern) { writer.bytes("XATA", 4); writer.little(34, 2); }
     writer.bytes("bplist00", 8);
     for (uint32_t index = 0; index < KeyCount; ++index) {
         size_t length = 0;
@@ -295,16 +402,23 @@ int buildSnapshot(dyld_all_image_infos *info, Writer &writer, uint64_t timestamp
     for (size_t index = 0; index < count; ++index) sImageObjects[index] = writeImage(writer, sImages[index]);
     values[7] = writer.array(sImageObjects, count);
     uint32_t root = writer.dictionary(keys, values, 8);
-    size_t offsetTable = writer.size - kArchiveHeaderSize;
+    size_t offsetTable = writer.size - writer.headerSize;
     for (uint32_t index = 0; index < writer.objectCount; ++index) writer.big(sObjectOffsets[index], 4);
     writer.big(0, 6); writer.byte(4); writer.byte(4);
     writer.big(writer.objectCount, 8); writer.big(root, 8); writer.big(offsetTable, 8);
-    size_t plistSize = writer.size - kArchiveHeaderSize;
-    // The native dyld CRC xattr describes the whole archive; its final four-byte checksum is excluded from the CRC input.
-    writer.little(34, 4); writer.bytes("com.apple.dyld.crc32c", 22); writer.little(writer.size + 8, 4);
-    if (!writer.valid || writer.size > kBufferSize - 4) return E2BIG;
-    for (unsigned byte = 0; byte < 4; ++byte) writer.data[34 + byte] = static_cast<uint8_t>(plistSize >> (byte * 8));
-    writer.little(crc32c(writer.data, writer.size), 4);
+    size_t plistSize = writer.size - writer.headerSize;
+    if (!writer.valid) return E2BIG;
+    size_t lengthOffset = modern ? 34 : 42;
+    for (unsigned byte = 0; byte < 4; ++byte) writer.data[lengthOffset + byte] = static_cast<uint8_t>(plistSize >> (byte * 8));
+    if (modern) {
+        // The native dyld CRC xattr describes the whole archive; its final four-byte checksum is excluded from the CRC input.
+        writer.little(34, 4); writer.bytes("com.apple.dyld.crc32c", 22); writer.little(writer.size + 8, 4);
+        if (!writer.valid || writer.size > kBufferSize - 4) return E2BIG;
+        writer.little(crc32c(writer.data, writer.size), 4);
+    } else {
+        uint32_t checksum = posixChecksum(writer.data + writer.headerSize, plistSize);
+        for (unsigned byte = 0; byte < 4; ++byte) writer.data[34 + byte] = static_cast<uint8_t>(checksum >> (byte * 8));
+    }
     return 0;
 }
 
@@ -312,10 +426,20 @@ int buildSnapshot(dyld_all_image_infos *info, Writer &writer, uint64_t timestamp
 
 namespace lsb {
 
+int configureCompactImageInfo(const void *nativeArchive, size_t nativeArchiveSize) {
+    if (__atomic_test_and_set(&sLocked, __ATOMIC_ACQUIRE)) return EBUSY;
+    ArchiveEncoding encoding;
+    int error = sTimestamp ? EBUSY : detectEncoding(static_cast<const uint8_t *>(nativeArchive), nativeArchiveSize, encoding);
+    if (!error) sEncoding = encoding;
+    __atomic_clear(&sLocked, __ATOMIC_RELEASE);
+    return error;
+}
+
 int publishCompactImageInfo(dyld_all_image_infos *info, uint64_t state) {
     if (!info || reinterpret_cast<uintptr_t>(&info->compact_dyld_image_info_addr) % alignof(Descriptor)) return EINVAL;
     if (state && state != 0x10 && state != 0x30 && state != 0x40 && state != 0x50) return EINVAL;
     if (__atomic_test_and_set(&sLocked, __ATOMIC_ACQUIRE)) return EBUSY;
+    if (sEncoding == ArchiveEncoding::unconfigured) { __atomic_clear(&sLocked, __ATOMIC_RELEASE); return ENXIO; }
     unsigned buffer = sActiveBuffer ^ 1;
     uint64_t timestamp = info->infoArrayChangeTimestamp;
     if (timestamp <= sTimestamp) timestamp = sTimestamp + 1;
@@ -323,7 +447,7 @@ int publishCompactImageInfo(dyld_all_image_infos *info, uint64_t state) {
     uint64_t nextState = info->libSystemInitialized ? 0x30 : 0x10;
     if (sInitializationState > nextState) nextState = sInitializationState;
     if (state > nextState) nextState = state;
-    Writer writer = {sBuffers[buffer], 0, 0, true};
+    Writer writer = {sBuffers[buffer], 0, 0, true, sEncoding == ArchiveEncoding::crc32cAttribute ? kModernHeaderSize : kLegacyHeaderSize};
     int error = buildSnapshot(info, writer, timestamp, nextState);
     if (!error) {
         Descriptor descriptor = {reinterpret_cast<uintptr_t>(writer.data), writer.size};

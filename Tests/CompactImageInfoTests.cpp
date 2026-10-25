@@ -39,6 +39,87 @@ static uint32_t referenceCRC(const uint8_t *bytes, size_t size) {
     for (size_t index = 0; index < size; ++index) crc = table[(crc ^ bytes[index]) & 255] ^ (crc >> 8);
     return ~crc;
 }
+static uint32_t referenceChecksum(const uint8_t *bytes, size_t size) {
+    uint32_t table[256];
+    for (unsigned value = 0; value < 256; ++value) {
+        uint32_t entry = value << 24;
+        for (unsigned bit = 0; bit < 8; ++bit) entry = (entry & 0x80000000) ? ((entry << 1) ^ 0x04c11db7) : (entry << 1);
+        table[value] = entry;
+    }
+    uint32_t crc = 0;
+    for (size_t index = 0; index < size; ++index) crc = table[(crc >> 24) ^ bytes[index]] ^ (crc << 8);
+    for (size_t remaining = size; remaining; remaining >>= 8) crc = table[(crc >> 24) ^ (remaining & 255)] ^ (crc << 8);
+    return ~crc;
+}
+static void appendLittle(std::vector<uint8_t> &bytes, uint64_t value, unsigned width) {
+    for (unsigned index = 0; index < width; ++index) bytes.push_back(static_cast<uint8_t>(value >> (8 * index)));
+}
+static void append(std::vector<uint8_t> &bytes, const char *text, size_t size) { bytes.insert(bytes.end(), text, text + size); }
+static std::vector<uint8_t> nativeArchive(bool modern, const char *path = "process.plist", unsigned width = 2) {
+    // Native 26 emits CKSF then DATA (often preceded by process.cinfo); native 27 emits DATA then XATA.
+    const uint8_t payload[] = {'b', 'p', 'l', 'i', 's', 't', '0', '0'};
+    size_t pathLength = std::strlen(path);
+    std::vector<uint8_t> bytes;
+    append(bytes, "AA01", 4); appendLittle(bytes, (modern ? 27 : 29) + pathLength + width, 2);
+    append(bytes, "TYP1FPATP", 9); appendLittle(bytes, pathLength, 2); append(bytes, path, pathLength);
+    if (!modern) { append(bytes, "CKSF", 4); appendLittle(bytes, referenceChecksum(payload, sizeof(payload)), 4); }
+    append(bytes, width == 2 ? "DATA" : width == 4 ? "DATB" : "DATC", 4); appendLittle(bytes, sizeof(payload), width);
+    if (modern) { append(bytes, "XATA", 4); appendLittle(bytes, 34, 2); }
+    bytes.insert(bytes.end(), payload, payload + sizeof(payload));
+    if (modern) {
+        appendLittle(bytes, 34, 4); append(bytes, "com.apple.dyld.crc32c", 22); appendLittle(bytes, bytes.size() + 8, 4);
+        appendLittle(bytes, referenceCRC(bytes.data(), bytes.size()), 4);
+    }
+    return bytes;
+}
+static void testEncodingSelection() {
+    check(posixChecksum(reinterpret_cast<const uint8_t *>("123456789"), 9) == 930766865, "POSIX cksum standard check value");
+    check(posixChecksum(nullptr, 0) == UINT32_MAX, "POSIX cksum empty input");
+    check(lsb::configureCompactImageInfo(nullptr, 0) == EINVAL, "missing native snapshot rejected");
+    for (bool modern : {false, true}) {
+        for (unsigned width : {2u, 4u, 8u}) {
+            auto bytes = nativeArchive(modern, "process.plist", width);
+            check(lsb::configureCompactImageInfo(bytes.data(), bytes.size()) == 0, "native DATA, DATB and DATC widths are accepted");
+            check(sEncoding == (modern ? ArchiveEncoding::crc32cAttribute : ArchiveEncoding::posixChecksum), "native encoding is retained as a local enum");
+            for (size_t truncated = 1; truncated < bytes.size(); ++truncated) {
+                std::vector<uint8_t> prefix(bytes.begin(), bytes.begin() + truncated);
+                check(lsb::configureCompactImageInfo(prefix.data(), prefix.size()) != 0, "every truncated archive is rejected");
+            }
+            auto corrupt = bytes; corrupt.back() ^= 1;
+            check(lsb::configureCompactImageInfo(corrupt.data(), corrupt.size()) == EBADMSG, "native checksum corruption rejected");
+        }
+    }
+    auto legacy = nativeArchive(false, "process.cinfo"), plist = nativeArchive(false);
+    legacy.insert(legacy.end(), plist.begin(), plist.end());
+    check(lsb::configureCompactImageInfo(legacy.data(), legacy.size()) == 0 && sEncoding == ArchiveEncoding::posixChecksum,
+          "native 26 process.cinfo followed by process.plist selects legacy encoding");
+    auto unknown = plist; unknown[0] = 'B';
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == ENOTSUP, "unknown archive magic rejected");
+    unknown = plist; unknown[30] = 'Z';
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == ENOTSUP, "unknown structural field rejected");
+    unknown = plist; unknown[41] = 'D';
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == ENOTSUP, "unsupported blob width rejected");
+    unknown = plist; unknown[42] = 0xff; unknown[43] = 0xff;
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == EBADMSG, "oversized blob length rejected");
+    unknown = plist; unknown[4] = 5;
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == EBADMSG, "undersized record header rejected");
+    unknown = plist; std::memcpy(unknown.data() + 38, "CKSF", 4);
+    check(lsb::configureCompactImageInfo(unknown.data(), unknown.size()) == EBADMSG, "duplicate checksum field rejected");
+    auto disguised = nativeArchive(false, "process.plistCKSF");
+    check(lsb::configureCompactImageInfo(disguised.data(), disguised.size()) == ENOTSUP, "path substring does not identify the process plist");
+    auto duplicated = plist; duplicated.insert(duplicated.end(), plist.begin(), plist.end());
+    check(lsb::configureCompactImageInfo(duplicated.data(), duplicated.size()) == EBADMSG, "duplicate process plist rejected");
+    auto modern = nativeArchive(true);
+    auto attribute = modern; attribute[attribute.size() - 30] ^= 1;
+    check(lsb::configureCompactImageInfo(attribute.data(), attribute.size()) == ENOTSUP, "unknown xattr name cannot select modern encoding");
+    auto mixed = legacy; mixed.insert(mixed.end(), modern.begin(), modern.end());
+    check(lsb::configureCompactImageInfo(mixed.data(), mixed.size()) != 0, "mixed legacy and modern archive rejected");
+    check(lsb::configureCompactImageInfo(plist.data(), kMaxNativeArchiveSize + 1) == E2BIG, "native archive size is bounded before reading");
+    sLocked = true;
+    check(lsb::configureCompactImageInfo(plist.data(), plist.size()) == EBUSY, "selection uses the publication lock");
+    sLocked = false;
+    check(sEncoding == ArchiveEncoding::posixChecksum, "failed selection preserves the prior encoding");
+}
 static std::vector<uint8_t> currentBytes(const dyld_all_image_infos &info) {
     const auto *start = reinterpret_cast<const uint8_t *>(info.compact_dyld_image_info_addr);
     return {start, start + info.compact_dyld_image_info_size};
@@ -57,16 +138,25 @@ static uint64_t number(CFDictionaryRef dictionary, CFStringRef key) {
 }
 static void checkSnapshot(const dyld_all_image_infos &info, uint64_t state, bool secondHasUUID = true, const char *secondPath = "/RuntimeRoot/bin/df") {
     auto data = currentBytes(info);
-    check(data.size() > 78 && std::memcmp(data.data(), "AA01", 4) == 0 && little(data.data() + 4, 2) == 44, "native AA01 archive header");
-    check(std::memcmp(data.data() + 6, "TYP1FPATP\x0d\x00process.plistDATB", 28) == 0, "single process.plist regular-file record");
-    size_t plistSize = static_cast<size_t>(little(data.data() + 34, 4));
-    check(std::memcmp(data.data() + 38, "XATA\x22\x00", 6) == 0 && plistSize + 44 + 34 == data.size(), "archive data and xattr lengths agree");
-    const auto *attribute = data.data() + 44 + plistSize;
-    check(little(attribute, 4) == 34 && std::memcmp(attribute + 4, "com.apple.dyld.crc32c", 22) == 0, "native dyld CRC attribute");
-    check(little(attribute + 26, 4) == data.size(), "CRC attribute records the complete archive length");
-    check(referenceCRC(data.data(), data.size() - 4) == little(attribute + 30, 4), "CRC validates archive bytes excluding final checksum");
-    check(referenceCRC(data.data(), data.size()) == 0x48674bc7, "complete archive has the native CRC32C residue");
-    CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, data.data() + 44, static_cast<CFIndex>(plistSize));
+    bool modern = sEncoding == ArchiveEncoding::crc32cAttribute;
+    size_t headerSize = modern ? 44 : 46;
+    check(data.size() > 78 && std::memcmp(data.data(), "AA01", 4) == 0 && little(data.data() + 4, 2) == headerSize, "native AA01 archive header");
+    check(std::memcmp(data.data() + 6, "TYP1FPATP\x0d\x00process.plist", 24) == 0, "single process.plist regular-file record");
+    size_t plistSize = static_cast<size_t>(little(data.data() + (modern ? 34 : 42), 4));
+    if (modern) {
+        check(std::memcmp(data.data() + 30, "DATB", 4) == 0, "modern data length field");
+        check(std::memcmp(data.data() + 38, "XATA\x22\x00", 6) == 0 && plistSize + 44 + 34 == data.size(), "archive data and xattr lengths agree");
+        const auto *attribute = data.data() + 44 + plistSize;
+        check(little(attribute, 4) == 34 && std::memcmp(attribute + 4, "com.apple.dyld.crc32c", 22) == 0, "native dyld CRC attribute");
+        check(little(attribute + 26, 4) == data.size(), "CRC attribute records the complete archive length");
+        check(referenceCRC(data.data(), data.size() - 4) == little(attribute + 30, 4), "CRC validates archive bytes excluding final checksum");
+        check(referenceCRC(data.data(), data.size()) == 0x48674bc7, "complete archive has the native CRC32C residue");
+    } else {
+        check(std::memcmp(data.data() + 30, "CKSF", 4) == 0 && std::memcmp(data.data() + 38, "DATB", 4) == 0, "legacy checksum and data fields");
+        check(headerSize + plistSize == data.size(), "legacy archive has no CRC xattr suffix");
+        check(referenceChecksum(data.data() + headerSize, plistSize) == little(data.data() + 34, 4), "independent POSIX checksum validates legacy payload");
+    }
+    CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, data.data() + headerSize, static_cast<CFIndex>(plistSize));
     CFErrorRef error = nullptr;
     CFPropertyListRef decoded = CFPropertyListCreateWithData(kCFAllocatorDefault, encoded, kCFPropertyListImmutable, nullptr, &error);
     check(decoded && !error && CFGetTypeID(decoded) == CFDictionaryGetTypeID(), "independent CoreFoundation binary-plist decoder accepts snapshot");
@@ -113,7 +203,9 @@ static void expectFailure(dyld_all_image_infos &info, int error, uint64_t state 
 }
 static void checkCachedSnapshot(const dyld_all_image_infos &info) {
     auto bytes = currentBytes(info);
-    CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, bytes.data() + 44, static_cast<CFIndex>(little(bytes.data() + 34, 4)));
+    bool modern = sEncoding == ArchiveEncoding::crc32cAttribute;
+    CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, bytes.data() + (modern ? 44 : 46),
+                                   static_cast<CFIndex>(little(bytes.data() + (modern ? 34 : 42), 4)));
     CFErrorRef error = nullptr;
     CFPropertyListRef decoded = CFPropertyListCreateWithData(kCFAllocatorDefault, encoded, kCFPropertyListImmutable, nullptr, &error);
     check(decoded && !error && CFGetTypeID(decoded) == CFDictionaryGetTypeID(), "cache snapshot decodes independently");
@@ -142,9 +234,9 @@ static void checkCachedSnapshot(const dyld_all_image_infos &info) {
     check(found == 1, "cached header appears exactly once");
     CFRelease(decoded); CFRelease(encoded);
 }
-int main(int argc, char **argv) {
-    check(crc32c(reinterpret_cast<const uint8_t *>("123456789"), 9) == 0xe3069283, "standard CRC32C check value");
-    check(crc32c(nullptr, 0) == 0, "empty CRC32C check value");
+static void testSnapshots(bool modern, const char *exportPath) {
+    sEncoding = ArchiveEncoding::unconfigured; sTimestamp = sInitializationState = 0; sActiveBuffer = 0;
+    auto native = nativeArchive(modern);
     for (unsigned index = 0; index < 3; ++index) {
         auto &image = fixtures[index];
         image.header.magic = MH_MAGIC_64; image.header.ncmds = 3;
@@ -164,7 +256,11 @@ int main(int argc, char **argv) {
     alignas(16) dyld_all_image_infos info = {};
     info.infoArray = images; info.infoArrayCount = 3; info.initialImageCount = 2; info.platform = PLATFORM_IOSSIMULATOR;
     info.dyldImageLoadAddress = dyld; info.dyldPath = images[0].imageFilePath; info.processDetachedFromSharedRegion = true;
+    check(lsb::publishCompactImageInfo(&info) == ENXIO, "publication requires native-reader configuration");
+    check(lsb::configureCompactImageInfo(native.data(), native.size()) == 0, "native-reader configuration succeeds before first publication");
+    std::memset(native.data(), 0, native.size());
     check(lsb::publishCompactImageInfo(&info) == 0, "initial snapshot publishes");
+    check(lsb::configureCompactImageInfo(native.data(), native.size()) == EBUSY, "encoding cannot change after first publication");
     checkSnapshot(info, 0x10);
     auto firstSnapshot = currentBytes(info); uintptr_t firstAddress = info.compact_dyld_image_info_addr;
     info.libSystemInitialized = true;
@@ -224,10 +320,17 @@ int main(int argc, char **argv) {
     info.errorMessage = nullptr;
     check(lsb::publishCompactImageInfo(&info) == 0, "error state does not replace saved progress"); checkSnapshot(info, 0x50);
     expectFailure(info, EINVAL, 0x21);
-    if (argc == 2) {
-        auto bytes = currentBytes(info); FILE *output = std::fopen(argv[1], "wb");
+    if (exportPath) {
+        auto bytes = currentBytes(info); FILE *output = std::fopen(exportPath, "wb");
         check(output && std::fwrite(bytes.data(), 1, bytes.size(), output) == bytes.size(), "export snapshot for independent native-SPI validation");
         std::fclose(output);
     }
+}
+int main(int argc, char **argv) {
+    check(crc32c(reinterpret_cast<const uint8_t *>("123456789"), 9) == 0xe3069283, "standard CRC32C check value");
+    check(crc32c(nullptr, 0) == 0, "empty CRC32C check value");
+    testEncodingSelection();
+    testSnapshots(false, argc == 3 ? argv[2] : nullptr);
+    testSnapshots(true, argc >= 2 ? argv[1] : nullptr);
     std::printf("Compact image metadata: %u checks passed\n", checks);
 }
