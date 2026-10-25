@@ -206,6 +206,28 @@ static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
     startNextJob();
 }
 
+static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
+    if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
+    if (targetPID <= 0) return ENOTSUP;
+    LSBJob *child = nil;
+    for (LSBJob *job in jobs) {
+        if (job.pid == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) { child = job; break; }
+    }
+    if (!child) return ESRCH;
+    audit_token_t identity = child.audit;
+    // A retained job can outlive the process until its queued exit notification runs. Validate the full PID generation.
+    // proc_signal_with_audittoken does not support signal 0, so the identity lookup also implements the existence check.
+    int error = LSBRunningBoardValidateIdentity(&identity);
+    if (error || !signalNumber) return error;
+    error = LSBChildSignal(&identity, signalNumber);
+    if (error == EACCES || error == EPERM) {
+        error = LSBSignalExtension(child.identifier, signalNumber);
+        if (!error) fprintf(stderr, "[broker] signal=%d submitted through launchd for request=%llu pid=%d\n",
+                            signalNumber, child.identifier, child.pid);
+    }
+    return error;
+}
+
 static void handleMessage(LSBReceivedMessage *message) {
     pid_t pid = (pid_t)message->audit.val[5];
     uint32_t generation = message->audit.val[7];
@@ -216,6 +238,13 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
             enqueueSpawn(message, sender);
             return;
+        case LSB_REQUEST_KILL: {
+            if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
+            int error = signalChild(sender, message->targetPID, message->signalNumber);
+            LSBTransportReply(message, error, error ? 0 : message->targetPID, 0, NULL, NULL, NULL);
+            disposeMessage(message);
+            return;
+        }
         case LSB_REQUEST_CHECKIN: {
             // PlugInKit launches our registered extension. Match its PID to the kernel's sender identity; iOS denies
             // cross-process SecTask entitlement queries even for our own extension.

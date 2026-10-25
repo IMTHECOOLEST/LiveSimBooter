@@ -27,13 +27,15 @@ static int submitError, readySendError, monitorCreateError, identityCheckError, 
 static unsigned deliveredSignals, identityChecks, runningBoardStarts, runningBoardCancels;
 static unsigned submittedExtensionSignals;
 static uint64_t signaledRequest;
-static int directSignalError;
+static int directSignalError, extensionSignalError, lastSignal;
 static audit_token_t signaledAudit;
 static LSBExtensionEvent extensionCallback;
 
 int LSBRunningBoardValidateIdentity(const audit_token_t *audit) {
     ++identityChecks;
-    assert(startingJob && audit->val[5] == (unsigned)startingJob.pid && audit->val[7] == startingJob.pidVersion);
+    bool found = false;
+    for (LSBJob *job in jobs) if (audit->val[5] == (unsigned)job.pid && audit->val[7] == job.pidVersion) found = true;
+    assert(found);
     return identityCheckError;
 }
 @interface LSBRunningBoardMonitor : NSObject
@@ -64,8 +66,9 @@ int LSBChildMonitorRead(int descriptor, pid_t pid, int *status) {
     return EAGAIN;
 }
 int LSBChildSignal(const audit_token_t *audit, int signal) {
-    assert(audit && signal == SIGCHLD);
+    assert(audit && signal > 0 && signal < NSIG);
     signaledAudit = *audit;
+    lastSignal = signal;
     ++deliveredSignals;
     return directSignalError;
 }
@@ -88,10 +91,11 @@ int LSBLaunchExtension(const char *identifier, uint64_t requestID, LSBExtensionE
 pid_t LSBExtensionProcessIdentifier(uint64_t requestID) { assert(requestID); return reportedPID; }
 void LSBReleaseExtension(uint64_t requestID) { assert(requestID); ++releasedLaunches; }
 int LSBSignalExtension(uint64_t requestID, int signal) {
-    assert(requestID && signal == SIGCHLD);
+    assert(requestID && signal > 0 && signal < NSIG);
     signaledRequest = requestID;
+    lastSignal = signal;
     ++submittedExtensionSignals;
-    return 0;
+    return extensionSignalError;
 }
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) { (void)port; (void)message; return ENOSYS; }
@@ -148,7 +152,7 @@ static void resetBroker(void) {
     runningBoardStarts = runningBoardCancels = 0;
     submittedExtensionSignals = 0;
     signaledRequest = 0;
-    directSignalError = 0;
+    directSignalError = extensionSignalError = lastSignal = 0;
     memset(&signaledAudit, 0, sizeof(signaledAudit));
     replyCount = disposedMessages = submittedLaunches = releasedLaunches = 0;
     memset(replies, 0, sizeof(replies));
@@ -464,6 +468,87 @@ static void testParentDeathDetachesOrphans(void) {
     assert(!jobs.count && !deliveredSignals);
 }
 
+static RecordedReply *requestKill(LSBJob *parent, pid_t targetPID, int signalNumber) {
+    LSBReceivedMessage *message = messageFor(LSB_REQUEST_KILL, parent.pid, parent.pidVersion, 0);
+    unsigned object = ((TestMessageObject *)message->object)->identifier;
+    message->targetPID = targetPID;
+    message->signalNumber = signalNumber;
+    handleMessage(message);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && !reply->requestID && !reply->deliveredPlan && (!reply->error || !reply->pid));
+    return reply;
+}
+
+static void testKillAuthenticationAndExit(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 40);
+    LSBJob *child = runTestJob(parent, 41);
+    parent.pid = getpid() + 100;
+    audit_token_t parentAudit = parent.audit;
+    parentAudit.val[5] = (unsigned)parent.pid;
+    parent.audit = parentAudit;
+    LSBJob *other = runTestJob(nil, 42);
+    other.pid = getpid() + 200;
+    unsigned checks = identityChecks;
+    assert(!requestKill(parent, child.pid, 0)->error && identityChecks == checks + 1 && !deliveredSignals && !submittedExtensionSignals);
+    assert(requestKill(parent, child.pid, -1)->error == EINVAL);
+    assert(requestKill(parent, child.pid, NSIG)->error == EINVAL);
+    assert(requestKill(parent, 0, SIGTERM)->error == ENOTSUP);
+    assert(requestKill(parent, -1, SIGTERM)->error == ENOTSUP);
+    assert(requestKill(parent, -20, SIGTERM)->error == ENOTSUP);
+    assert(requestKill(parent, other.pid, SIGTERM)->error == ESRCH);
+    assert(requestKill(parent, parent.pid, SIGTERM)->error == ESRCH);
+    assert(requestKill(parent, getpid() + 300, SIGTERM)->error == ESRCH);
+    LSBJob *impostor = [LSBJob new];
+    impostor.pid = parent.pid;
+    impostor.pidVersion = parent.pidVersion + 1;
+    assert(requestKill(impostor, child.pid, SIGTERM)->error == EACCES);
+    parent.phase = JobDispatched;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == EACCES);
+    parent.phase = JobRunning;
+    child.phase = JobDispatched;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == ESRCH);
+    child.phase = JobRunning;
+    assert(identityChecks == checks + 1 && !deliveredSignals && !submittedExtensionSignals);
+    identityCheckError = ESRCH;
+    assert(requestKill(parent, child.pid, 0)->error == ESRCH);
+    assert(requestKill(parent, child.pid, SIGTERM)->error == ESRCH);
+    assert(!deliveredSignals && !submittedExtensionSignals);
+    identityCheckError = 0;
+    RecordedReply *reply = requestKill(parent, child.pid, SIGTERM);
+    assert(!reply->error && reply->pid == child.pid && deliveredSignals == 1 && !submittedExtensionSignals && lastSignal == SIGTERM);
+    audit_token_t childAudit = child.audit;
+    assert(!memcmp(&signaledAudit, &childAudit, sizeof(childAudit)));
+    // Successful signaling does not invent an exit. Only the later monitor event makes waitpid reapable.
+    pid_t waited;
+    int status;
+    assert(findJob(child.identifier) && LSBChildStatusTryWait(parent.childStatus, child.pid, getpgrp(), &waited, &status) == EAGAIN);
+    recordChildExit(child.identifier, SIGTERM);
+    assert(!LSBChildStatusTryWait(parent.childStatus, child.pid, getpgrp(), &waited, &status));
+    assert(waited == child.pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+    assert(requestKill(parent, child.pid, 0)->error == ESRCH && requestKill(parent, child.pid, SIGTERM)->error == ESRCH);
+}
+
+static void testKillFallbackErrors(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 50);
+    LSBJob *child = runTestJob(parent, 51);
+    directSignalError = ESRCH;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == 1 && !submittedExtensionSignals);
+    directSignalError = EINVAL;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == EINVAL && deliveredSignals == 2 && !submittedExtensionSignals);
+    directSignalError = EPERM;
+    assert(!requestKill(parent, child.pid, SIGTERM)->error && submittedExtensionSignals == 1 && signaledRequest == child.identifier);
+    assert(lastSignal == SIGTERM);
+    directSignalError = EACCES;
+    assert(!requestKill(parent, child.pid, SIGKILL)->error && submittedExtensionSignals == 2 && lastSignal == SIGKILL);
+    extensionSignalError = ENOMEM;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == ENOMEM && submittedExtensionSignals == 3);
+    extensionSignalError = ESRCH;
+    assert(requestKill(parent, child.pid, SIGTERM)->error == ESRCH && submittedExtensionSignals == 4);
+    assert(findJob(child.identifier) && jobs.count == 2);
+}
+
 int main(void) {
     @autoreleasepool {
         alarm(10);
@@ -479,8 +564,10 @@ int main(void) {
         testAuditedGenerationDisappearsBeforeBootstrap();
         testRunningBoardFallback();
         testParentDeathDetachesOrphans();
+        testKillAuthenticationAndExit();
+        testKillFallbackErrors();
         resetBroker();
-        puts("Broker: authentication, lifecycle, FD ownership, exact exit status, token-safe signals, repeated reap, and orphan cleanup passed");
+        puts("Broker: authentication, lifecycle, FD ownership, exit status, token-safe kill, launchd fallback, repeated reap, and orphan cleanup passed");
     }
     return 0;
 }

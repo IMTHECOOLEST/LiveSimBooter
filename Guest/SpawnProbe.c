@@ -117,23 +117,59 @@ static int spawnAndRead(void) {
     return waited ? waited : total ? 0 : 5;
 }
 
+static int waitForChildReady(int fd) {
+    int64_t start = milliseconds();
+    if (start < 0) return -1;
+    int64_t deadline = start + 15000;
+    for (;;) {
+        int64_t now = milliseconds();
+        if (now < 0) return -1;
+        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
+        struct pollfd descriptor = {.fd = fd, .events = POLLIN};
+        int result = poll(&descriptor, 1, (int)(deadline - now));
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) return -1;
+        if (!result) continue;
+        char byte;
+        ssize_t count = read(fd, &byte, 1);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return -1;
+        if (count != 1 || byte != 'r') { errno = EPIPE; return -1; }
+        return 0;
+    }
+}
+
 static int verifyStatusCase(const char *program, unsigned value, int bySignal, int anyChild) {
-    int gate[2];
+    int gate[2], ready[2] = {-1, -1};
     if (pipe(gate)) { perror("[spawn-probe] status gate"); return 1; }
+    if (bySignal && pipe(ready)) { perror("[spawn-probe] readiness pipe"); close(gate[0]); close(gate[1]); return 1; }
     posix_spawn_file_actions_t actions;
     int error = posix_spawn_file_actions_init(&actions);
-    if (error) { close(gate[0]); close(gate[1]); return 1; }
+    if (error) { close(gate[0]); close(gate[1]); if (bySignal) { close(ready[0]); close(ready[1]); } return 1; }
     error = posix_spawn_file_actions_addclose(&actions, gate[1]);
-    char valueString[16], gateString[16];
+    if (!error && bySignal) error = posix_spawn_file_actions_addclose(&actions, ready[0]);
+    char valueString[16], gateString[16], readyString[16];
     snprintf(valueString, sizeof(valueString), "%u", value);
     snprintf(gateString, sizeof(gateString), "%d", gate[0]);
-    char *arguments[] = {(char *)program, bySignal ? "--self-signal" : "--exit-code", valueString, "--child-gate-fd", gateString, NULL};
+    snprintf(readyString, sizeof(readyString), "%d", ready[1]);
+    char *arguments[] = {(char *)program, bySignal ? "--wait-signal" : "--exit-code", valueString, "--child-gate-fd", gateString,
+                        bySignal ? "--child-ready-fd" : NULL, readyString, NULL};
     pid_t child = -1;
     sig_atomic_t beforeSignals = childSignals;
     if (!error) error = posix_spawn(&child, program, &actions, NULL, arguments, environ);
     posix_spawn_file_actions_destroy(&actions);
     close(gate[0]);
-    if (error) { fprintf(stderr, "[spawn-probe] status child: %s\n", strerror(error)); close(gate[1]); return 2; }
+    if (bySignal) close(ready[1]);
+    if (error) {
+        fprintf(stderr, "[spawn-probe] status child: %s\n", strerror(error));
+        close(gate[1]); if (bySignal) close(ready[0]);
+        return 2;
+    }
+    if (bySignal) {
+        int result = waitForChildReady(ready[0]);
+        close(ready[0]);
+        if (result) { perror("[spawn-probe] wait for child readiness"); close(gate[1]); return 6; }
+    }
     int status = 0x1234;
     errno = EDOM;
     if (waitpid(child, &status, WNOHANG) != 0 || status != 0x1234 || errno != EDOM) {
@@ -141,16 +177,30 @@ static int verifyStatusCase(const char *program, unsigned value, int bySignal, i
         close(gate[1]); return 6;
     }
     fprintf(stderr, "[spawn-probe] pid=%d WNOHANG=0 before releasing child\n", child);
+    if (bySignal) {
+        errno = EDOM;
+        if (kill(child, 0) || errno != EDOM) { perror("[spawn-probe] kill existence check"); close(gate[1]); return 6; }
+        if (kill(child, (int)value) || errno != EDOM) { perror("[spawn-probe] kill child"); close(gate[1]); return 6; }
+        fprintf(stderr, "[spawn-probe] parent=%d sent signal=%u to ready pid=%d with kill\n", getpid(), value, child);
+        // Keep the gate open until the exit is observed: launchd may deliver the signal after kill returns.
+        int result = expectWait(child, anyChild ? -1 : child, 0, (int)value, beforeSignals);
+        close(gate[1]);
+        if (!result && (kill(child, 0) != -1 || errno != ESRCH)) {
+            fprintf(stderr, "[spawn-probe] reaped pid=%d did not become ESRCH for kill\n", child);
+            return 6;
+        }
+        return result;
+    }
     ssize_t written;
     do { written = write(gate[1], "x", 1); } while (written < 0 && errno == EINTR);
     close(gate[1]);
     if (written != 1) { perror("[spawn-probe] release status child"); return 6; }
-    return expectWait(child, anyChild ? -1 : child, bySignal ? 0 : (int)value, bySignal ? (int)value : 0, beforeSignals);
+    return expectWait(child, anyChild ? -1 : child, (int)value, 0, beforeSignals);
 }
 
 static int usage(const char *program) {
     fprintf(stderr, "usage: %s [--stop-before-spawn] [--debug-delay N] [--repeat N] [--verify-statuses]\n"
-                    "       %s --exit-code N | --self-signal N\n"
+                    "       %s --exit-code N | --self-signal N | --wait-signal N --child-gate-fd FD --child-ready-fd FD\n"
                     "       debug delay: 1 to 60 seconds; repeat: 1 to 16; exit code: 0 to 255\n", program, program);
     return 64;
 }
@@ -167,8 +217,8 @@ static int parseCount(const char *number, unsigned minimum, unsigned maximum, un
 
 int main(int argc, char *argv[]) {
     unsigned repeat = 1, debugDelay = 0;
-    unsigned exitCode = 0, selfSignal = 0, gateFD = 0;
-    int stopBeforeSpawn = 0, hasRepeat = 0, verifyStatuses = 0, exitChild = 0, hasGate = 0;
+    unsigned exitCode = 0, selfSignal = 0, waitSignal = 0, gateFD = 0, readyFD = 0;
+    int stopBeforeSpawn = 0, hasRepeat = 0, verifyStatuses = 0, exitChild = 0, hasGate = 0, hasReady = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--stop-before-spawn") && !stopBeforeSpawn) stopBeforeSpawn = 1;
         else if (!strcmp(argv[i], "--repeat") && !hasRepeat && i + 1 < argc) {
@@ -177,18 +227,39 @@ int main(int argc, char *argv[]) {
         } else if (!strcmp(argv[i], "--debug-delay") && !debugDelay && i + 1 < argc) {
             if (parseCount(argv[++i], 1, 60, &debugDelay)) return usage(argv[0]);
         } else if (!strcmp(argv[i], "--verify-statuses") && !verifyStatuses) verifyStatuses = 1;
-        else if (!strcmp(argv[i], "--exit-code") && !exitChild && !selfSignal && i + 1 < argc) {
+        else if (!strcmp(argv[i], "--exit-code") && !exitChild && !selfSignal && !waitSignal && i + 1 < argc) {
             if (parseCount(argv[++i], 0, 255, &exitCode)) return usage(argv[0]);
             exitChild = 1;
-        } else if (!strcmp(argv[i], "--self-signal") && !selfSignal && !exitChild && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "--self-signal") && !selfSignal && !waitSignal && !exitChild && i + 1 < argc) {
             if (parseCount(argv[++i], 1, NSIG - 1, &selfSignal)) return usage(argv[0]);
+        } else if (!strcmp(argv[i], "--wait-signal") && !selfSignal && !waitSignal && !exitChild && i + 1 < argc) {
+            if (parseCount(argv[++i], 1, NSIG - 1, &waitSignal)) return usage(argv[0]);
         } else if (!strcmp(argv[i], "--child-gate-fd") && !hasGate && i + 1 < argc) {
             if (parseCount(argv[++i], 0, INT_MAX, &gateFD)) return usage(argv[0]);
             hasGate = 1;
+        } else if (!strcmp(argv[i], "--child-ready-fd") && !hasReady && i + 1 < argc) {
+            if (parseCount(argv[++i], 0, INT_MAX, &readyFD)) return usage(argv[0]);
+            hasReady = 1;
         } else return usage(argv[0]);
     }
-    if (exitChild || selfSignal) {
+    if (exitChild || selfSignal || waitSignal) {
         if (verifyStatuses || hasRepeat || debugDelay || stopBeforeSpawn) return usage(argv[0]);
+        if (waitSignal ? !hasGate || !hasReady || gateFD == readyFD : hasReady) return usage(argv[0]);
+        unsigned signalNumber = selfSignal ? selfSignal : waitSignal;
+        if (signalNumber) {
+            struct sigaction action = {.sa_handler = SIG_DFL};
+            sigemptyset(&action.sa_mask);
+            sigset_t unblocked;
+            sigemptyset(&unblocked); sigaddset(&unblocked, (int)signalNumber);
+            if (signalNumber != SIGKILL && signalNumber != SIGSTOP && sigaction((int)signalNumber, &action, NULL)) return 125;
+            if (sigprocmask(SIG_UNBLOCK, &unblocked, NULL)) return 125;
+        }
+        if (waitSignal) {
+            ssize_t count;
+            do { count = write((int)readyFD, "r", 1); } while (count < 0 && errno == EINTR);
+            close((int)readyFD);
+            if (count != 1) return 125;
+        }
         if (hasGate) {
             char byte;
             ssize_t count;
@@ -197,15 +268,10 @@ int main(int argc, char *argv[]) {
             if (count != 1) return 125;
         }
         if (exitChild) return (int)exitCode;
-        struct sigaction action = {.sa_handler = SIG_DFL};
-        sigemptyset(&action.sa_mask);
-        sigset_t unblocked;
-        sigemptyset(&unblocked); sigaddset(&unblocked, (int)selfSignal);
-        if (selfSignal != SIGKILL && selfSignal != SIGSTOP && sigaction((int)selfSignal, &action, NULL)) return 125;
-        if (sigprocmask(SIG_UNBLOCK, &unblocked, NULL) || raise((int)selfSignal)) return 125;
+        if (selfSignal) raise((int)selfSignal);
         return 125;
     }
-    if (hasGate) return usage(argv[0]);
+    if (hasGate || hasReady) return usage(argv[0]);
     struct sigaction action = {.sa_handler = childSignal};
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGCHLD, &action, NULL)) { perror("[spawn-probe] SIGCHLD handler"); return 1; }

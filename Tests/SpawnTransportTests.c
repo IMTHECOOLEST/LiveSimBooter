@@ -8,7 +8,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +22,19 @@
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
 static unsigned openDescriptorCount(void);
-enum { MalformedBootstrapCount = 11 };
+enum { MalformedBootstrapCount = 11, MalformedKillCount = 12 };
+static volatile sig_atomic_t childSignals;
+static volatile sig_atomic_t signalAcknowledgementFD = -1;
+
+static void childSignal(int number) {
+    int savedErrno = errno;
+    if (number == SIGCHLD) {
+        ++childSignals;
+        // An async-safe acknowledgement proves the handler ran while the broker still withheld the KILL reply.
+        (void)pwrite(signalAcknowledgementFD, "s", 1, 6);
+    }
+    errno = savedErrno;
+}
 
 int LSBTestCopyBrokerPort(mach_port_t *port) {
     mach_port_array_t ports = NULL;
@@ -69,6 +83,43 @@ static void testMalformedRequest(const LSBSpawnPlan *plan, unsigned variant) {
     xpc_dictionary_set_value(request, "fds", fds);
     xpc_release(fds);
     if (variant == 0) xpc_dictionary_set_string(request, "kind", "not an integer");
+    xpc_object_t reply = NULL;
+    assert(!xpc_pipe_routine(pipe, request, &reply));
+    assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
+    xpc_release(reply);
+    xpc_release(request);
+    xpc_release(pipe);
+    mach_port_deallocate(mach_task_self(), port);
+    assert(!LSBRequireSingleThread());
+}
+
+static void testMalformedKill(unsigned variant) {
+    mach_port_t port;
+    assert(!LSBTestCopyBrokerPort(&port));
+    xpc_object_t pipe = xpc_pipe_create_from_port(port, 0);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    assert(pipe && request);
+    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_KILL);
+    xpc_dictionary_set_uint64(request, "request-id", variant == 10 ? 77 : 0);
+    xpc_dictionary_set_int64(request, "error", variant == 11 ? EACCES : 0);
+    if (variant != 0) xpc_dictionary_set_int64(request, "target-pid", 4242);
+    if (variant == 1) xpc_dictionary_set_uint64(request, "target-pid", 4242);
+    if (variant == 2) xpc_dictionary_set_int64(request, "target-pid", (int64_t)INT_MAX + 1);
+    if (variant == 3) xpc_dictionary_set_int64(request, "target-pid", (int64_t)INT_MIN - 1);
+    if (variant != 4) xpc_dictionary_set_int64(request, "signal", SIGTERM);
+    if (variant == 5) xpc_dictionary_set_uint64(request, "signal", SIGTERM);
+    if (variant == 6) xpc_dictionary_set_int64(request, "signal", (int64_t)INT_MAX + 1);
+    if (variant == 7) xpc_dictionary_set_int64(request, "signal", (int64_t)INT_MIN - 1);
+    if (variant == 8) xpc_dictionary_set_data(request, "plan", "unexpected", 10);
+    if (variant == 9) {
+        xpc_object_t fds = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(STDERR_FILENO);
+        assert(fds && descriptor);
+        xpc_array_append_value(fds, descriptor);
+        xpc_dictionary_set_value(request, "fds", fds);
+        xpc_release(descriptor);
+        xpc_release(fds);
+    }
     xpc_object_t reply = NULL;
     assert(!xpc_pipe_routine(pipe, request, &reply));
     assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
@@ -157,6 +208,21 @@ static int client(void) {
     assert(read(received[0], &byte, 1) == 1 && byte == 'b' && lseek(fd, 0, SEEK_CUR) == 2);
     close(received[0]);
     assert(!LSBTransportReady(reply.requestID, 0));
+    signalAcknowledgementFD = fd;
+    struct sigaction action = {.sa_handler = childSignal}, previousAction;
+    sigemptyset(&action.sa_mask);
+    assert(!sigaction(SIGCHLD, &action, &previousAction));
+    assert(LSBTransportKill(4242, -1) == EINVAL && LSBTransportKill(4242, NSIG) == EINVAL);
+    assert(LSBTransportKill(0, 0) == ENOTSUP && LSBTransportKill(-1, SIGTERM) == ENOTSUP && LSBTransportKill(-20, SIGTERM) == ENOTSUP);
+    assert(!LSBTransportKill(4242, 0));
+    assert(!LSBTransportKill(4242, SIGTERM));
+    assert(childSignals == 1);
+    assert(LSBTransportKill(4242, SIGKILL) == ESRCH);
+    assert(LSBTransportKill(4242, SIGTERM) == EPROTO);
+    assert(LSBTransportKill(4242, SIGTERM) == EPROTO);
+    assert(!LSBRequireSingleThread());
+    assert(!sigaction(SIGCHLD, &previousAction, NULL));
+    signalAcknowledgementFD = -1;
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportCheckIn(&reply, received) == EPROTO);
@@ -172,6 +238,7 @@ static int client(void) {
     assert(LSBTransportSpawn(&plan, fds, &pid) == EACCES && pid == 0);
     assert(LSBTransportSpawn(&plan, fds, &pid) == EPROTO && pid == 0);
     for (unsigned variant = 0; variant < 5; ++variant) testMalformedRequest(&plan, variant);
+    for (unsigned variant = 0; variant < MalformedKillCount; ++variant) testMalformedKill(variant);
     assert(LSBTransportReady(77, ENOEXEC) == ENOEXEC);
     assert(!LSBRequireSingleThread());
     close(fd);
@@ -196,7 +263,7 @@ static int client(void) {
             statistics.sentInline, statistics.sentOOL, statistics.receivedInline, statistics.receivedOOL, statistics.receiveRetries);
     assert(statistics.sentInline && statistics.receivedInline);
 #endif
-    puts("SpawnTransport child: payload, shared FD, error, malformed-message and single-thread checks passed");
+    puts("SpawnTransport child: payload, shared FD, kill requests/replies with SIGCHLD pending, malformed-message and single-thread checks passed");
     return 0;
 }
 
@@ -312,6 +379,24 @@ static int host(const char *executable) {
     assert(pread(bootstrap.status, shared, sizeof(shared), 0) == sizeof(shared) && !memcmp(shared, "shared", sizeof(shared)));
     assert(!LSBTransportReply(&message, 0, child, 77, NULL, NULL, NULL));
     LSBTransportDisposeMessage(&message);
+    const int signals[] = {0, SIGTERM, SIGKILL, SIGTERM, SIGTERM};
+    for (unsigned variant = 0; variant < sizeof(signals) / sizeof(signals[0]); ++variant) {
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_KILL && !message.requestID && !message.error);
+        assert(message.audit.val[5] == (unsigned)child && message.targetPID == 4242 && message.signalNumber == signals[variant]);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        if (variant == 1) {
+            assert(!kill(child, SIGCHLD));
+            char acknowledged = 0;
+            for (unsigned attempt = 0; attempt < 1000 && acknowledged != 's'; ++attempt) {
+                ssize_t count = pread(pending.fds[0], &acknowledged, 1, 6);
+                assert(count >= 0);
+                if (acknowledged != 's') usleep(1000);
+            }
+            assert(acknowledged == 's');
+        }
+        assert(!LSBTransportReply(&message, variant == 2 ? ESRCH : 0, variant == 3 ? 4243 : 4242, variant == 4 ? 77 : 0, NULL, NULL, NULL));
+        LSBTransportDisposeMessage(&message);
+    }
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
         unsigned before = openDescriptorCount();
@@ -334,6 +419,12 @@ static int host(const char *executable) {
     xpc_release(invalid);
     LSBTransportDisposeMessage(&message);
     for (unsigned variant = 0; variant < 5; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        assert(openDescriptorCount() == before);
+    }
+    for (unsigned variant = 0; variant < MalformedKillCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);

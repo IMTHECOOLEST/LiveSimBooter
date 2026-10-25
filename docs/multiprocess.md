@@ -1,7 +1,7 @@
 # Simulator processes through LiveProcess
 
 The native `LiveSimBooter` app now has a minimal UIKit foreground window and acts as a launch broker. Every simulator program
-runs in a separate `LiveProcess.appex` instance. The implementation intercepts `posix_spawn`, `posix_spawnp`, `wait`, and `waitpid`; it does
+runs in a separate `LiveProcess.appex` instance. The implementation intercepts `posix_spawn`, `posix_spawnp`, `wait`, `waitpid`, and `kill`; it does
 not implement a complete POSIX process tree or boot `launchd_sim`.
 
 The matching iOS 26 runtime remains the target. The spawn attribute and file-action decoder is pinned to the arm64 Darwin ABI
@@ -183,7 +183,33 @@ Returned PIDs identify real extension processes, but the simulator caller is not
 fork, exec replacement, and full session/process-group inheritance remain unimplemented. A default child retains its system
 launch session/group; guest waiting is provided by the separate mechanism below.
 
+## Signaling a simulated child
+
+[ChildKill.c](../Guest/ChildKill.c) interposes `kill`. The initial scope is exact positive PIDs belonging to the caller's direct
+simulated children. An exact self PID calls the simulator's original `kill` implementation without broker IPC. Other positive
+PIDs go through synchronous XPC to the authenticated broker; it rejects unknown, unrelated, and completed child jobs with
+`ESRCH`. Nonpositive selectors, including process groups, `0`, and `-1`, return `ENOTSUP`. Signals outside `[0, NSIG)` return
+`EINVAL`. Successful broker calls return 0 and preserve `errno`.
+
+The broker validates the target's full audit identity against RunningBoard before signaling. This protects against a retained
+job whose PID has already exited or been reused. `kill(child, 0)` performs only this identity check; it sends no signal, because
+the private audited signal API does not accept signal 0. For real signals the host first uses `proc_signal_with_audittoken`.
+An `EACCES` or `EPERM` response selects the same retained extension-instance UUID fallback used for SIGCHLD: launchd receives
+the request through `xpc_connection_kill`. The fallback targets that instance, not a freshly looked-up process with the same PID.
+An accepted launchd request is asynchronous; the child's exit monitor and `waitpid` establish the resulting terminal status.
+
+The guest's cross-process `kill` implementation is **not async-signal-safe**: it allocates XPC objects and performs a synchronous
+broker call. It starts no guest worker and needs the foreground host to remain runnable. It does not provide process-group
+signaling, arbitrary-process signaling, or `sigqueue` payloads. Stop/continue signals do not add stopped/continued wait events;
+the current waiting implementation still reports terminal statuses only.
+
 ## Child status, waiting, and SIGCHLD
+
+The native broker does not reap these extension instances with a native `waitpid` syscall: they are launched through
+PlugInKit/launchd, and their parent/child relationship is maintained by the broker. The guest `waitpid` reads the shared
+status ledger described below. Direct audited signaling is sandbox denied on the tested phones, so the host delegates
+delivery to launchd using the retained extension instance. Hosting an extension does not grant ordinary parent-process
+`waitpid` or signal permissions.
 
 Each guest receives a 4 KiB shared mapping with 16 child slots and a nonblocking wake-pipe reader. The host creates the backing
 file inside the App Group, unlinks it immediately, and transfers its descriptor at check-in. Native preparation maps it, closes
@@ -269,8 +295,12 @@ extension's App Group path. A newly signed executable still needs its own device
 
 [SpawnProbe.c](../Guest/SpawnProbe.c) spawns `/bin/df -h`, redirects stdout through a transferred pipe, prints the returned PID,
 and reads until EOF with a 15-second deadline. It then checks `waitpid`, raw exit status 0, SIGCHLD delivery, and `ECHILD` after reaping.
-`--verify-statuses` adds gated children that return 0, return 37, and terminate themselves with SIGTERM. Before opening each gate
-it verifies `WNOHANG=0`; subsequent waits include an any-child selector and check the exact exit/signal encoding.
+`--verify-statuses` adds gated children that return 0, return 37, and wait for parent-issued SIGTERM. The signal child resets and
+unblocks SIGTERM, writes a readiness byte, and remains blocked on its gate. After receiving readiness, the parent verifies
+`WNOHANG=0`, calls `kill(child, 0)`, then `kill(child, SIGTERM)`. It keeps the gate open until `waitpid` observes termination,
+so a delayed launchd signal cannot be confused with an EOF-induced child exit. It checks `WIFSIGNALED`, `WTERMSIG == SIGTERM`,
+raw status `0x000f`, SIGCHLD, `ECHILD` on a second wait, and `ESRCH` from `kill(child, 0)` after reaping. The exit cases retain
+their gate release and include an any-child wait selector.
 
 `--repeat N` runs between 1 and 16 sequential spawn/read/EOF iterations, defaulting to one. `--debug-delay N` waits 1–60 seconds
 after simulator startup before spawning, allowing LLDB to attach. Use `--debug-delay 60` for the verified device workflow:
@@ -298,12 +328,19 @@ wake hints, signal-handler reaping, discard policy, interrupted waits, RBS conte
 Broker tests also cover status ownership, failed reservations, parent death, and direct-signal denial falling back to the
 specific extension instance. These local tests do not establish iPhone sandbox permission or launchd delivery.
 
+[ChildKillTests.c](../Tests/ChildKillTests.c) covers invalid signals, unsupported PID selectors, signal 0, native self-signaling,
+and broker error/errno propagation. Transport tests cover kill request/reply encoding and malformed message rejection.
+The broker's kill cases cover direct-child ownership, audit generation, completed jobs, and the retained-instance fallback.
+
 The unsigned and signed app/extension builds passed, including the native UIKit shell used for the successful device run.
 The child binary's dependencies and entry point were inspected, and the nested signatures and profile entitlements were
 verified. Broker argument-preservation tests cover the default probe and explicit guest arguments/environment. The current
 host links UIKit and Foundation; the child still links only libSystem and libc++, with no Objective-C imports or sections.
 
-## Device progress, 2026-10-25
+## Original-device progress, 2026-10-25
+
+The following recorded tests predate the cross-process `kill` interposer. Their SIGTERM status case used a self-issued
+signal; they validate waiting and notification, not parent-to-child signaling.
 
 The complete wait/SIGCHLD test passed under LLDB. Foreground host PID 9918 launched simulator parent PID 9919 with
 `--debug-delay 60 --repeat 2 --verify-statuses`:

@@ -43,6 +43,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_WAIT_TESTING \
     Tests/ChildWaitTests.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -o "$test_directory/ChildWait"
 "$test_directory/ChildWait"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_KILL_TESTING \
+    Tests/ChildKillTests.c Guest/ChildKill.c -o "$test_directory/ChildKill"
+"$test_directory/ChildKill"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"

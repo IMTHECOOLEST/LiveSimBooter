@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -283,6 +284,28 @@ int LSBTransportReady(uint64_t requestID, int childError) {
     return error;
 }
 
+int LSBTransportKill(pid_t targetPID, int signalNumber) {
+    if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
+    if (targetPID <= 0) return ENOTSUP;
+    xpc_object_t request = createRequest(LSB_REQUEST_KILL, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_dictionary_set_int64(request, "target-pid", targetPID);
+    xpc_dictionary_set_int64(request, "signal", signalNumber);
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        if (!error && (requestID || (!remoteError && pid != targetPID))) error = EPROTO;
+        if (!error) error = remoteError;
+    }
+    if (reply) xpc_release(reply);
+    return error;
+}
+
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     if (!message) return;
     if (message->object) xpc_release((xpc_object_t)message->object);
@@ -358,7 +381,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     uint64_t version = 0, kind = 0;
     int64_t childError = 0;
     if (!unsignedValue(request, "version", &version) || version != LSB_TRANSPORT_VERSION ||
-        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_READY ||
+        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_KILL ||
         !unsignedValue(request, "request-id", &message->requestID) || !signedValue(request, "error", &childError) ||
         childError < 0 || childError > INT_MAX) error = EPROTO;
     if (!error) {
@@ -369,6 +392,12 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
         } else if (message->requestID || childError) error = EPROTO;
         else if (kind == LSB_REQUEST_SPAWN) error = decodePlan(request, &message->plan, message->fds);
         else if (xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds")) error = EPROTO;
+        if (!error && kind == LSB_REQUEST_KILL) {
+            int64_t target = 0, signal = 0;
+            if (!signedValue(request, "target-pid", &target) || target < INT_MIN || target > INT_MAX ||
+                !signedValue(request, "signal", &signal) || signal < INT_MIN || signal > INT_MAX) error = EPROTO;
+            else { message->targetPID = (pid_t)target; message->signalNumber = (int)signal; }
+        }
     }
     if (error) {
         (void)LSBTransportReply(message, error, 0, message->requestID, NULL, NULL, NULL);
