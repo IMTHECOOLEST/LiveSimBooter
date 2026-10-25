@@ -29,6 +29,9 @@ retains the newer format on hosts that require it. Native preparation preserves 
 and the transport adapter handles the native/simulator XPC wire-magic difference.
 See [multiprocess setup, progress, and limits](docs/multiprocess.md).
 
+The opt-in `--launchd` mode starts an isolated, empty simulator launchd bootstrap through the same C LiveProcess entry.
+See [launchd startup, its holding-tank handshake, and workqueue compatibility](docs/launchd.md) for the current experiment.
+
 Unmodified Fish 4.9.3 source, built for iOS Simulator, now runs noninteractive external commands through this runtime.
 On the iOS 26.1 phone it spawned and waited for two df children, then separately verified a Bash child exiting 37. Fish exited 0
 in both runs. Runtime interposers handle its executable-access checks and wait options. The new [fake terminal](docs/fake-pty.md)

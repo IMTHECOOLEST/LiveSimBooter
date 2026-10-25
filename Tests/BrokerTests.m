@@ -16,6 +16,7 @@ typedef struct {
     pid_t pid;
     uint64_t requestID;
     bool deliveredPlan;
+    mach_port_t launchdTank;
 } RecordedReply;
 
 typedef struct { unsigned identifier; int retainedFD; } TestMessageObject;
@@ -23,7 +24,7 @@ typedef struct { unsigned identifier; int retainedFD; } TestMessageObject;
 static RecordedReply replies[128];
 static unsigned replyCount, disposedMessages, submittedLaunches, releasedLaunches, objectSequence;
 static pid_t reportedPID;
-static int submitError, readySendError, monitorCreateError, identityCheckError, runningBoardError;
+static int submitError, readySendError, launchdBootstrapSendError, monitorCreateError, identityCheckError, runningBoardError;
 static unsigned deliveredSignals, identityChecks, runningBoardStarts, runningBoardCancels;
 static unsigned submittedExtensionSignals;
 static uint64_t signaledRequest;
@@ -108,7 +109,7 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
         for (unsigned i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
     }
     unsigned identifier = ((TestMessageObject *)message->object)->identifier;
-    replies[replyCount++] = (RecordedReply){identifier, message->kind, error, sendError, pid, requestID, plan != NULL};
+    replies[replyCount++] = (RecordedReply){identifier, message->kind, error, sendError, pid, requestID, plan != NULL, MACH_PORT_NULL};
     releaseMessageObject(message->object);
     message->object = NULL;
     return sendError;
@@ -119,6 +120,19 @@ int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid
     struct stat metadata;
     assert(!fstat(statusFD, &metadata) && metadata.st_size == LSB_CHILD_STATUS_MAPPING_SIZE);
     return LSBTransportReply(message, error, pid, requestID, root, plan, fds);
+}
+int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
+                                      const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, mach_port_t tank) {
+    mach_port_type_t type = 0;
+    assert(tank && mach_port_type(mach_task_self(), tank, &type) == KERN_SUCCESS && (type & MACH_PORT_TYPE_SEND));
+    LSBJob *job = findJob(requestID);
+    assert(job && job.simulatorLaunchd && job.launchdSource && job.launchdHandshake);
+    assert(tank == LSBLaunchdHandshakeTankPort(job.launchdHandshake) && !job.launchdHandshake->completed);
+    assert(!memcmp(&message->audit, &job.launchdHandshake->expectedAudit, sizeof(message->audit)));
+    int result = LSBTransportReplyBootstrap(message, error, pid, requestID, root, plan, fds, statusFD, wakeFD);
+    replies[replyCount - 1].launchdTank = tank;
+    if (launchdBootstrapSendError) replies[replyCount - 1].sendError = result = launchdBootstrapSendError;
+    return result;
 }
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     assert(message);
@@ -135,6 +149,8 @@ static void resetBroker(void) {
     for (LSBJob *job in jobs) {
         if (job.exitMonitor) dispatch_source_cancel(job.exitMonitor);
         job.exitMonitor = nil;
+        if (job.launchdSource) dispatch_source_cancel(job.launchdSource);
+        job.launchdSource = nil;
         if (job.runningBoardMonitor) LSBRunningBoardMonitorCancel(job.runningBoardMonitor);
         job.runningBoardMonitor = nil;
         if (job.request) disposeMessage(job.request);
@@ -146,7 +162,7 @@ static void resetBroker(void) {
     nextIdentifier = 1;
     launchLaneFailed = NO;
     reportedPID = getpid();
-    submitError = readySendError = monitorCreateError = identityCheckError = 0;
+    submitError = readySendError = launchdBootstrapSendError = monitorCreateError = identityCheckError = 0;
     runningBoardError = EACCES;
     deliveredSignals = identityChecks = finishingDepth = 0;
     runningBoardStarts = runningBoardCancels = 0;
@@ -564,6 +580,144 @@ static void testKillFallbackErrors(void) {
     assert(findJob(child.identifier) && jobs.count == 2);
 }
 
+static audit_token_t ownAudit(void) {
+    audit_token_t token;
+    mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+    assert(!task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&token, &count));
+    assert(count == TASK_AUDIT_TOKEN_COUNT && token.val[5] == (unsigned)getpid());
+    return token;
+}
+
+static bool hasRight(mach_port_t port, mach_port_type_t right) {
+    mach_port_type_t type = 0;
+    return !mach_port_type(mach_task_self(), port, &type) && (type & right);
+}
+
+static void runMainQueueUntil(BOOL (^done)(void)) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2];
+    while (!done() && deadline.timeIntervalSinceNow > 0)
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.001]];
+    assert(done());
+}
+
+static LSBReceivedMessage *launchdRequest(int *fd, unsigned *object, const char *path, const char *marker) {
+    LSBReceivedMessage *message = spawnRequest(fd, object);
+    assert(!LSBPlanAddString(&message->plan, path, &message->plan.path));
+    message->plan.argv[0] = message->plan.path;
+    if (marker) {
+        assert(!LSBPlanAddString(&message->plan, marker, &message->plan.envp[0]));
+        message->plan.envc = 1;
+    }
+    return message;
+}
+
+static LSBJob *checkInLaunchd(unsigned *parentObject) {
+    int fd;
+    enqueueSpawn(launchdRequest(&fd, parentObject, "/sbin/launchd_sim", "LSB_SIMULATOR_LAUNCHD=1"), nil);
+    LSBJob *job = startingJob;
+    assert(job.simulatorLaunchd);
+    audit_token_t audit = ownAudit();
+    LSBReceivedMessage *checkIn = messageFor(LSB_REQUEST_CHECKIN, getpid(), audit.val[7], 0);
+    checkIn->audit = audit;
+    handleMessage(checkIn);
+    assertClosed(fd);
+    return job;
+}
+
+static void testLaunchdModeRequiresInitialPathAndMarker(void) {
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        resetBroker();
+        LSBJob *parent = nil;
+        if (variant == 3) {
+            parent = [LSBJob new];
+            parent.identifier = 99;
+            assert(!prepareChildStatus(parent));
+        }
+        int fd;
+        unsigned object;
+        const char *path = variant == 0 ? "/bin/df" : "/sbin/launchd_sim";
+        const char *marker = variant == 1 ? NULL : variant == 2 ? "LSB_SIMULATOR_LAUNCHD=0" : "LSB_SIMULATOR_LAUNCHD=1";
+        enqueueSpawn(launchdRequest(&fd, &object, path, marker), parent);
+        assert(startingJob && !startingJob.simulatorLaunchd);
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 71, 0));
+        assert(planReplies() == 1 && !replies[replyCount - 1].launchdTank && !startingJob.launchdHandshake && !startingJob.launchdSource);
+        finishJob(startingJob, ECANCELED);
+        assert(replyFor(object)->error == ECANCELED);
+        assertClosed(fd);
+    }
+}
+
+static void testLaunchdHandshakeDispatchAndRights(void) {
+    resetBroker();
+    __weak LSBJob *retired;
+    mach_port_t service, replyPort;
+    @autoreleasepool {
+        unsigned object;
+        LSBJob *job = checkInLaunchd(&object);
+        retired = job;
+        mach_port_t tank = replies[replyCount - 1].launchdTank;
+        service = job.launchdHandshake->serviceSend;
+        assert(tank && job.launchdSource && hasRight(tank, MACH_PORT_TYPE_RECEIVE) && !replyFor(object));
+        handleMessage(messageFor(LSB_REQUEST_READY, getpid(), job.pidVersion, job.identifier));
+        assert(job.phase == JobRunning && replyFor(object) && !replyFor(object)->error);
+        assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &replyPort));
+        mach_msg_header_t request = {
+            .msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE),
+            .msgh_size = sizeof(request), .msgh_remote_port = tank, .msgh_local_port = replyPort, .msgh_id = 708
+        };
+        assert(!mach_msg(&request, MACH_SEND_MSG, sizeof(request), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL));
+        runMainQueueUntil(^BOOL{ return job.launchdHandshake->completed && !job.launchdHandshake->tankReceive; });
+        assert(!job.launchdSource && !job.launchdHandshake->tankSend && !job.launchdHandshake->serviceReceive);
+        assert(!hasRight(tank, MACH_PORT_TYPE_SEND | MACH_PORT_TYPE_RECEIVE));
+        assert(hasRight(service, MACH_PORT_TYPE_SEND) && !hasRight(service, MACH_PORT_TYPE_RECEIVE));
+        struct {
+            mach_msg_header_t header;
+            mach_msg_body_t body;
+            mach_msg_port_descriptor_t service;
+            mach_msg_trailer_t trailer;
+        } response = {0};
+        assert(!mach_msg(&response.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(response), replyPort, 0, MACH_PORT_NULL));
+        assert(response.header.msgh_id == 808 && response.header.msgh_size == 40 && (response.header.msgh_bits & MACH_MSGH_BITS_COMPLEX));
+        assert(response.body.msgh_descriptor_count == 1 && response.service.name == service);
+        assert(response.service.type == MACH_MSG_PORT_DESCRIPTOR && response.service.disposition == MACH_MSG_TYPE_MOVE_RECEIVE);
+        assert(hasRight(service, MACH_PORT_TYPE_RECEIVE) && hasRight(service, MACH_PORT_TYPE_SEND));
+        finishJob(job, 0);
+        // Only the service send right belongs to the broker now; the received endpoint must survive job disposal.
+        assert(!jobs.count && !startingJob && hasRight(service, MACH_PORT_TYPE_SEND));
+    }
+    runMainQueueUntil(^BOOL{ return retired == nil; });
+    assert(hasRight(service, MACH_PORT_TYPE_RECEIVE) && !hasRight(service, MACH_PORT_TYPE_SEND));
+    assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
+    assert(!mach_port_mod_refs(mach_task_self(), replyPort, MACH_PORT_RIGHT_RECEIVE, -1));
+}
+
+static void testLaunchdCancellationAndFailedBootstrap(void) {
+    for (unsigned failedSend = 0; failedSend < 2; ++failedSend) {
+        resetBroker();
+        __weak LSBJob *retired;
+        mach_port_t tank, service;
+        @autoreleasepool {
+            unsigned object;
+            launchdBootstrapSendError = failedSend ? EPIPE : 0;
+            LSBJob *job = checkInLaunchd(&object);
+            retired = job;
+            tank = job.launchdHandshake->tankReceive;
+            service = job.launchdHandshake->serviceReceive;
+            assert(tank && service && !job.launchdHandshake->completed);
+            if (!failedSend) finishJob(job, ECANCELED);
+            assert(!jobs.count && !startingJob && !job.launchdSource && !launchLaneFailed);
+            assert(replyFor(object)->error == (failedSend ? EPIPE : ECANCELED));
+            // finishJob cancels the watch; its cancellation handler owns the later RECEIVE-right destruction.
+            assert(hasRight(tank, MACH_PORT_TYPE_RECEIVE) && hasRight(service, MACH_PORT_TYPE_RECEIVE));
+            runMainQueueUntil(^BOOL{ return !job.launchdHandshake->tankReceive; });
+            assert(!job.launchdHandshake->tankSend && hasRight(service, MACH_PORT_TYPE_RECEIVE));
+        }
+        runMainQueueUntil(^BOOL{ return retired == nil; });
+        assert(!hasRight(tank, MACH_PORT_TYPE_RECEIVE | MACH_PORT_TYPE_SEND | MACH_PORT_TYPE_DEAD_NAME));
+        assert(!hasRight(service, MACH_PORT_TYPE_RECEIVE | MACH_PORT_TYPE_SEND | MACH_PORT_TYPE_DEAD_NAME));
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         alarm(10);
@@ -581,8 +735,11 @@ int main(void) {
         testParentDeathDetachesOrphans();
         testKillAuthenticationAndExit();
         testKillFallbackErrors();
+        testLaunchdModeRequiresInitialPathAndMarker();
+        testLaunchdHandshakeDispatchAndRights();
+        testLaunchdCancellationAndFailedBootstrap();
         resetBroker();
-        puts("Broker: authentication, lifecycle, FD ownership, exit status, token-safe kill, launchd fallback, repeated reap, and orphan cleanup passed");
+        puts("Broker: authentication, FD ownership, exit/kill, orphan cleanup, launchd mode, Mach handoff, and source cancellation passed");
     }
     return 0;
 }

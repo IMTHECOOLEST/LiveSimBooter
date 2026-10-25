@@ -3,6 +3,7 @@
 #include "PrivateXPC.h"
 #include "ChildStatus.h"
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -17,6 +18,8 @@ static LSBMappedImage loader, executable;
 static LSBChildStatus *childStatus;
 
 static void closeStatus(void) {
+    if (MACH_PORT_VALID(launch.launchdTankPort)) mach_port_deallocate(mach_task_self(), launch.launchdTankPort);
+    launch.launchdTankPort = MACH_PORT_NULL;
     if (launch.statusFD >= 0) close(launch.statusFD);
     if (launch.wakeFD >= 0) close(launch.wakeFD);
     launch.statusFD = launch.wakeFD = -1;
@@ -85,6 +88,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) if (received[i] >= 0) { close(received[i]); received[i] = -1; }
     char executablePath[PATH_MAX], dyldPath[PATH_MAX], insertLibrary[PATH_MAX + 32], brokerEnvironment[64], detail[1024] = {0};
     char statusEnvironment[64], wakeEnvironment[64];
+    char workqueueStartEnvironment[80], workqueueFeaturesEnvironment[80];
     mach_port_t brokerPort = MACH_PORT_NULL;
     if (!error) error = resolveExecutable(executablePath);
     int length = snprintf(dyldPath, sizeof(dyldPath), "%s/usr/lib/dyld_sim", launch.runtimeRoot);
@@ -95,6 +99,18 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     if (!error && !LSBMapSimExecutable(executablePath, &executable, detail, sizeof(detail))) error = ENOEXEC;
     // Keep only a kernel send right across detachment; simulator libxpc cannot look up services without simulator launchd.
     if (!error) error = LSBTransportCopyBrokerPort(&brokerPort);
+    if (!error) {
+        uintptr_t workqueueStart = (uintptr_t)dlsym(RTLD_DEFAULT, "start_wqthread");
+        int (*features)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "_pthread_workqueue_supported");
+        if (!workqueueStart || !features) error = ENOTSUP;
+        else {
+            // Retain only numeric metadata; guest code never calls these native-cache function pointers after detachment.
+            __asm__("xpaci %0" : "+r"(workqueueStart));
+            snprintf(workqueueStartEnvironment, sizeof(workqueueStartEnvironment), "LSB_HOST_WORKQUEUE_START=0x%llx",
+                     (unsigned long long)workqueueStart);
+            snprintf(workqueueFeaturesEnvironment, sizeof(workqueueFeaturesEnvironment), "LSB_HOST_WORKQUEUE_FEATURES=0x%x", features());
+        }
+    }
     snprintf(brokerEnvironment, sizeof(brokerEnvironment), "LSB_BROKER_PORT=%u", brokerPort);
     snprintf(statusEnvironment, sizeof(statusEnvironment), LSB_CHILD_STATUS_ENV "=0x%llx", (unsigned long long)(uintptr_t)childStatus);
     snprintf(wakeEnvironment, sizeof(wakeEnvironment), LSB_CHILD_WAKE_FD_ENV "=%d", launch.wakeFD);
@@ -112,7 +128,19 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         closeStatus();
         fprintf(stderr, "[LiveProcess] Native worker appeared before handoff: %s\n", strerror(error)); return 1;
     }
-    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 5];
+    if (MACH_PORT_VALID(launch.launchdTankPort)) {
+        // The native host supplies the one-shot tank endpoint; launchd_sim retrieves its own receive right through MIG 708.
+        kern_return_t status = task_set_bootstrap_port(mach_task_self(), launch.launchdTankPort);
+        if (status) {
+            fprintf(stderr, "[LiveProcess] Cannot install launchd tank bootstrap: %d\n", status);
+            mach_port_deallocate(mach_task_self(), brokerPort);
+            closeStatus();
+            return 1;
+        }
+        mach_port_deallocate(mach_task_self(), launch.launchdTankPort);
+        launch.launchdTankPort = MACH_PORT_NULL;
+    }
+    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 7];
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
@@ -125,6 +153,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
             continue;
         }
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
+            strncmp(entry, "LSB_HOST_WORKQUEUE_START=", sizeof("LSB_HOST_WORKQUEUE_START=") - 1) &&
+            strncmp(entry, "LSB_HOST_WORKQUEUE_FEATURES=", sizeof("LSB_HOST_WORKQUEUE_FEATURES=") - 1) &&
             strncmp(entry, LSB_CHILD_STATUS_ENV "=", sizeof(LSB_CHILD_STATUS_ENV)) &&
             strncmp(entry, LSB_CHILD_WAKE_FD_ENV "=", sizeof(LSB_CHILD_WAKE_FD_ENV))) environment[count++] = entry;
     }
@@ -132,6 +162,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     environment[count++] = brokerEnvironment;
     environment[count++] = statusEnvironment;
     environment[count++] = wakeEnvironment;
+    environment[count++] = workqueueStartEnvironment;
+    environment[count++] = workqueueFeaturesEnvironment;
     environment[count] = NULL;
     fprintf(stderr, "[LiveProcess] pid=%d entering %s with %u arguments\n", getpid(), executablePath, launch.plan.argc);
     if (stopBeforeHandoff) {

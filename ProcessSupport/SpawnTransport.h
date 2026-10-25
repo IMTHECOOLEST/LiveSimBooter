@@ -11,6 +11,7 @@ typedef struct {
     uint64_t requestID;
     int32_t error, pid;
     int statusFD, wakeFD;
+    mach_port_t launchdTankPort;
     char runtimeRoot[LSB_PATH_BYTES];
     LSBSpawnPlan plan;
 } LSBBootstrapReply;
@@ -51,6 +52,9 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
 // A successful CheckIn returns these in reply.statusFD/wakeFD. The caller must close them separately from the plan FDs.
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD);
+// Optional launchd-only temporary bootstrap send right. CheckIn returns an owned send reference; the caller must release it.
+int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                                      const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, mach_port_t tankPort);
 // Only pass a message initialized by Receive, and do not reuse it for another Receive before disposal.
 void LSBTransportDisposeMessage(LSBReceivedMessage *message);
 // Reject handoff if a native transport worker remains; called after all native IPC objects have been released.

@@ -73,6 +73,31 @@ static void check(bool condition, const char *message) {
     if (!condition) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
+static std::string expectedMainStack() {
+    char value[96];
+    snprintf(value, sizeof(value), "main_stack=0x%llx,0x%llx,0x0,0x0",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self()))),
+             static_cast<unsigned long long>(pthread_get_stacksize_np(pthread_self())));
+    return value;
+}
+
+static void checkAndConsumeMainStack(const char *value) {
+    check(std::string(value) == expectedMainStack(), "main_stack uses real native bounds and zero allocation metadata");
+    memset(const_cast<char *>(value) + 11, 0, strlen(value) - 11);
+    check(std::string(value) == "main_stack=", "simulator can consume and erase its own main stack metadata");
+}
+
+static void mainStackBoundsTest() {
+    check(mainStackContains(0x18000, 0x8000, 0x10000), "native stack includes its bottom address");
+    check(mainStackContains(0x18000, 0x8000, 0x17fff), "native stack includes its final byte");
+    check(!mainStackContains(0x18000, 0x8000, 0x18000), "native stack excludes its top address");
+    check(!mainStackContains(0x18000, 0x8000, 0xffff), "native stack rejects an address below its allocation");
+    check(!mainStackContains(0x18000, 0, 0x17000), "native stack size must be nonzero");
+    check(!mainStackContains(0, 0x8000, 0), "native stack top must be nonzero");
+    check(!mainStackContains(0x18000, SIZE_MAX, 0x17000), "native stack subtraction cannot wrap");
+    check(!mainStackContains(0x18000, 0x18000, 0x17000), "native stack cannot extend to the null page");
+}
+
 using Bytes = std::vector<uint8_t>;
 static constexpr uint64_t preferred = 0x100000000, entryOffset = 1024;
 static const size_t page = static_cast<size_t>(getpagesize());
@@ -430,13 +455,16 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
     check(diagnosticSettings == 2 && environmentCount == 5, "no default simulator diagnostics are injected");
     check(std::string(envp[1]) == "DYLD_PRINT_TO_STDERR=0" && std::string(envp[2]) == "DYLD_PRINT_TO_FILE=/old.log", "diagnostic output is unchanged");
     check(apple == envp + environmentCount + 1, "apple vector follows expanded environment contiguously");
-    unsigned executablePaths = 0, preservedApple = 0, ptrMungeTokens = 0;
+    unsigned executablePaths = 0, preservedApple = 0, mainStacks = 0, ptrMungeTokens = 0;
     for (const char *const *item = apple; *item; ++item) {
         std::string value = *item;
         check(value.rfind("executable_file=", 0) != 0, "host executable file identity is removed");
         if (value.rfind("executable_path=", 0) == 0) {
             ++executablePaths;
             check(value == "executable_path=/RuntimeRoot/bin/df", "apple executable path names mapped df");
+        } else if (value.rfind("main_stack=", 0) == 0) {
+            ++mainStacks;
+            checkAndConsumeMainStack(*item);
         } else if (value.rfind("ptr_munge=", 0) == 0) {
             ++ptrMungeTokens;
             check(value.rfind("ptr_munge=0x", 0) == 0, "token includes the prefix required by Apple's pthread parser");
@@ -451,6 +479,7 @@ static FakeMain fakeEntry(int argc, const char *const argv[], const char *const 
         }
     }
     check(executablePaths == 1 && preservedApple == 1, "apple has one replacement executable path and preserved values");
+    check(mainStacks == 1, "all consumed or stale main_stack entries are replaced exactly once");
     check(ptrMungeTokens == 1 && randomCalls == 2, "all inherited tokens are replaced and zero random values are retried");
     check(executable == &fakeExecutable && dyld == &fakeDyld && slide == 42 && helpers == &fakeHelpers, "entry ABI image and helper arguments");
     check(initializedHeader == dyld && initializedPath == "/RuntimeRoot/usr/lib/dyld_sim", "process info initialized before entry");
@@ -484,7 +513,7 @@ struct TerminalStartupFixture {
                        "LSB_FAKE_PTY_STATE=/RuntimeRoot/.terminal-state", "DYLD_INSERT_LIBRARIES=/RuntimeRoot/usr/lib/libLiveSimSpawn.dylib",
                        "DYLD_ROOT_PATH=/old", "DYLD_SHARED_CACHE_DIR=/old-cache"};
         apple = {"executable_path=/app/LiveProcess", "executable_file=0x123,0x456", "stack_guard=0x1234",
-                 "main_stack=0x100000,0x10000", "ptr_munge=", "ptr_munge=0x1234"};
+                 "main_stack=0x100000,0x10000", "main_stack=", "ptr_munge=", "ptr_munge=0x1234"};
         if (large) {
             // Force repeated vector reallocations and both short-string and heap-backed storage.
             for (unsigned i = 0; i < 240; ++i) {
@@ -496,6 +525,7 @@ struct TerminalStartupFixture {
             environment.emplace_back("DYLD_SHARED_CACHE_DIR=/second-old-cache");
             apple.emplace_back("executable_path=/second-old-app");
             apple.emplace_back("executable_file=0x789,0xabc");
+            apple.emplace_back("main_stack=0x180000,0x1000,0x170000,0x11000");
             apple.emplace_back("ptr_munge=0xffff");
         }
         for (const auto &item : environment)
@@ -503,9 +533,11 @@ struct TerminalStartupFixture {
         expectedEnvironment.emplace_back("DYLD_ROOT_PATH=/RuntimeRoot");
         expectedEnvironment.emplace_back("DYLD_SHARED_CACHE_DIR=/RuntimeRoot/System/Library/Caches/com.apple.dyld");
         for (const auto &item : apple)
-            if (item.rfind("executable_path=", 0) != 0 && item.rfind("executable_file=", 0) != 0 && item.rfind("ptr_munge=", 0) != 0)
+            if (item.rfind("executable_path=", 0) != 0 && item.rfind("executable_file=", 0) != 0 &&
+                item.rfind("main_stack=", 0) != 0 && item.rfind("ptr_munge=", 0) != 0)
                 expectedApple.push_back(item);
         expectedApple.emplace_back("executable_path=/RuntimeRoot/bin/fish");
+        expectedApple.emplace_back(expectedMainStack());
         expectedApple.emplace_back("ptr_munge=0xa739c450e16b28df");
     }
 
@@ -552,6 +584,7 @@ static FakeMain terminalEntry(int argc, const char *const argv[], const char *co
     fixture.checkVector(apple, fixture.expectedApple, "terminal apple contents and replacement order survive native allocation");
     check(randomCalls == 2, "terminal startup retries zero before generating a fresh pointer token");
     size_t tokenIndex = fixture.expectedApple.size() - 1;
+    checkAndConsumeMainStack(apple[tokenIndex - 1]);
     char *token = const_cast<char *>(apple[tokenIndex]);
     check(strncmp(token, "ptr_munge=0x", 12) == 0 && !apple[tokenIndex + 1], "fresh pointer token is the final apple entry");
     size_t tokenLength = strlen(token);
@@ -607,7 +640,8 @@ static void entryTest() {
     const char *argv[] = {"/RuntimeRoot/bin/df", "arg", nullptr};
     const char *envp[] = {"DYLD_ROOT_PATH=/old", "KEEP=value", "DYLD_SHARED_CACHE_DIR=/old-cache", "DYLD_PRINT_TO_STDERR=0",
                           "DYLD_PRINT_TO_FILE=/old.log", nullptr};
-    const char *apple[] = {"executable_path=/app", "executable_file=0x123,0x456", "stack_guard=0x1234", "ptr_munge=", "ptr_munge=0x1234", nullptr};
+    const char *apple[] = {"executable_path=/app", "executable_file=0x123,0x456", "stack_guard=0x1234", "ptr_munge=", "ptr_munge=0x1234",
+                           "main_stack=", "main_stack=0x1,0x2,0x3,0x4", nullptr};
     auto enter = [&] {
         return LSBEnterDyldSim(&image, &fakeExecutable, "/RuntimeRoot/bin/df", "/RuntimeRoot/usr/lib/dyld_sim", "/RuntimeRoot", 2, argv, envp, apple);
     };
@@ -617,7 +651,23 @@ static void entryTest() {
     check(std::string(envp[3]) == "DYLD_PRINT_TO_STDERR=0", "simulator environment copy leaves host diagnostics untouched");
     check(std::string(envp[4]) == "DYLD_PRINT_TO_FILE=/old.log", "simulator logging leaves inherited host output path untouched");
     check(std::string(apple[3]) == "ptr_munge=" && std::string(apple[4]) == "ptr_munge=0x1234", "simulator token erasure leaves host apple data untouched");
+    check(std::string(apple[5]) == "main_stack=" && std::string(apple[6]) == "main_stack=0x1,0x2,0x3,0x4", "stack erasure leaves host apple untouched");
     check(enter() == 1 && entryCalls == 1, "second entry is rejected");
+}
+
+static void offMainEntryTest() {
+    pthread_t worker;
+    int result = 0;
+    int error = pthread_create(&worker, nullptr, [](void *context) -> void * {
+        LSBMappedImage image = {&fakeDyld, 0, 42, reinterpret_cast<uintptr_t>(&fakeEntry)};
+        const char *argv[] = {"/RuntimeRoot/bin/df", nullptr};
+        *static_cast<int *>(context) = LSBEnterDyldSim(&image, &fakeExecutable, argv[0], "/RuntimeRoot/usr/lib/dyld_sim", "/RuntimeRoot",
+                                                    1, argv, nullptr, nullptr);
+        return nullptr;
+    }, &result);
+    check(!error, "create a native worker to exercise the main-thread handoff guard");
+    check(!pthread_join(worker, nullptr), "join the rejected handoff worker");
+    check(result == 1 && !initializedHeader && !entryCalls && !checkedFinalThreadCount, "off-main handoff rejects before initialization or detachment");
 }
 
 int main() {
@@ -635,6 +685,8 @@ int main() {
     executableMapping(universal(true, true, executable()), page);
     executableMapping(dylibVariant(executable()), 0);
     executableMapping(universal(true, true, dylibVariant(executable())), page);
+    mainStackBoundsTest();
+    offMainEntryTest();
     terminalEntryTest(false);
     terminalEntryTest(true);
     entryTest();

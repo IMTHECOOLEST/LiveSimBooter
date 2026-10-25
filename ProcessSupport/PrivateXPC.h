@@ -16,6 +16,9 @@ extern int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t message, xpc_object_
 extern int xpc_pipe_receive(mach_port_t port, xpc_object_t *message, uint64_t flags);
 extern int xpc_pipe_routine_reply(xpc_object_t reply);
 extern void xpc_dictionary_get_audit_token(xpc_object_t dictionary, audit_token_t *token);
+extern const struct _xpc_type_s _xpc_type_mach_send;
+extern void xpc_dictionary_set_mach_send(xpc_object_t dictionary, const char *key, mach_port_t port);
+extern mach_port_t xpc_dictionary_copy_mach_send(xpc_object_t dictionary, const char *key);
 // Synchronous launchd startup notification; this does not initialize an NSXPC listener or extension context.
 extern void launch_extension_check_in_live_4UIKit(void);
 // Native launchd service-instance signaling. Neither call requires activating the connection or starting an NSXPC handshake.

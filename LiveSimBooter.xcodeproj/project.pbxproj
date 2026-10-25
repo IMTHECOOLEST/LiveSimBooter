@@ -76,6 +76,7 @@
 				Broker.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
+				LaunchdConfiguration.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
 				TerminalSession.m = "-fobjc-arc";
 				TerminalView.m = "-fobjc-arc";

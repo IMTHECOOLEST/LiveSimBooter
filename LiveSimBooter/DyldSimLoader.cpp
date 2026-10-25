@@ -25,6 +25,7 @@
 // Modified 2026-10-23: adapt simulator image mapping, validation and launch arguments for an iPhone app.
 // Modified 2026-10-24: accept MH_DYLIB signing variants while retaining validation for each image's launch role.
 // Modified 2026-10-24: refresh ptr_munge in writable startup data and prepare debugger metadata before host-cache removal.
+// Modified 2026-10-25: replace consumed main_stack metadata with validated native stack bounds for simulator pthread teardown.
 // Mapping sequence based on Apple's prepareSim(), dyldMain.cpp:300-469 at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp
 
@@ -42,6 +43,7 @@
 #include <libkern/OSByteOrder.h>
 #include <mach/mach.h>
 #include <mach-o/fat.h>
+#include <pthread.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -92,6 +94,20 @@ bool fail(std::string &error, const char *message) {
 bool systemFailure(std::string &error, const char *operation) {
     error = std::string(operation) + ": " + strerror(errno);
     return false;
+}
+
+bool mainStackContains(uintptr_t top, size_t size, uintptr_t address) {
+    return size && size < top && address >= top - size && address < top;
+}
+
+bool captureMainStack(uintptr_t &top, size_t &size, std::string &error) {
+    if (pthread_main_np() != 1) return fail(error, "Simulator handoff must run on the native main thread");
+    pthread_t thread = pthread_self();
+    top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(thread));
+    size = pthread_get_stacksize_np(thread);
+    if (!mainStackContains(top, size, reinterpret_cast<uintptr_t>(__builtin_frame_address(0))))
+        return fail(error, "Native main-thread stack bounds do not contain the current stack");
+    return true;
 }
 
 bool selectSlice(const FileMapping &file, Layout &layout, std::string &error) {
@@ -355,6 +371,13 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     if (!image || !image->entry || !executable || !executablePath || !dyldPath || !rootPath || argc < 1 || !argv) return 1;
     static bool entered = false;
     if (entered) { fprintf(stderr, "dyld_sim can only be entered once per process\n"); return 1; }
+    uintptr_t stackTop = 0;
+    size_t stackSize = 0;
+    std::string stackError;
+    if (!captureMainStack(stackTop, stackSize, stackError)) {
+        fprintf(stderr, "Cannot prepare simulator main stack: %s\n", stackError.c_str());
+        return 1;
+    }
     if (!LSBInitializeSimProcessInfo(image->header, dyldPath)) {
         fprintf(stderr, "Cannot initialize simulator process info: %s\n", strerror(*LSBGetSimSyscallHelpers()->errnoAddress()));
         return 1;
@@ -381,10 +404,17 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     // Diagnostic variables remain opt-in and are copied unchanged, including their output destination.
     for (auto entry = apple; entry && *entry; ++entry) {
         // executable_file identifies the host by FSID/inode and takes precedence over executable_path inside dyld.
-        if (strncmp(*entry, "executable_path=", 16) != 0 && strncmp(*entry, "executable_file=", 16) != 0 && strncmp(*entry, "ptr_munge=", 10) != 0)
+        if (strncmp(*entry, "executable_path=", 16) != 0 && strncmp(*entry, "executable_file=", 16) != 0 &&
+            strncmp(*entry, "main_stack=", 11) != 0 && strncmp(*entry, "ptr_munge=", 10) != 0)
             appleStrings.emplace_back(*entry);
     }
     appleStrings.emplace_back(std::string("executable_path=") + executablePath);
+    // Native libpthread erases main_stack too. Its simulator counterpart must not guess a macOS-sized stack when the main thread exits.
+    // The pthread object lives in app storage, so only publish stack bounds; it is not part of a stack allocation to free.
+    char mainStackEntry[sizeof("main_stack=0x,0x,0x0,0x0") + 2 * sizeof(stackTop) + 2 * sizeof(stackSize)];
+    snprintf(mainStackEntry, sizeof(mainStackEntry), "main_stack=0x%llx,0x%llx,0x0,0x0",
+             static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize));
+    appleStrings.emplace_back(mainStackEntry);
     // Native libpthread has already consumed the kernel's token before main. The simulator needs its own nonzero secret.
     uintptr_t ptrMungeToken = 0;
     do { arc4random_buf(&ptrMungeToken, sizeof(ptrMungeToken)); } while (!ptrMungeToken);
@@ -394,7 +424,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     kernelArgs.push_back(reinterpret_cast<uintptr_t>(executable));
     kernelArgs.push_back(static_cast<uintptr_t>(argc));
     auto append = [](std::vector<std::string> &strings) {
-        // libpthread erases the ptr_munge value after reading it, so expose owned, writable string storage.
+        // libpthread erases main_stack and ptr_munge after reading them, so expose owned, writable string storage.
         for (auto &string : strings) kernelArgs.push_back(reinterpret_cast<uintptr_t>(string.data()));
         kernelArgs.push_back(0);
     };

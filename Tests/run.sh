@@ -59,6 +59,21 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_FAKE_P
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ThreadBootstrapTests.c -o "$test_directory/ThreadBootstrap"
 "$test_directory/ThreadBootstrap"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/WorkqueueBootstrapTests.c -o "$test_directory/WorkqueueBootstrap"
+"$test_directory/WorkqueueBootstrap"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/WorkqueueMachTests.c -o "$test_directory/WorkqueueMach"
+"$test_directory/WorkqueueMach"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdHandshakeTests.c -o "$test_directory/LaunchdHandshake"
+"$test_directory/LaunchdHandshake"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdProbeTests.c ProcessSupport/LaunchdProbe.c -o "$test_directory/LaunchdProbe"
+"$test_directory/LaunchdProbe"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdCompatibilityTests.c -o "$test_directory/LaunchdCompatibility"
+"$test_directory/LaunchdCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
@@ -76,9 +91,14 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WI
     Tests/XPCWireCompatibilityTests.c "$test_directory/libXPCWireCompatibility.dylib" -o "$test_directory/XPCWireCompatibility"
 DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
-    Tests/BrokerTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
+    Tests/BrokerTests.m Host/TerminalSession.m Host/LaunchdConfiguration.m ProcessSupport/LaunchdHandshake.c ProcessSupport/LaunchdProbe.c \
+    ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
     -framework Foundation -o "$test_directory/Broker"
 "$test_directory/Broker"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
+    Tests/LaunchdConfigurationTests.m Host/LaunchdConfiguration.m ProcessSupport/SpawnPlan.c \
+    -framework Foundation -o "$test_directory/LaunchdConfiguration"
+"$test_directory/LaunchdConfiguration"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/TerminalSessionTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/TerminalSession"

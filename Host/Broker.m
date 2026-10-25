@@ -6,6 +6,9 @@
 #include "ChildStatus.h"
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
+#include "LaunchdHandshake.h"
+#include "LaunchdProbe.h"
+#include "LaunchdConfiguration.h"
 #import "TerminalSession.h"
 #include "FakePTY.h"
 #include <errno.h>
@@ -33,6 +36,9 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property LSBChildStatus *childStatus;
 @property int statusFD, wakeReadFD, wakeWriteFD;
 @property BOOL terminalSession;
+@property BOOL simulatorLaunchd;
+@property LSBLaunchdHandshake *launchdHandshake;
+@property dispatch_source_t launchdSource;
 @end
 @implementation LSBJob
 - (instancetype)init {
@@ -40,6 +46,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
     return self;
 }
 - (void)dealloc {
+    if (_launchdHandshake) { LSBLaunchdHandshakeDispose(_launchdHandshake); free(_launchdHandshake); }
     if (_childStatus) munmap(_childStatus, LSB_CHILD_STATUS_MAPPING_SIZE);
     if (_statusFD >= 0) close(_statusFD);
     if (_wakeReadFD >= 0) close(_wakeReadFD);
@@ -120,6 +127,7 @@ static void finishJob(LSBJob *job, int error) {
         job.request = NULL;
     }
     if (job.exitMonitor) { dispatch_source_cancel(job.exitMonitor); job.exitMonitor = nil; }
+    if (job.launchdSource) { dispatch_source_cancel(job.launchdSource); job.launchdSource = nil; }
     if (job.runningBoardMonitor) { LSBRunningBoardMonitorCancel(job.runningBoardMonitor); job.runningBoardMonitor = nil; }
     LSBJob *parent = findJob(job.parentIdentifier);
     if (parent && !job.parentStatusPublished && !LSBChildStatusAbandon(parent.childStatus, job.parentTicket)) wakeParent(parent);
@@ -214,6 +222,10 @@ static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
     }
     job.identifier = nextIdentifier++;
     job.terminalSession = parent ? parent.terminalSession : hostTerminal != nil;
+    if (!parent && !strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim")) {
+        for (unsigned i = 0; i < message->plan.envc; ++i)
+            if (!strcmp(message->plan.strings + message->plan.envp[i], "LSB_SIMULATOR_LAUNCHD=1")) job.simulatorLaunchd = YES;
+    }
     job.request = message;
     [jobs addObject:job];
     startNextJob();
@@ -257,6 +269,47 @@ static int signalTerminal(pid_t foreground, int signalNumber) {
         if (error && error != ESRCH && !firstError) firstError = error;
     }
     return found ? firstError : ESRCH;
+}
+
+static int prepareLaunchdHandshake(LSBJob *job) {
+    job.launchdHandshake = calloc(1, sizeof(*job.launchdHandshake));
+    if (!job.launchdHandshake) return ENOMEM;
+    audit_token_t audit = job.audit;
+    int error = LSBLaunchdHandshakeInitialize(job.launchdHandshake, &audit);
+    if (error) return error;
+    mach_port_t tank = LSBLaunchdHandshakeTankPort(job.launchdHandshake);
+    job.launchdSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, tank, 0, dispatch_get_main_queue());
+    if (!job.launchdSource) return ENOMEM;
+    uint64_t identifier = job.identifier;
+    // Retain the state until its kevent registration has retired; successful MIG transfer leaves the service send right alive.
+    dispatch_source_set_cancel_handler(job.launchdSource, ^{ LSBLaunchdHandshakeCloseTank(job.launchdHandshake); });
+    dispatch_source_set_event_handler(job.launchdSource, ^{
+        LSBJob *active = findJob(identifier);
+        if (!active || !active.launchdHandshake) return;
+        int result = LSBLaunchdHandshakeHandleNext(active.launchdHandshake);
+        if (result == EAGAIN) return;
+        if (!result || result == EALREADY) {
+            fprintf(stderr, "[launchd] transferred service receive right to pid=%d; host send port=%u\n", active.pid,
+                    LSBLaunchdHandshakeServicePort(active.launchdHandshake));
+            const char *probe = getenv("LSB_LAUNCHD_HEALTHCHECK");
+            mach_port_t service = LSBLaunchdHandshakeServicePort(active.launchdHandshake);
+            if (probe && !strcmp(probe, "1") && !mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1)) {
+                audit_token_t expected = active.audit;
+                pid_t process = active.pid;
+                // This bounded diagnostic must not stall UIKit or the broker while launchd finishes entering its event loop.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    kern_return_t bootstrapStatus = -1;
+                    int probeError = LSBLaunchdProbeService(service, &expected, &bootstrapStatus);
+                    fprintf(stderr, "[launchd] service lookup pid=%d error=%d bootstrap=%d\n", process, probeError, bootstrapStatus);
+                    mach_port_deallocate(mach_task_self(), service);
+                });
+            }
+            dispatch_source_cancel(active.launchdSource);
+            active.launchdSource = nil;
+        } else fprintf(stderr, "[launchd] tank request rejected for pid=%d: %s\n", active.pid, strerror(result));
+    });
+    dispatch_resume(job.launchdSource);
+    return 0;
 }
 
 static void handleMessage(LSBReceivedMessage *message) {
@@ -326,8 +379,15 @@ static void handleMessage(LSBReceivedMessage *message) {
                 });
                 dispatch_resume(job.exitMonitor);
             }
-            error = LSBTransportReplyBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
-                                               &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD);
+            if (job.simulatorLaunchd) {
+                error = prepareLaunchdHandshake(job);
+                if (error) { replyError(message, error); finishJob(job, error); return; }
+                error = LSBTransportReplyLaunchdBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
+                    &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD, LSBLaunchdHandshakeTankPort(job.launchdHandshake));
+            } else {
+                error = LSBTransportReplyBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
+                                                   &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD);
+            }
             disposeMessage(message);
             // Don't keep pipe writers alive while waiting for READY; the child now owns copies.
             for (unsigned i = 0; i < job.request->plan.fdCount; ++i) {
@@ -393,6 +453,8 @@ static int prepareRuntimeRoot(void) {
 static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[], const char *envp[]) {
     LSBSpawnPlan *plan = &message->plan;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
+    if (argc > 1 && !strcmp(argv[1], "--launchd"))
+        return argc == 2 ? LSBPrepareLaunchdPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     plan->version = LSB_PLAN_VERSION;
     const char *defaultArgs[] = {"/bin/fish", "-i", "-N", "-P", "-C",
         "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end", NULL};

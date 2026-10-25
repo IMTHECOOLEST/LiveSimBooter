@@ -254,6 +254,16 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         if (!error) error = decodeBootstrapFD(reply, "child-status-fd", &result->statusFD);
         if (!error) error = decodeBootstrapFD(reply, "child-wake-fd", &result->wakeFD);
         if (!error) error = validateBootstrapFDs(result->statusFD, result->wakeFD);
+        if (!error) {
+            xpc_object_t port = xpc_dictionary_get_value(reply, "launchd-tank-port");
+            if (port) {
+                if (xpc_get_type(port) != &_xpc_type_mach_send) error = EPROTO;
+                else {
+                    result->launchdTankPort = xpc_dictionary_copy_mach_send(reply, "launchd-tank-port");
+                    if (!MACH_PORT_VALID(result->launchdTankPort)) error = EPROTO;
+                }
+            }
+        }
     }
     if (reply) xpc_release(reply);
     if (error) {
@@ -261,6 +271,8 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         if (result->statusFD >= 0) close(result->statusFD);
         if (result->wakeFD >= 0) close(result->wakeFD);
         result->statusFD = result->wakeFD = -1;
+        if (MACH_PORT_VALID(result->launchdTankPort)) mach_port_deallocate(mach_task_self(), result->launchdTankPort);
+        result->launchdTankPort = MACH_PORT_NULL;
     }
     return error;
 }
@@ -314,7 +326,7 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
 }
 
 static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
-                          const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD) {
+                          const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD, mach_port_t tankPort) {
     if (!message || !message->object || error < 0 || pid < 0) return EINVAL;
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     if (!reply) {
@@ -342,6 +354,7 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
             if (status) xpc_release(status);
             if (wake) xpc_release(wake);
         }
+        if (!encodingError && MACH_PORT_VALID(tankPort)) xpc_dictionary_set_mach_send(reply, "launchd-tank-port", tankPort);
     }
     if (encodingError) error = encodingError;
     xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
@@ -357,12 +370,18 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
 
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL);
 }
 
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL);
+}
+
+int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                                      const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, mach_port_t tankPort) {
+    if (!MACH_PORT_VALID(tankPort)) return EINVAL;
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, tankPort);
 }
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {

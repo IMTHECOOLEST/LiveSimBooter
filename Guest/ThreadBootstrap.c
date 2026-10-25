@@ -1,4 +1,5 @@
 #include "ThreadBootstrap.h"
+#include "WorkqueueBootstrap.h"
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -46,6 +47,7 @@ int LSBThreadRegister(uintptr_t start, uintptr_t workqueueStart, int pthreadSize
         machSelfOffset = prefix.machSelfOffset;
         mode = RegistrationRedirect;
     }
+    LSBWorkqueueRegister(mode == RegistrationRedirect ? workqueueStart : 0);
     atomic_store_explicit(&registration, mode, memory_order_release);
     errno = saved;
     return result;
@@ -60,7 +62,7 @@ static int machError(kern_return_t error) {
     }
 }
 
-static uintptr_t signedProgramCounter(uintptr_t start, uint32_t flags) {
+uintptr_t LSBThreadSignPC(uintptr_t start, uint32_t flags) {
     if (flags & THREAD_STATE_NO_PTRAUTH) return start;
     // Matches arm_thread_state64_set_pc_fptr: string discriminator "pc" is 0x7481 in Apple's arm64e ABI.
     // The shim uses unsigned arm64 function pointers; sign the new PC directly, retaining all other fetched signed state fields.
@@ -106,7 +108,7 @@ void *LSBThreadCreate(void *(*function)(void *), void *argument, void *stack, vo
                    state.__x[4] != (uintptr_t)stack || !(state.__x[5] & THREAD_START_TSD_BASE_SET) || (state.__x[5] & THREAD_START_SUSPENDED)))
         error = EPROTO;
     if (!error) {
-        state.__pc = signedProgramCounter(simulatorStart, state.__pad);
+        state.__pc = LSBThreadSignPC(simulatorStart, state.__pad);
         state.__pad &= ~THREAD_STATE_KERNEL_SIGNED_PC;
         status = thread_set_state(port, ARM_THREAD_STATE64, (thread_state_t)&state, count);
         if (status) error = machError(status);

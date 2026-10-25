@@ -23,6 +23,8 @@ static jmp_buf exitJump;
 static unsigned char pthreadStorage[16384] __attribute__((aligned(16384)));
 static arm_thread_state64_t initialState, updatedState;
 static const mach_port_t testPort = 0x170b;
+static uintptr_t observedWorkqueueRegistration;
+void LSBWorkqueueRegister(uintptr_t start) { observedWorkqueueRegistration = start; }
 
 static int testRegister(uintptr_t start, uintptr_t workqueue, int size, void *data, size_t bytes, uint64_t dispatch) {
     ++registerCalls;
@@ -119,6 +121,7 @@ static void reset(void) {
     getError = setError = resumeError = terminateError = KERN_SUCCESS;
     invalidPort = false;
     atomic_store(&registration, RegistrationMissing);
+    observedWorkqueueRegistration = 0;
     memset(pthreadStorage, 0, sizeof(pthreadStorage));
     memset(&initialState, 0, sizeof(initialState));
     memset(&updatedState, 0, sizeof(updatedState));
@@ -142,12 +145,14 @@ static void testRegistration(void) {
     assert(create(0) == (void *)-1 && errno == ENOTSUP && !createCalls);
     registerSimulator();
     assert(errno == EINVAL && atomic_load(&registration) == RegistrationRedirect);
+    assert(observedWorkqueueRegistration == 0x12b269a74);
 
     reset();
     registerResult = 0x7f;
     errno = EDOM;
     registerSimulator();
     assert(errno == EDOM && atomic_load(&registration) == RegistrationNative);
+    assert(observedWorkqueueRegistration == 0);
     assert(create(0) == pthreadStorage && observedFlags == 0x090008ff && !getCalls && !setCalls && !resumeCalls);
 
     reset();

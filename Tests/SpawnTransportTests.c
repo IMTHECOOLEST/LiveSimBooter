@@ -22,7 +22,7 @@
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
 static unsigned openDescriptorCount(void);
-enum { MalformedBootstrapCount = 11, MalformedKillCount = 12 };
+enum { MalformedBootstrapCount = 14, MalformedKillCount = 12 };
 static volatile sig_atomic_t childSignals;
 static volatile sig_atomic_t signalAcknowledgementFD = -1;
 
@@ -190,6 +190,7 @@ static int client(void) {
     int received[LSB_MAX_FDS];
     assert(!LSBTransportCheckIn(&reply, received));
     assert(reply.requestID == 77 && !reply.error && !strcmp(reply.runtimeRoot, "/tmp/RuntimeRoot"));
+    assert(reply.launchdTankPort == MACH_PORT_NULL);
     assert(!memcmp(&reply.plan, &plan, sizeof(plan)) && received[0] >= 0);
     assert(reply.statusFD >= 0 && reply.wakeFD >= 0 && reply.statusFD != reply.wakeFD && reply.statusFD != received[0]);
     assert((fcntl(reply.statusFD, F_GETFD) & FD_CLOEXEC) && (fcntl(reply.wakeFD, F_GETFD) & FD_CLOEXEC));
@@ -208,6 +209,28 @@ static int client(void) {
     assert(read(received[0], &byte, 1) == 1 && byte == 'b' && lseek(fd, 0, SEEK_CUR) == 2);
     close(received[0]);
     assert(!LSBTransportReady(reply.requestID, 0));
+    // The optional tank is an independently owned send right, surviving release of the XPC reply and imported FD cleanup.
+    mach_port_t tankAnchor = MACH_PORT_NULL;
+    for (unsigned index = 0; index < 2; ++index) {
+        assert(!LSBTransportCheckIn(&reply, received) && reply.requestID == 78 + index);
+        assert(MACH_PORT_VALID(reply.launchdTankPort));
+        mach_port_type_t type;
+        mach_port_urefs_t references;
+        assert(!mach_port_type(mach_task_self(), reply.launchdTankPort, &type));
+        assert((type & MACH_PORT_TYPE_SEND) && !(type & MACH_PORT_TYPE_RECEIVE));
+        if (!index) tankAnchor = reply.launchdTankPort;
+        else assert(reply.launchdTankPort == tankAnchor);
+        assert(!mach_port_get_refs(mach_task_self(), tankAnchor, MACH_PORT_RIGHT_SEND, &references) && references == index + 1);
+        close(reply.statusFD);
+        close(reply.wakeFD);
+        close(received[0]);
+    }
+    assert(!mach_port_deallocate(mach_task_self(), reply.launchdTankPort));
+    mach_port_urefs_t tankReferences;
+    assert(!mach_port_get_refs(mach_task_self(), tankAnchor, MACH_PORT_RIGHT_SEND, &tankReferences) && tankReferences == 1);
+    mach_msg_header_t ping = {.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0), .msgh_size = sizeof(ping),
+                              .msgh_remote_port = tankAnchor, .msgh_id = 885};
+    assert(!mach_msg(&ping, MACH_SEND_MSG, sizeof(ping), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
     signalAcknowledgementFD = fd;
     struct sigaction action = {.sa_handler = childSignal}, previousAction;
     sigemptyset(&action.sa_mask);
@@ -226,10 +249,14 @@ static int client(void) {
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportCheckIn(&reply, received) == EPROTO);
-        assert(reply.statusFD == -1 && reply.wakeFD == -1);
+        assert(reply.statusFD == -1 && reply.wakeFD == -1 && reply.launchdTankPort == MACH_PORT_NULL);
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(received[i] == -1);
         assert(openDescriptorCount() == before);
+        assert(!mach_port_get_refs(mach_task_self(), tankAnchor, MACH_PORT_RIGHT_SEND, &tankReferences) && tankReferences == 1);
     }
+    assert(!mach_port_deallocate(mach_task_self(), tankAnchor));
+    mach_port_type_t tankType;
+    assert(mach_port_type(mach_task_self(), tankAnchor, &tankType) == KERN_INVALID_NAME);
     assert(!LSBRequireSingleThread());
     assert(LSBTransportReady(0, 0) == EINVAL);
     plan.version = 0;
@@ -263,7 +290,7 @@ static int client(void) {
             statistics.sentInline, statistics.sentOOL, statistics.receivedInline, statistics.receivedOOL, statistics.receiveRetries);
     assert(statistics.sentInline && statistics.receivedInline);
 #endif
-    puts("SpawnTransport child: payload, shared FD, kill requests/replies with SIGCHLD pending, malformed-message and single-thread checks passed");
+    puts("SpawnTransport child: payload, shared FD, optional tank rights, kill/SIGCHLD, malformed-message and single-thread checks passed");
     return 0;
 }
 
@@ -309,7 +336,7 @@ static void closeBootstrapFDs(BootstrapFDs *fds) {
 }
 
 static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnPlan *plan, int planFD,
-                                    const BootstrapFDs *fds, unsigned variant) {
+                                    const BootstrapFDs *fds, mach_port_t tank, unsigned variant) {
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     assert(reply);
     xpc_dictionary_set_uint64(reply, "version", 1);
@@ -325,6 +352,15 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
     xpc_release(descriptor);
     xpc_release(array);
     if (variant == 10) xpc_dictionary_set_string(reply, "plan", "malformed plan");
+    // Valid ports in the earlier-invalid variants must be released even though decoding never reaches the optional field.
+    if (variant == 11) xpc_dictionary_set_string(reply, "launchd-tank-port", "not a Mach send right");
+    else if (variant == 12) xpc_dictionary_set_uint64(reply, "launchd-tank-port", tank);
+    else if (variant == 13) {
+        descriptor = xpc_fd_create(planFD);
+        assert(descriptor);
+        xpc_dictionary_set_value(reply, "launchd-tank-port", descriptor);
+        xpc_release(descriptor);
+    } else xpc_dictionary_set_mach_send(reply, "launchd-tank-port", tank);
     if (variant == 1) xpc_dictionary_set_string(reply, "child-status-fd", "not a descriptor");
     else if (variant != 0) {
         int statusFD = variant == 4 ? fds->wake[0] : variant == 7 ? fds->readOnlyStatus : variant == 8 ? fds->shortStatus : fds->status;
@@ -369,6 +405,9 @@ static int host(const char *executable) {
     assert(pending.object == NULL && fcntl(pending.fds[0], F_GETFD) >= 0);
     LSBReceivedMessage message;
     BootstrapFDs bootstrap = makeBootstrapFDs();
+    mach_port_t tank;
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &tank));
+    assert(!mach_port_insert_right(mach_task_self(), tank, tank, MACH_MSG_TYPE_MAKE_SEND));
     assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
     assert(message.audit.val[5] == (unsigned)child);
     assert(!LSBTransportReplyBootstrap(&message, 0, child, 77, "/tmp/RuntimeRoot", &pending.plan, pending.fds, bootstrap.status, bootstrap.wake[0]));
@@ -379,6 +418,24 @@ static int host(const char *executable) {
     assert(pread(bootstrap.status, shared, sizeof(shared), 0) == sizeof(shared) && !memcmp(shared, "shared", sizeof(shared)));
     assert(!LSBTransportReply(&message, 0, child, 77, NULL, NULL, NULL));
     LSBTransportDisposeMessage(&message);
+    for (unsigned index = 0; index < 2; ++index) {
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
+        void *request = message.object;
+        assert(LSBTransportReplyLaunchdBootstrap(&message, 0, child, 78 + index, "/tmp/RuntimeRoot", &pending.plan,
+                                                pending.fds, bootstrap.status, bootstrap.wake[0], MACH_PORT_NULL) == EINVAL);
+        assert(LSBTransportReplyLaunchdBootstrap(&message, 0, child, 78 + index, "/tmp/RuntimeRoot", &pending.plan,
+                                                pending.fds, bootstrap.status, bootstrap.wake[0], MACH_PORT_DEAD) == EINVAL);
+        assert(message.object == request);
+        assert(!LSBTransportReplyLaunchdBootstrap(&message, 0, child, 78 + index, "/tmp/RuntimeRoot", &pending.plan,
+                                                 pending.fds, bootstrap.status, bootstrap.wake[0], tank));
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), tank, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(fcntl(bootstrap.status, F_GETFD) >= 0 && fcntl(bootstrap.wake[0], F_GETFD) >= 0 && !message.object);
+        LSBTransportDisposeMessage(&message);
+    }
+    struct { mach_msg_header_t header; mach_msg_max_trailer_t trailer; } ping;
+    assert(!mach_msg(&ping.header, MACH_RCV_MSG, 0, sizeof(ping), tank, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
+    assert(ping.header.msgh_id == 885 && ping.header.msgh_size == sizeof(mach_msg_header_t));
     const int signals[] = {0, SIGTERM, SIGKILL, SIGTERM, SIGTERM};
     for (unsigned variant = 0; variant < sizeof(signals) / sizeof(signals[0]); ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_KILL && !message.requestID && !message.error);
@@ -400,9 +457,11 @@ static int host(const char *executable) {
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
         unsigned before = openDescriptorCount();
-        replyMalformedBootstrap(&message, &pending.plan, pending.fds[0], &bootstrap, variant);
+        replyMalformedBootstrap(&message, &pending.plan, pending.fds[0], &bootstrap, tank, variant);
         LSBTransportDisposeMessage(&message);
         assert(openDescriptorCount() == before);
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), tank, MACH_PORT_RIGHT_SEND, &references) && references == 1);
     }
     closeBootstrapFDs(&bootstrap);
     LSBTransportDisposeMessage(&pending);
@@ -435,6 +494,8 @@ static int host(const char *executable) {
     LSBTransportDisposeMessage(&message);
     int status;
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    assert(!mach_port_deallocate(mach_task_self(), tank));
+    assert(!mach_port_mod_refs(mach_task_self(), tank, MACH_PORT_RIGHT_RECEIVE, -1));
     mach_port_deallocate(mach_task_self(), port);
     mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
     puts("SpawnTransport parent: retained asynchronous reply ownership and audit identity checks passed");
