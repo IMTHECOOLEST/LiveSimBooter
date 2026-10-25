@@ -1,10 +1,22 @@
 #import "ViewController.h"
 #include "HostApplication.h"
+#include "Broker.h"
 #import "TerminalSession.h"
 #import "TerminalView.h"
+#import "SimulatorDisplayView.h"
 #include <string.h>
 
+static __weak LSBSimulatorDisplayView *hostDisplay;
+LSBSimulatorDisplayView *LSBHostSimulatorDisplay(void) { return hostDisplay; }
+
+@interface LSBHostViewController ()
+@property (nonatomic, strong) id indigoObserver;
+@end
+
 @implementation LSBHostViewController
+- (void)dealloc {
+    if (_indigoObserver) [NSNotificationCenter.defaultCenter removeObserver:_indigoObserver];
+}
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     for (UIView *view in self.view.subviews) if ([view isKindOfClass:LSBTerminalView.class]) [view becomeFirstResponder];
@@ -13,6 +25,27 @@
     [super viewDidLoad];
     int startupError = LSBStartInitialGuest();
     self.view.backgroundColor = UIColor.systemBackgroundColor;
+    if (!startupError && LSBHostUsesSimulatorDisplay()) {
+        LSBSimulatorDisplayView *display = [[LSBSimulatorDisplayView alloc] initWithFrame:CGRectZero];
+        display.translatesAutoresizingMaskIntoConstraints = NO;
+        display.indigoServer = LSBHostIndigoHIDServer();
+        [self.view addSubview:display];
+        hostDisplay = display;
+        __weak LSBSimulatorDisplayView *weakDisplay = display;
+        self.indigoObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostIndigoDidChangeNotification object:nil
+            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+                (void)notification;
+                weakDisplay.indigoServer = LSBHostIndigoHIDServer();
+            }];
+        UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [display.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+            [display.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+            [display.topAnchor constraintEqualToAnchor:safe.topAnchor],
+            [display.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor]
+        ]];
+        return;
+    }
     LSBTerminalSession *session = LSBHostTerminal();
     if (!startupError && session) {
         LSBTerminalView *terminal = [[LSBTerminalView alloc] initWithFrame:CGRectZero];

@@ -26,6 +26,7 @@
 // Modified 2026-10-24: accept MH_DYLIB signing variants while retaining validation for each image's launch role.
 // Modified 2026-10-24: refresh ptr_munge in writable startup data and prepare debugger metadata before host-cache removal.
 // Modified 2026-10-25: replace consumed main_stack metadata with validated native stack bounds for simulator pthread teardown.
+// Modified 2026-10-25: own startup vectors and writable strings in bounded app-image storage that cache mappings cannot replace.
 // Mapping sequence based on Apple's prepareSim(), dyldMain.cpp:300-469 at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp
 
@@ -108,6 +109,106 @@ bool captureMainStack(uintptr_t &top, size_t &size, std::string &error) {
     if (!mainStackContains(top, size, reinterpret_cast<uintptr_t>(__builtin_frame_address(0))))
         return fail(error, "Native main-thread stack bounds do not contain the current stack");
     return true;
+}
+
+constexpr size_t startupStorageCapacity = 512 * 1024;
+struct StartupStorage { uintptr_t words[startupStorageCapacity / sizeof(uintptr_t)]; };
+struct StartupVectors { const char *const *argv, *const *envp, *const *apple; };
+static StartupStorage startupStorage;
+
+int copyStartupVectors(StartupStorage &storage, size_t capacity, const mach_header *executable, const std::vector<std::string> &arguments,
+                       const std::vector<std::string> &environment, const std::vector<std::string> &apple, StartupVectors &vectors) {
+    // The guest cache may replace native malloc zones. Only app-image storage may survive the destructive handoff.
+    // Preflight the entire layout so an overlong input cannot publish a partial vector or overflow the static buffer.
+    if (capacity > sizeof(storage.words)) return EINVAL;
+    size_t wordCount = 5; // executable header, argc, and three vector terminators
+    if (wordCount > capacity / sizeof(uintptr_t)) return E2BIG;
+    for (const auto *group : {&arguments, &environment, &apple}) {
+        if (group->size() > capacity / sizeof(uintptr_t) - wordCount) return E2BIG;
+        wordCount += group->size();
+    }
+    size_t used = wordCount * sizeof(uintptr_t);
+    for (const auto *group : {&arguments, &environment, &apple}) {
+        for (const auto &string : *group) {
+            if (string.size() >= capacity - used) return E2BIG;
+            used += string.size() + 1;
+        }
+    }
+    storage.words[0] = reinterpret_cast<uintptr_t>(executable);
+    storage.words[1] = arguments.size();
+    size_t word = 2, stringOffset = wordCount * sizeof(uintptr_t);
+    auto append = [&](const std::vector<std::string> &strings) {
+        auto vector = reinterpret_cast<const char *const *>(storage.words + word);
+        for (const auto &string : strings) {
+            char *destination = reinterpret_cast<char *>(storage.words) + stringOffset;
+            memcpy(destination, string.c_str(), string.size() + 1);
+            storage.words[word++] = reinterpret_cast<uintptr_t>(destination);
+            stringOffset += string.size() + 1;
+        }
+        storage.words[word++] = 0;
+        return vector;
+    };
+    StartupVectors result;
+    result.argv = append(arguments);
+    result.envp = append(environment);
+    result.apple = append(apple);
+    vectors = result;
+    return 0;
+}
+
+int prepareStartupVectors(const mach_header *executable, const char *executablePath, const char *rootPath, int argc,
+                          const char *const argv[], const char *const envp[], const char *const apple[],
+                          uintptr_t stackTop, size_t stackSize, StartupVectors &vectors) {
+    // These temporary transformations are destroyed on return, before either cache mapping or thread/cache detachment.
+    std::vector<std::string> arguments, environment, appleStrings;
+    size_t remaining = startupStorageCapacity - 5 * sizeof(uintptr_t);
+    auto append = [&](std::vector<std::string> &group, const char *text) {
+        if (!text) return EINVAL;
+        if (remaining <= sizeof(uintptr_t)) return E2BIG;
+        size_t length = strnlen(text, remaining - sizeof(uintptr_t));
+        if (length == remaining - sizeof(uintptr_t)) return E2BIG;
+        remaining -= sizeof(uintptr_t) + length + 1;
+        group.emplace_back(text, length);
+        return 0;
+    };
+    if (static_cast<size_t>(argc) > remaining / (sizeof(uintptr_t) + 1)) return E2BIG;
+    for (int i = 0; i < argc; ++i) {
+        int error = append(arguments, argv[i]);
+        if (error) return error;
+    }
+    for (auto entry = envp; entry && *entry; ++entry) {
+        if (strncmp(*entry, "DYLD_ROOT_PATH=", sizeof("DYLD_ROOT_PATH=") - 1) == 0 ||
+            strncmp(*entry, "DYLD_SHARED_CACHE_DIR=", sizeof("DYLD_SHARED_CACHE_DIR=") - 1) == 0) continue;
+        int error = append(environment, *entry);
+        if (error) return error;
+    }
+    if (strnlen(rootPath, remaining) == remaining || strnlen(executablePath, remaining) == remaining) return E2BIG;
+    int error = append(environment, (std::string("DYLD_ROOT_PATH=") + rootPath).c_str());
+    if (!error) error = append(environment, (std::string("DYLD_SHARED_CACHE_DIR=") + rootPath + "/System/Library/Caches/com.apple.dyld").c_str());
+    if (error) return error;
+    // Diagnostic variables remain opt-in. executable_file would identify the host and override executable_path inside dyld.
+    for (auto entry = apple; entry && *entry; ++entry) {
+        if (strncmp(*entry, "executable_path=", 16) == 0 || strncmp(*entry, "executable_file=", 16) == 0 ||
+            strncmp(*entry, "main_stack=", 11) == 0 || strncmp(*entry, "ptr_munge=", 10) == 0) continue;
+        error = append(appleStrings, *entry);
+        if (error) return error;
+    }
+    error = append(appleStrings, (std::string("executable_path=") + executablePath).c_str());
+    if (error) return error;
+    // Native libpthread consumed main_stack. The simulator must use actual bounds, without freeing the app-local pthread object.
+    char mainStackEntry[sizeof("main_stack=0x,0x,0x0,0x0") + 2 * sizeof(stackTop) + 2 * sizeof(stackSize)];
+    snprintf(mainStackEntry, sizeof(mainStackEntry), "main_stack=0x%llx,0x%llx,0x0,0x0",
+             static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize));
+    error = append(appleStrings, mainStackEntry);
+    if (error) return error;
+    // Native libpthread consumed the kernel's token too. Its simulator copy needs a fresh, writable nonzero secret.
+    uintptr_t ptrMungeToken = 0;
+    do { arc4random_buf(&ptrMungeToken, sizeof(ptrMungeToken)); } while (!ptrMungeToken);
+    char ptrMungeEntry[sizeof("ptr_munge=0x") + 2 * sizeof(ptrMungeToken)];
+    snprintf(ptrMungeEntry, sizeof(ptrMungeEntry), "ptr_munge=0x%llx", static_cast<unsigned long long>(ptrMungeToken));
+    error = append(appleStrings, ptrMungeEntry);
+    if (error) return error;
+    return copyStartupVectors(startupStorage, sizeof(startupStorage.words), executable, arguments, environment, appleStrings, vectors);
 }
 
 bool selectSlice(const FileMapping &file, Layout &layout, std::string &error) {
@@ -383,65 +484,20 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         return 1;
     }
 
-    // dyld_sim reconstructs KernelArgs at argv - 2 words and writes the executable header there.
-    // Keep both strings and the contiguous kernel-style vector alive after prepare returns.
-    static std::vector<std::string> arguments, environment, appleStrings;
-    static std::vector<uintptr_t> kernelArgs;
-    for (int i = 0; i < argc; ++i) arguments.emplace_back(argv[i]);
-    for (auto entry = envp; entry && *entry; ++entry) environment.emplace_back(*entry);
-    auto removeEnvironment = [&](const char *name) {
-        std::string prefix = std::string(name) + "=";
-        environment.erase(std::remove_if(environment.begin(), environment.end(), [&](const std::string &item) {
-            return item.compare(0, prefix.size(), prefix) == 0;
-        }), environment.end());
-    };
-    auto setEnvironment = [&](const char *name, const std::string &value) {
-        removeEnvironment(name);
-        environment.emplace_back(std::string(name) + "=" + value);
-    };
-    setEnvironment("DYLD_ROOT_PATH", rootPath);
-    setEnvironment("DYLD_SHARED_CACHE_DIR", std::string(rootPath) + "/System/Library/Caches/com.apple.dyld");
-    // Diagnostic variables remain opt-in and are copied unchanged, including their output destination.
-    for (auto entry = apple; entry && *entry; ++entry) {
-        // executable_file identifies the host by FSID/inode and takes precedence over executable_path inside dyld.
-        if (strncmp(*entry, "executable_path=", 16) != 0 && strncmp(*entry, "executable_file=", 16) != 0 &&
-            strncmp(*entry, "main_stack=", 11) != 0 && strncmp(*entry, "ptr_munge=", 10) != 0)
-            appleStrings.emplace_back(*entry);
+    // dyld_sim reconstructs KernelArgs at argv - 2 words; all three vectors and their strings must survive cache mapping.
+    StartupVectors startup = {};
+    int startupError = prepareStartupVectors(executable, executablePath, rootPath, argc, argv, envp, apple, stackTop, stackSize, startup);
+    if (startupError) {
+        fprintf(stderr, "Cannot prepare simulator startup data: %s\n", strerror(startupError));
+        errno = startupError;
+        return 1;
     }
-    appleStrings.emplace_back(std::string("executable_path=") + executablePath);
-    // Native libpthread erases main_stack too. Its simulator counterpart must not guess a macOS-sized stack when the main thread exits.
-    // The pthread object lives in app storage, so only publish stack bounds; it is not part of a stack allocation to free.
-    char mainStackEntry[sizeof("main_stack=0x,0x,0x0,0x0") + 2 * sizeof(stackTop) + 2 * sizeof(stackSize)];
-    snprintf(mainStackEntry, sizeof(mainStackEntry), "main_stack=0x%llx,0x%llx,0x0,0x0",
-             static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize));
-    appleStrings.emplace_back(mainStackEntry);
-    // Native libpthread has already consumed the kernel's token before main. The simulator needs its own nonzero secret.
-    uintptr_t ptrMungeToken = 0;
-    do { arc4random_buf(&ptrMungeToken, sizeof(ptrMungeToken)); } while (!ptrMungeToken);
-    char ptrMungeEntry[sizeof("ptr_munge=0x") + 2 * sizeof(ptrMungeToken)];
-    snprintf(ptrMungeEntry, sizeof(ptrMungeEntry), "ptr_munge=0x%llx", static_cast<unsigned long long>(ptrMungeToken));
-    appleStrings.emplace_back(ptrMungeEntry);
-    kernelArgs.push_back(reinterpret_cast<uintptr_t>(executable));
-    kernelArgs.push_back(static_cast<uintptr_t>(argc));
-    auto append = [](std::vector<std::string> &strings) {
-        // libpthread erases main_stack and ptr_munge after reading them, so expose owned, writable string storage.
-        for (auto &string : strings) kernelArgs.push_back(reinterpret_cast<uintptr_t>(string.data()));
-        kernelArgs.push_back(0);
-    };
-    append(arguments);
-    size_t envOffset = kernelArgs.size();
-    append(environment);
-    size_t appleOffset = kernelArgs.size();
-    append(appleStrings);
 
     using Entry = LSBDyldSimLaunch::Entry;
     auto entry = reinterpret_cast<Entry>(image->entry);
 #if __has_feature(ptrauth_calls)
     entry = reinterpret_cast<Entry>(ptrauth_sign_unauthenticated(reinterpret_cast<void *>(image->entry), ptrauth_key_function_pointer, 0));
 #endif
-    auto simArgv = reinterpret_cast<const char *const *>(kernelArgs.data() + 2);
-    auto simEnvp = reinterpret_cast<const char *const *>(kernelArgs.data() + envOffset);
-    auto simApple = reinterpret_cast<const char *const *>(kernelArgs.data() + appleOffset);
     // Capture the real AMFI result and materialize arguments before the cache disappears.
     LSBPrepareHostPolicy();
     lsb::MainThreadBootstrap thread = {};
@@ -456,7 +512,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         return 1;
     }
     const SimSyscallHelpers *helpers = LSBGetSimSyscallHelpers();
-    LSBDyldSimLaunch launch = {entry, argc, simArgv, simEnvp, simApple, executable, image->header, image->slide, helpers, thread};
+    LSBDyldSimLaunch launch = {entry, argc, startup.argv, startup.envp, startup.apple, executable, image->header, image->slide, helpers, thread};
     entered = true;
     fprintf(stderr, "Detaching host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n", reinterpret_cast<void *>(image->entry), image->header,
             static_cast<unsigned long long>(image->slide));

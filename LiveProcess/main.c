@@ -18,6 +18,7 @@ static LSBMappedImage loader, executable;
 static LSBChildStatus *childStatus;
 
 static void closeStatus(void) {
+    LSBSpawnPortsDispose(&launch.ports);
     if (MACH_PORT_VALID(launch.launchdTankPort)) mach_port_deallocate(mach_task_self(), launch.launchdTankPort);
     launch.launchdTankPort = MACH_PORT_NULL;
     if (launch.statusFD >= 0) close(launch.statusFD);
@@ -88,6 +89,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) if (received[i] >= 0) { close(received[i]); received[i] = -1; }
     char executablePath[PATH_MAX], dyldPath[PATH_MAX], insertLibrary[PATH_MAX + 32], brokerEnvironment[64], detail[1024] = {0};
     char statusEnvironment[64], wakeEnvironment[64];
+    char guestPIDEnvironment[48], parentPIDEnvironment[48];
     char workqueueStartEnvironment[80], workqueueFeaturesEnvironment[80];
     mach_port_t brokerPort = MACH_PORT_NULL;
     if (!error) error = resolveExecutable(executablePath);
@@ -114,8 +116,26 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     snprintf(brokerEnvironment, sizeof(brokerEnvironment), "LSB_BROKER_PORT=%u", brokerPort);
     snprintf(statusEnvironment, sizeof(statusEnvironment), LSB_CHILD_STATUS_ENV "=0x%llx", (unsigned long long)(uintptr_t)childStatus);
     snprintf(wakeEnvironment, sizeof(wakeEnvironment), LSB_CHILD_WAKE_FD_ENV "=%d", launch.wakeFD);
+    snprintf(guestPIDEnvironment, sizeof(guestPIDEnvironment), "LSB_GUEST_PID=%d", launch.guestPID);
+    snprintf(parentPIDEnvironment, sizeof(parentPIDEnvironment), "LSB_GUEST_PPID=%d", launch.parentPID);
+    // Complete fallible Mach state setup before READY can commit an exec. Readiness uses the retained broker right directly.
+    kern_return_t portsError = KERN_SUCCESS;
+    if (!error && launch.ports.registeredPresent)
+        portsError = mach_ports_register(mach_task_self(), launch.ports.registered, launch.ports.count);
+    if (!error && !portsError && launch.ports.bootstrapPresent)
+        portsError = task_set_bootstrap_port(mach_task_self(), launch.ports.bootstrapPort);
+    if (!error && !portsError && MACH_PORT_VALID(launch.launchdTankPort))
+        portsError = task_set_bootstrap_port(mach_task_self(), launch.launchdTankPort);
+    LSBSpawnPortsDispose(&launch.ports);
+    if (MACH_PORT_VALID(launch.launchdTankPort)) mach_port_deallocate(mach_task_self(), launch.launchdTankPort);
+    launch.launchdTankPort = MACH_PORT_NULL;
+    if (portsError && !error) {
+        fprintf(stderr, "[LiveProcess] Cannot install simulator Mach ports: %d\n", portsError);
+        error = EIO;
+    }
     if (!error) error = LSBRequireSingleThread();
-    int readyError = LSBTransportReady(launch.requestID, error);
+    int readyError = MACH_PORT_VALID(brokerPort) ? LSBTransportReadyOnPort(brokerPort, launch.requestID, error) :
+        LSBTransportReady(launch.requestID, error);
     if (error || readyError) {
         if (MACH_PORT_VALID(brokerPort)) mach_port_deallocate(mach_task_self(), brokerPort);
         closeStatus();
@@ -128,19 +148,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         closeStatus();
         fprintf(stderr, "[LiveProcess] Native worker appeared before handoff: %s\n", strerror(error)); return 1;
     }
-    if (MACH_PORT_VALID(launch.launchdTankPort)) {
-        // The native host supplies the one-shot tank endpoint; launchd_sim retrieves its own receive right through MIG 708.
-        kern_return_t status = task_set_bootstrap_port(mach_task_self(), launch.launchdTankPort);
-        if (status) {
-            fprintf(stderr, "[LiveProcess] Cannot install launchd tank bootstrap: %d\n", status);
-            mach_port_deallocate(mach_task_self(), brokerPort);
-            closeStatus();
-            return 1;
-        }
-        mach_port_deallocate(mach_task_self(), launch.launchdTankPort);
-        launch.launchdTankPort = MACH_PORT_NULL;
-    }
-    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 7];
+    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 9];
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
@@ -153,6 +161,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
             continue;
         }
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
+            strncmp(entry, "LSB_GUEST_PID=", sizeof("LSB_GUEST_PID=") - 1) &&
+            strncmp(entry, "LSB_GUEST_PPID=", sizeof("LSB_GUEST_PPID=") - 1) &&
             strncmp(entry, "LSB_HOST_WORKQUEUE_START=", sizeof("LSB_HOST_WORKQUEUE_START=") - 1) &&
             strncmp(entry, "LSB_HOST_WORKQUEUE_FEATURES=", sizeof("LSB_HOST_WORKQUEUE_FEATURES=") - 1) &&
             strncmp(entry, LSB_CHILD_STATUS_ENV "=", sizeof(LSB_CHILD_STATUS_ENV)) &&
@@ -164,6 +174,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     environment[count++] = wakeEnvironment;
     environment[count++] = workqueueStartEnvironment;
     environment[count++] = workqueueFeaturesEnvironment;
+    environment[count++] = guestPIDEnvironment;
+    environment[count++] = parentPIDEnvironment;
     environment[count] = NULL;
     fprintf(stderr, "[LiveProcess] pid=%d entering %s with %u arguments\n", getpid(), executablePath, launch.plan.argc);
     if (stopBeforeHandoff) {

@@ -136,6 +136,8 @@ static void testBoundedSendAndReceive(void) {
         double elapsed = monotonicSeconds() - start;
         assert(elapsed >= 0.9 && elapsed < 3.0);
         assert(hasRight(service, MACH_PORT_TYPE_RECEIVE) && hasRight(service, MACH_PORT_TYPE_SEND));
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, &references) && references == 1);
         closeService(service);
     }
 }

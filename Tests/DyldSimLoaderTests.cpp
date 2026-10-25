@@ -98,6 +98,44 @@ static void mainStackBoundsTest() {
     check(!mainStackContains(0x18000, 0x18000, 0x17000), "native stack cannot extend to the null page");
 }
 
+static void startupStorageBoundsTest() {
+    StartupStorage storage;
+    memset(&storage, 0xa5, sizeof(storage));
+    std::vector<std::string> arguments = {"program", ""}, environment = {"KEEP=value"}, apple = {"main_stack=123", "ptr_munge=456"};
+    size_t required = (5 + arguments.size() + environment.size() + apple.size()) * sizeof(uintptr_t);
+    for (const auto *group : {&arguments, &environment, &apple})
+        for (const auto &string : *group) required += string.size() + 1;
+    StartupVectors vectors = {};
+    for (size_t capacity : {size_t(0), size_t(5 * sizeof(uintptr_t) - 1), required - 1}) {
+        check(copyStartupVectors(storage, capacity, nullptr, arguments, environment, apple, vectors) == E2BIG, "startup storage rejects overflow");
+        check(!vectors.argv && !vectors.envp && !vectors.apple, "overflow does not publish any partial vector");
+        auto bytes = reinterpret_cast<const unsigned char *>(&storage);
+        check(std::all_of(bytes, bytes + sizeof(storage), [](unsigned char value) { return value == 0xa5; }), "overflow does not change storage");
+    }
+    check(copyStartupVectors(storage, sizeof(storage) + 1, nullptr, arguments, environment, apple, vectors) == EINVAL,
+          "startup storage capacity cannot exceed the actual static allocation");
+    check(!copyStartupVectors(storage, required, nullptr, arguments, environment, apple, vectors), "startup vectors fit at the exact byte boundary");
+    auto bytes = reinterpret_cast<const unsigned char *>(&storage);
+    check(std::all_of(bytes + required, bytes + sizeof(storage), [](unsigned char value) { return value == 0xa5; }), "exact fit preserves following bytes");
+    check(vectors.argv == reinterpret_cast<const char *const *>(storage.words + 2), "startup kernel prefix remains contiguous with argv");
+    check(vectors.envp == vectors.argv + 3 && vectors.apple == vectors.envp + 2, "all three vectors are contiguous including terminators");
+    for (auto *group : {&arguments, &environment, &apple}) {
+        for (auto &string : *group) std::fill(string.begin(), string.end(), '!');
+        std::vector<std::string>().swap(*group);
+    }
+    check(!strcmp(vectors.argv[0], "program") && !strcmp(vectors.argv[1], "") && !strcmp(vectors.envp[0], "KEEP=value"),
+          "owned startup strings survive destruction of all staging allocations");
+    memset(const_cast<char *>(vectors.apple[0]) + 11, 0, 3);
+    memset(const_cast<char *>(vectors.apple[1]) + 10, 0, 3);
+    check(!strcmp(vectors.apple[0], "main_stack=") && !strcmp(vectors.apple[1], "ptr_munge="), "owned startup secrets remain writable");
+    arguments.assign(startupStorageCapacity / sizeof(uintptr_t), "");
+    StartupVectors unchanged = vectors;
+    check(copyStartupVectors(storage, sizeof(storage), nullptr, arguments, environment, apple, vectors) == E2BIG,
+          "pointer-table overflow is rejected even for empty strings");
+    check(vectors.argv == unchanged.argv && vectors.envp == unchanged.envp && vectors.apple == unchanged.apple,
+          "failed replacement leaves previously published vectors unchanged");
+}
+
 using Bytes = std::vector<uint8_t>;
 static constexpr uint64_t preferred = 0x100000000, entryOffset = 1024;
 static const size_t page = static_cast<size_t>(getpagesize());
@@ -493,6 +531,21 @@ struct HandoffComplete {};
 int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
     check(checkedFinalThreadCount, "native worker guard runs before destructive cache detachment");
     check(launch->thread.hostTSD == 0x1000 && launch->thread.simulatorTSD == 0x2000, "handoff receives prepared thread storage");
+    uintptr_t base = reinterpret_cast<uintptr_t>(startupStorage.words);
+    auto inStorage = [&](const void *pointer, size_t length) {
+        uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+        return address >= base && contains(sizeof(startupStorage.words), address - base, length);
+    };
+    check(inStorage(reinterpret_cast<const uintptr_t *>(launch->argv) - 2, 2 * sizeof(uintptr_t)), "kernel argument prefix lives in app-image storage");
+    for (const char *const *vector : {launch->argv, launch->envp, launch->apple}) {
+        for (const char *const *item = vector;; ++item) {
+            check(inStorage(item, sizeof(*item)), "every vector entry and terminator lives in app-image storage");
+            if (!*item) break;
+            check(inStorage(*item, 1), "every startup string starts in app-image storage, outside native malloc zones");
+            size_t available = sizeof(startupStorage.words) - (reinterpret_cast<uintptr_t>(*item) - base);
+            check(memchr(*item, 0, available) != nullptr, "every complete startup string and terminator fits inside app-image storage");
+        }
+    }
     // The real implementation never returns after entry. Model that boundary without detaching this test process's cache.
     uintptr_t startGlue = 0;
     auto main = launch->entry(launch->argc, launch->argv, launch->envp, launch->apple, launch->executable,
@@ -670,6 +723,16 @@ static void offMainEntryTest() {
     check(result == 1 && !initializedHeader && !entryCalls && !checkedFinalThreadCount, "off-main handoff rejects before initialization or detachment");
 }
 
+static void oversizedEntryTest() {
+    LSBMappedImage image = {&fakeDyld, 0, 42, reinterpret_cast<uintptr_t>(&fakeEntry)};
+    std::string oversized(startupStorageCapacity, 'x');
+    const char *argv[] = {oversized.c_str(), nullptr};
+    check(LSBEnterDyldSim(&image, &fakeExecutable, "/bin/df", "/usr/lib/dyld_sim", "/RuntimeRoot", 1, argv, nullptr, nullptr) == 1 && errno == E2BIG,
+          "oversized startup arguments fail explicitly with E2BIG");
+    check(!entryCalls && !checkedFinalThreadCount, "oversized startup data fails before host preparation and cache detachment");
+    randomCalls = 0;
+}
+
 int main() {
     parserTests();
     executableParserTests();
@@ -686,7 +749,9 @@ int main() {
     executableMapping(dylibVariant(executable()), 0);
     executableMapping(universal(true, true, dylibVariant(executable())), page);
     mainStackBoundsTest();
+    startupStorageBoundsTest();
     offMainEntryTest();
+    oversizedEntryTest();
     terminalEntryTest(false);
     terminalEntryTest(true);
     entryTest();

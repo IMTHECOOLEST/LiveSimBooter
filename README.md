@@ -30,7 +30,13 @@ and the transport adapter handles the native/simulator XPC wire-magic difference
 See [multiprocess setup, progress, and limits](docs/multiprocess.md).
 
 The opt-in `--launchd` mode starts an isolated, empty simulator launchd bootstrap through the same C LiveProcess entry.
+`--launchd-df` loads one df job through stock `xpcproxy_sim`. POSIX_SPAWN_SETEXEC prepares a replacement LiveProcess while keeping
+the child's guest PID stable for the parent's waitpid, kill and launchd exec/exit events. The old native instance is retired after preparation.
 See [launchd startup, its holding-tank handshake, and workqueue compatibility](docs/launchd.md) for the current experiment.
+`--launchd-lifecycle` exercises process EXIT delivery after waitpid and orphan adoption. `--launchd-backboardd` starts a
+single stock backboardd job. The expanded 545-image UIKit/backboardd cache runs df on the phone; backboardd currently reaches
+an IOHID service-ownership failure after exec replacement. Native Indigo input and a BGRA presentation view are prepared,
+while guest graphics-service integration remains unfinished. See [backboardd progress and cache measurements](docs/backboardd.md).
 
 Unmodified Fish 4.9.3 source, built for iOS Simulator, now runs noninteractive external commands through this runtime.
 On the iOS 26.1 phone it spawned and waited for two df children, then separately verified a Bash child exiting 37. Fish exited 0
@@ -39,7 +45,8 @@ adds native keyboard/display handling and pure-C guest termios/ioctl compatibili
 Fish reached its prompt on the iPhone, accepted editing keys, spawned `df` with exit 0 and original-platform Bash with exit 37,
 interrupted a looping child with Ctrl-C, and exited 0 on Ctrl-D. LLDB caught a new worker entering simulator pthread while
 the host cache region remained inaccessible. Same-burst text/Ctrl-C flushing and other terminal limits are documented.
-Fish starts with job control disabled. Native PTY allocation, full job control, and fork/exec emulation remain unsupported.
+Fish starts with job control disabled. Native PTY allocation, full job control, fork and generic execve remain unsupported;
+the supported replacement path currently uses POSIX_SPAWN_SETEXEC.
 See [Fish setup and results](docs/fish.md) and [tracked creation masks for guest worker threads](docs/creation-mask.md).
 
 Launch the app normally and keep its window in the foreground while programs run. Its active scene keeps the screen awake and

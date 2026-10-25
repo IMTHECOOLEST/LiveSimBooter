@@ -51,14 +51,16 @@ static int probe(mach_port_t service, const audit_token_t *expectedAudit, kern_r
         .ndr = NDR_record, .name = "com.kdt.LiveSimBooter.health.nonexistent"
     };
     int result = ETIMEDOUT;
-    mach_msg_return_t sent;
-    do {
-        mach_msg_timeout_t timeout = remainingMilliseconds(deadline);
-        if (!timeout) goto cleanup;
-        sent = mach_msg(&request.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT | MACH_SEND_INTERRUPT,
-                        sizeof(request), 0, MACH_PORT_NULL, timeout, MACH_PORT_NULL);
-    } while (sent == MACH_SEND_INTERRUPTED);
-    if (sent) { result = sent == MACH_SEND_TIMED_OUT ? ETIMEDOUT : sent == MACH_SEND_INVALID_DEST ? EPIPE : EIO; goto cleanup; }
+    mach_msg_timeout_t sendTimeout = remainingMilliseconds(deadline);
+    if (!sendTimeout) goto cleanup;
+    mach_msg_return_t sent = mach_msg(&request.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT | MACH_SEND_INTERRUPT,
+                                     sizeof(request), 0, MACH_PORT_NULL, sendTimeout, MACH_PORT_NULL);
+    if (sent) {
+        // Timeout after copyin returns a new destination uref with a received disposition. Preserve the borrowed COPY_SEND right.
+        if (MACH_MSGH_BITS_REMOTE(request.header.msgh_bits) == MACH_MSG_TYPE_PORT_SEND) mach_msg_destroy(&request.header);
+        result = sent == MACH_SEND_TIMED_OUT ? ETIMEDOUT : sent == MACH_SEND_INVALID_DEST ? EPIPE : sent == MACH_SEND_INTERRUPTED ? EINTR : EIO;
+        goto cleanup;
+    }
     union { mach_msg_header_t header; uint8_t bytes[4096 + MAX_TRAILER_SIZE]; } response = {0};
     mach_msg_option_t options = MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_INTERRUPT |
         MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) | MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT);
@@ -68,7 +70,11 @@ static int probe(mach_port_t service, const audit_token_t *expectedAudit, kern_r
         if (!timeout) goto cleanup;
         received = mach_msg(&response.header, options, 0, sizeof(response), replyPort, timeout, MACH_PORT_NULL);
     } while (received == MACH_RCV_INTERRUPTED);
-    if (received) { result = received == MACH_RCV_TIMED_OUT ? ETIMEDOUT : received == MACH_RCV_TOO_LARGE ? EMSGSIZE : EIO; goto cleanup; }
+    if (received) {
+        if ((received & ~MACH_MSG_MASK) == MACH_RCV_BODY_ERROR) mach_msg_destroy(&response.header);
+        result = received == MACH_RCV_TIMED_OUT ? ETIMEDOUT : received == MACH_RCV_TOO_LARGE ? EMSGSIZE : EIO;
+        goto cleanup;
+    }
     result = EPROTO;
     if (response.header.msgh_size == sizeof(mig_reply_error_t) && response.header.msgh_id == LookupReplyID &&
         response.header.msgh_bits == MACH_MSGH_BITS(0, MACH_MSG_TYPE_PORT_SEND_ONCE) &&

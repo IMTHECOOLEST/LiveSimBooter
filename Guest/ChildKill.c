@@ -1,4 +1,5 @@
 #include "ChildKill.h"
+#include "ProcessIdentity.h"
 #include "../ProcessSupport/SpawnTransport.h"
 
 #include <errno.h>
@@ -9,7 +10,7 @@ int LSBKill(pid_t pid, int signalNumber) {
     if (signalNumber < 0 || signalNumber >= NSIG) { errno = EINVAL; return -1; }
     if (pid <= 0) { errno = ENOTSUP; return -1; }
     // References from this image retain the original implementation, as with the signal and sigaction interposers.
-    if (pid == getpid()) return kill(pid, signalNumber);
+    if (pid == LSBGuestPID()) return kill(getpid(), signalNumber);
     int savedErrno = errno;
     int error = LSBTransportKill(pid, signalNumber);
     if (error) { errno = error; return -1; }

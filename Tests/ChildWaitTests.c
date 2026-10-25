@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -51,6 +52,36 @@ static void testNoHangAndSelectors(void) {
     assert(LSBWait(NULL) == -1 && errno == ECHILD);
 }
 
+static void testWait4TerminalStatusAndUsage(void) {
+    reset();
+    const int terminalStatuses[] = {0, 37 << 8, SIGTERM};
+    struct rusage usage, unchanged;
+    memset(&usage, 0xa5, sizeof(usage));
+    memcpy(&unchanged, &usage, sizeof(usage));
+    for (unsigned i = 0; i < sizeof(terminalStatuses) / sizeof(terminalStatuses[0]); ++i) {
+        pid_t pid = 501 + (pid_t)i;
+        LSBChildTicket ticket = running(pid, getpgrp());
+        int status = 0x1234;
+        errno = EDOM;
+        assert(LSBWait4(pid, &status, WNOHANG | WUNTRACED | WCONTINUED, NULL) == 0 && status == 0x1234 && errno == EDOM);
+        assert(LSBWait4(pid, &status, 0x40000000, NULL) == -1 && errno == EINVAL && status == 0x1234);
+        assert(LSBWait4(pid, &status, WNOHANG, &usage) == -1 && errno == ENOTSUP && status == 0x1234);
+        assert(!memcmp(&usage, &unchanged, sizeof(usage)));
+        assert(!LSBChildStatusPublishExit(&ledger, ticket, terminalStatuses[i]));
+        assert(LSBWait4(pid, &status, 0, &usage) == -1 && errno == ENOTSUP && status == 0x1234);
+        assert(!memcmp(&usage, &unchanged, sizeof(usage)));
+        errno = ERANGE;
+        pid_t selector = i == 0 ? 0 : i == 1 ? -getpgrp() : -1;
+        assert(LSBWait4(selector, &status, WUNTRACED | WCONTINUED, NULL) == pid && status == terminalStatuses[i] && errno == ERANGE);
+        if (i == 2) assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+        else assert(WIFEXITED(status) && WEXITSTATUS(status) == (i == 1 ? 37 : 0));
+        status = 0x2345;
+        assert(LSBWait4(pid, &status, WNOHANG, NULL) == -1 && errno == ECHILD && status == 0x2345);
+        assert(LSBWaitPID(pid, &status, WNOHANG) == -1 && errno == ECHILD && status == 0x2345);
+    }
+    assert(LSBWait4(-1, NULL, 0, NULL) == -1 && errno == ECHILD);
+}
+
 typedef struct { LSBChildTicket ticket; int status, wake; } Completion;
 static void *completeLater(void *pointer) {
     Completion *completion = pointer;
@@ -61,14 +92,17 @@ static void *completeLater(void *pointer) {
 }
 
 static void testBlockingWait(void) {
-    for (unsigned wake = 0; wake < 2; ++wake) {
+    for (unsigned variant = 0; variant < 4; ++variant) {
         reset();
-        Completion completion = {running(201, getpgrp()), 37 << 8, (int)wake};
+        int wake = variant & 1;
+        Completion completion = {running(201, getpgrp()), 37 << 8, wake};
         pthread_t worker;
         assert(!pthread_create(&worker, NULL, completeLater, &completion));
         int status;
         int options = wake ? WUNTRACED | WCONTINUED : 0;
-        assert(LSBWaitPID(-1, &status, options) == 201 && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+        errno = EDOM;
+        pid_t result = variant & 2 ? LSBWait4(-1, &status, options, NULL) : LSBWaitPID(-1, &status, options);
+        assert(result == 201 && WIFEXITED(status) && WEXITSTATUS(status) == 37 && errno == EDOM);
         assert(!pthread_join(worker, NULL));
     }
 }
@@ -124,27 +158,32 @@ static void *interruptLater(void *pointer) {
 }
 
 static void testInterruptedWait(void) {
-    reset();
-    LSBChildTicket ticket = running(401, getpgrp());
-    struct sigaction action = {.sa_handler = interruptHandler};
-    sigemptyset(&action.sa_mask);
-    assert(!sigaction(SIGUSR1, &action, NULL));
-    pthread_t mainThread = pthread_self(), worker;
-    assert(!pthread_create(&worker, NULL, interruptLater, &mainThread));
-    int status = 0x2222;
-    assert(LSBWaitPID(401, &status, 0) == -1 && errno == EINTR && status == 0x2222);
-    assert(!pthread_join(worker, NULL));
-    assert(!LSBChildStatusAbandon(&ledger, ticket));
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        reset();
+        LSBChildTicket ticket = running(401, getpgrp());
+        struct sigaction action = {.sa_handler = interruptHandler};
+        sigemptyset(&action.sa_mask);
+        assert(!sigaction(SIGUSR1, &action, NULL));
+        pthread_t mainThread = pthread_self(), worker;
+        assert(!pthread_create(&worker, NULL, interruptLater, &mainThread));
+        int status = 0x2222;
+        pid_t result = variant ? LSBWait4(401, &status, 0, NULL) : LSBWaitPID(401, &status, 0);
+        assert(result == -1 && errno == EINTR && status == 0x2222);
+        assert(!pthread_join(worker, NULL));
+        assert(!LSBChildStatusPublishExit(&ledger, ticket, 37 << 8));
+        assert(LSBWait4(401, &status, 0, NULL) == 401 && WIFEXITED(status) && WEXITSTATUS(status) == 37);
+    }
 }
 
 int main(void) {
     alarm(15);
     assert(!pipe(wakeFDs) && !fcntl(wakeFDs[0], F_SETFL, O_NONBLOCK));
     testNoHangAndSelectors();
+    testWait4TerminalStatusAndUsage();
     testBlockingWait();
     testSignalHandlerReapAndDiscard();
     testInterruptedWait();
     close(wakeFDs[0]); close(wakeFDs[1]);
-    puts("ChildWait: standard options, PID/groups, terminal exit/signal status, blocking/lost wakes, signal-handler reaping, discard policy and EINTR passed");
+    puts("ChildWait: waitpid/wait4 options, PID/groups, terminal status, unsupported rusage, blocking/lost wakes, signal reaping, discard and EINTR passed");
     return 0;
 }

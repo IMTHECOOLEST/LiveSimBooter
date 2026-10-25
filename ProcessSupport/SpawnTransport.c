@@ -60,6 +60,62 @@ static void closeFDs(int fds[LSB_MAX_FDS]) {
     }
 }
 
+static bool sendRight(mach_port_t port) {
+    mach_port_type_t type = 0;
+    return MACH_PORT_VALID(port) && !mach_port_type(mach_task_self(), port, &type) && (type & MACH_PORT_TYPE_SEND);
+}
+
+static int encodePorts(xpc_object_t dictionary, const LSBSpawnPorts *ports) {
+    if (!ports) return 0;
+    if (ports->count > LSB_MAX_REGISTERED_PORTS || (!ports->registeredPresent && ports->count)) return EINVAL;
+    for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) {
+        mach_port_t port = ports->registered[i];
+        if (i >= ports->count) { if (port != MACH_PORT_NULL) return EINVAL; else continue; }
+        if (port == MACH_PORT_NULL) continue;
+        if (!sendRight(port)) return EBADF;
+    }
+    if (!ports->bootstrapPresent && ports->bootstrapPort != MACH_PORT_NULL) return EINVAL;
+    if (ports->bootstrapPort != MACH_PORT_NULL && !sendRight(ports->bootstrapPort)) return EBADF;
+    if (ports->registeredPresent) {
+        xpc_object_t array = xpc_array_create(NULL, 0);
+        if (!array) return ENOMEM;
+        for (unsigned i = 0; i < ports->count; ++i) xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, ports->registered[i]);
+        xpc_dictionary_set_value(dictionary, "registered-ports", array);
+        xpc_release(array);
+    }
+    if (ports->bootstrapPresent) xpc_dictionary_set_mach_send(dictionary, "bootstrap-port", ports->bootstrapPort);
+    return 0;
+}
+
+static int decodePorts(xpc_object_t dictionary, LSBSpawnPorts *ports) {
+    xpc_object_t array = xpc_dictionary_get_value(dictionary, "registered-ports");
+    if (array && (xpc_get_type(array) != XPC_TYPE_ARRAY || xpc_array_get_count(array) > LSB_MAX_REGISTERED_PORTS)) return EPROTO;
+    ports->registeredPresent = array != NULL;
+    ports->count = array ? (uint32_t)xpc_array_get_count(array) : 0;
+    for (unsigned i = 0; i < ports->count; ++i) {
+        xpc_object_t object = xpc_array_get_value(array, i);
+        if (!object || xpc_get_type(object) != &_xpc_type_mach_send) { LSBSpawnPortsDispose(ports); return EPROTO; }
+        mach_port_t borrowed = xpc_mach_send_get_right(object);
+        if (borrowed == MACH_PORT_NULL) continue;
+        mach_port_t copy = xpc_array_copy_mach_send(array, i);
+        ports->registered[i] = copy;
+        if (!sendRight(copy)) {
+            LSBSpawnPortsDispose(ports);
+            return EPROTO;
+        }
+    }
+    xpc_object_t bootstrap = xpc_dictionary_get_value(dictionary, "bootstrap-port");
+    if (bootstrap) {
+        if (xpc_get_type(bootstrap) != &_xpc_type_mach_send) { LSBSpawnPortsDispose(ports); return EPROTO; }
+        ports->bootstrapPresent = true;
+        if (xpc_mach_send_get_right(bootstrap) != MACH_PORT_NULL) {
+            ports->bootstrapPort = xpc_dictionary_copy_mach_send(dictionary, "bootstrap-port");
+            if (!sendRight(ports->bootstrapPort)) { LSBSpawnPortsDispose(ports); return EPROTO; }
+        }
+    }
+    return 0;
+}
+
 static int validateBootstrapFDs(int statusFD, int wakeFD) {
     struct stat status, wake;
     if (fstat(statusFD, &status) || fstat(wakeFD, &wake)) return errno;
@@ -165,16 +221,12 @@ static xpc_object_t createRequest(uint32_t kind, uint64_t requestID, int error) 
 
 // This private API has no documented timeout. The native broker must finish or fail each accepted request.
 // Nothing from this call (including a pipe or reply object) may survive the native-cache handoff.
-static int callBroker(xpc_object_t request, xpc_object_t *reply) {
+static int callBrokerOnPort(mach_port_t port, xpc_object_t request, xpc_object_t *reply) {
     *reply = NULL;
-    mach_port_t port = MACH_PORT_NULL;
-    int error = LSBTransportCopyBrokerPort(&port);
-    if (error) return traceError("copy broker port", error, port);
+    if (!sendRight(port)) return EINVAL;
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0);
-    if (!pipe) {
-        mach_port_deallocate(mach_task_self(), port);
-        return traceError("xpc_pipe_create_from_port", ENOMEM, port);
-    }
+    if (!pipe) return traceError("xpc_pipe_create_from_port", ENOMEM, port);
+    int error;
 #if defined(LSB_XPC_WIRE_COMPATIBILITY)
     error = LSBXPCWireBegin(port);
     if (!error) {
@@ -186,8 +238,17 @@ static int callBroker(xpc_object_t request, xpc_object_t *reply) {
 #endif
     if (error) traceError("xpc_pipe_routine", error, port);
     xpc_release(pipe);
-    mach_port_deallocate(mach_task_self(), port);
     if (error && *reply) { xpc_release(*reply); *reply = NULL; }
+    return error;
+}
+
+static int callBroker(xpc_object_t request, xpc_object_t *reply) {
+    *reply = NULL;
+    mach_port_t port = MACH_PORT_NULL;
+    int error = LSBTransportCopyBrokerPort(&port);
+    if (error) return traceError("copy broker port", error, port);
+    error = callBrokerOnPort(port, request, reply);
+    mach_port_deallocate(mach_task_self(), port);
     return error;
 }
 
@@ -203,12 +264,13 @@ static int decodeReplyHeader(xpc_object_t reply, int *remoteError, pid_t *pid, u
     return 0;
 }
 
-int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_t *pid) {
+static int processRequest(uint32_t kind, const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports, pid_t *pid) {
     if (!pid) return EINVAL;
     *pid = 0;
-    xpc_object_t request = createRequest(LSB_REQUEST_SPAWN, 0, 0);
-    if (!request) return traceError("create spawn request", ENOMEM, 0);
+    xpc_object_t request = createRequest(kind, 0, 0);
+    if (!request) return traceError("create process request", ENOMEM, kind);
     int error = encodePlan(request, plan, fds);
+    if (!error) error = encodePorts(request, ports);
     xpc_object_t reply = NULL;
     if (!error) error = callBroker(request, &reply);
     xpc_release(request);
@@ -216,14 +278,27 @@ int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_
         int remoteError = 0;
         uint64_t requestID = 0;
         error = decodeReplyHeader(reply, &remoteError, pid, &requestID);
-        if (error) traceError("decode spawn reply", error, 0);
-        if (!error && remoteError) traceError("broker spawn reply", remoteError, 0);
+        if (error) traceError("decode process reply", error, kind);
+        if (!error && remoteError) traceError("broker process reply", remoteError, kind);
         if (!error) error = remoteError;
         if (!error && *pid <= 0) error = EPROTO;
     }
     if (reply) xpc_release(reply);
     if (error) *pid = 0;
     return error;
+}
+
+int LSBTransportSpawnWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports, pid_t *pid) {
+    return processRequest(LSB_REQUEST_SPAWN, plan, fds, ports, pid);
+}
+
+int LSBTransportExecWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports) {
+    pid_t pid = 0;
+    return processRequest(LSB_REQUEST_EXEC, plan, fds, ports, &pid);
+}
+
+int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_t *pid) {
+    return LSBTransportSpawnWithPorts(plan, fds, NULL, pid);
 }
 
 int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
@@ -243,7 +318,13 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         result->error = remoteError;
         result->pid = pid;
         if (!error) error = remoteError;
-        if (!error && !result->requestID) error = EPROTO;
+        if (!error && (!result->requestID || pid <= 0)) error = EPROTO;
+        if (!error) {
+            int64_t guestPID, parentPID;
+            if (!signedValue(reply, "guest-pid", &guestPID) || guestPID <= 0 || guestPID > INT_MAX ||
+                !signedValue(reply, "parent-pid", &parentPID) || parentPID < 0 || parentPID > INT_MAX) error = EPROTO;
+            else { result->guestPID = (int32_t)guestPID; result->parentPID = (int32_t)parentPID; }
+        }
         if (!error) {
             xpc_object_t root = xpc_dictionary_get_value(reply, "runtime-root");
             if (!root || xpc_get_type(root) != XPC_TYPE_STRING || !xpc_string_get_length(root) ||
@@ -254,6 +335,7 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         if (!error) error = decodeBootstrapFD(reply, "child-status-fd", &result->statusFD);
         if (!error) error = decodeBootstrapFD(reply, "child-wake-fd", &result->wakeFD);
         if (!error) error = validateBootstrapFDs(result->statusFD, result->wakeFD);
+        if (!error) error = decodePorts(reply, &result->ports);
         if (!error) {
             xpc_object_t port = xpc_dictionary_get_value(reply, "launchd-tank-port");
             if (port) {
@@ -273,16 +355,17 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
         result->statusFD = result->wakeFD = -1;
         if (MACH_PORT_VALID(result->launchdTankPort)) mach_port_deallocate(mach_task_self(), result->launchdTankPort);
         result->launchdTankPort = MACH_PORT_NULL;
+        LSBSpawnPortsDispose(&result->ports);
     }
     return error;
 }
 
-int LSBTransportReady(uint64_t requestID, int childError) {
+int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int childError) {
     if (!requestID || childError < 0) return EINVAL;
     xpc_object_t request = createRequest(LSB_REQUEST_READY, requestID, childError);
     if (!request) return ENOMEM;
     xpc_object_t reply = NULL;
-    int error = callBroker(request, &reply);
+    int error = callBrokerOnPort(broker, request, &reply);
     xpc_release(request);
     if (!error) {
         int remoteError = 0;
@@ -293,6 +376,16 @@ int LSBTransportReady(uint64_t requestID, int childError) {
         if (!error) error = remoteError;
     }
     if (reply) xpc_release(reply);
+    return error;
+}
+
+int LSBTransportReady(uint64_t requestID, int childError) {
+    if (!requestID || childError < 0) return EINVAL;
+    mach_port_t port = MACH_PORT_NULL;
+    int error = LSBTransportCopyBrokerPort(&port);
+    if (error) return error;
+    error = LSBTransportReadyOnPort(port, requestID, childError);
+    mach_port_deallocate(mach_task_self(), port);
     return error;
 }
 
@@ -318,15 +411,39 @@ int LSBTransportKill(pid_t targetPID, int signalNumber) {
     return error;
 }
 
+int LSBTransportResolveAuditPID(const audit_token_t *audit, pid_t *result) {
+    if (result) *result = 0;
+    if (!audit || !result || !audit->val[5] || audit->val[5] > INT_MAX) return EINVAL;
+    xpc_object_t request = createRequest(LSB_REQUEST_RESOLVE_AUDIT_PID, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_dictionary_set_data(request, "target-audit", audit, sizeof(*audit));
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        if (!error && (requestID || (!remoteError && pid <= 0))) error = EPROTO;
+        if (!error) error = remoteError;
+        if (!error) *result = pid;
+    }
+    if (reply) xpc_release(reply);
+    return error;
+}
+
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     if (!message) return;
     if (message->object) xpc_release((xpc_object_t)message->object);
     message->object = NULL;
     closeFDs(message->fds);
+    LSBSpawnPortsDispose(&message->ports);
 }
 
 static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
-                          const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD, mach_port_t tankPort) {
+                          const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], bool bootstrap, int statusFD, int wakeFD,
+                          mach_port_t tankPort, const LSBSpawnPorts *ports, pid_t guestPID, pid_t parentPID) {
     if (!message || !message->object || error < 0 || pid < 0) return EINVAL;
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     if (!reply) {
@@ -343,7 +460,7 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
         }
     }
     if (!error && !encodingError && bootstrap) {
-        encodingError = plan ? validateBootstrapFDs(statusFD, wakeFD) : EINVAL;
+        encodingError = plan && pid > 0 && guestPID > 0 && parentPID >= 0 ? validateBootstrapFDs(statusFD, wakeFD) : EINVAL;
         if (!encodingError) {
             xpc_object_t status = xpc_fd_create(statusFD), wake = xpc_fd_create(wakeFD);
             if (!status || !wake) encodingError = errno ? errno : EBADF;
@@ -355,6 +472,11 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
             if (wake) xpc_release(wake);
         }
         if (!encodingError && MACH_PORT_VALID(tankPort)) xpc_dictionary_set_mach_send(reply, "launchd-tank-port", tankPort);
+        if (!encodingError) encodingError = encodePorts(reply, ports);
+        if (!encodingError) {
+            xpc_dictionary_set_int64(reply, "guest-pid", guestPID);
+            xpc_dictionary_set_int64(reply, "parent-pid", parentPID);
+        }
     }
     if (encodingError) error = encodingError;
     xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
@@ -370,18 +492,31 @@ static int replyToMessage(LSBReceivedMessage *message, int error, pid_t pid, uin
 
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL, NULL, 0, 0);
 }
 
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL, NULL, pid, getpid());
+}
+
+int LSBTransportReplyBootstrapWithPorts(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                                        const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, const LSBSpawnPorts *ports) {
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, MACH_PORT_NULL, ports, pid, getpid());
+}
+
+int LSBTransportReplyBootstrapWithMetadata(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
+                                           const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD,
+                                           const LSBBootstrapMetadata *metadata) {
+    if (!metadata || (metadata->launchdTankPort != MACH_PORT_NULL && !sendRight(metadata->launchdTankPort))) return EINVAL;
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
+                          metadata->launchdTankPort, metadata->ports, metadata->guestPID, metadata->parentPID);
 }
 
 int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD, mach_port_t tankPort) {
     if (!MACH_PORT_VALID(tankPort)) return EINVAL;
-    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, tankPort);
+    return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD, tankPort, NULL, pid, getpid());
 }
 
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
@@ -400,23 +535,36 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     uint64_t version = 0, kind = 0;
     int64_t childError = 0;
     if (!unsignedValue(request, "version", &version) || version != LSB_TRANSPORT_VERSION ||
-        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_KILL ||
+        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_RESOLVE_AUDIT_PID ||
         !unsignedValue(request, "request-id", &message->requestID) || !signedValue(request, "error", &childError) ||
         childError < 0 || childError > INT_MAX) error = EPROTO;
     if (!error) {
         message->kind = (uint32_t)kind;
         message->error = (int)childError;
         if (kind == LSB_REQUEST_READY) {
-            if (!message->requestID || xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds")) error = EPROTO;
+            if (!message->requestID || xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds") ||
+                xpc_dictionary_get_value(request, "registered-ports") || xpc_dictionary_get_value(request, "bootstrap-port")) error = EPROTO;
         } else if (message->requestID || childError) error = EPROTO;
-        else if (kind == LSB_REQUEST_SPAWN) error = decodePlan(request, &message->plan, message->fds);
-        else if (xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds")) error = EPROTO;
+        else if (kind == LSB_REQUEST_SPAWN || kind == LSB_REQUEST_EXEC) {
+            error = decodePlan(request, &message->plan, message->fds);
+            if (!error) error = decodePorts(request, &message->ports);
+        } else if (xpc_dictionary_get_value(request, "plan") || xpc_dictionary_get_value(request, "fds") ||
+                   xpc_dictionary_get_value(request, "registered-ports") || xpc_dictionary_get_value(request, "bootstrap-port")) error = EPROTO;
         if (!error && kind == LSB_REQUEST_KILL) {
             int64_t target = 0, signal = 0;
             if (!signedValue(request, "target-pid", &target) || target < INT_MIN || target > INT_MAX ||
                 !signedValue(request, "signal", &signal) || signal < INT_MIN || signal > INT_MAX) error = EPROTO;
             else { message->targetPID = (pid_t)target; message->signalNumber = (int)signal; }
         }
+        if (!error && kind == LSB_REQUEST_RESOLVE_AUDIT_PID) {
+            xpc_object_t target = xpc_dictionary_get_value(request, "target-audit");
+            if (!target || xpc_get_type(target) != XPC_TYPE_DATA || xpc_data_get_length(target) != sizeof(message->targetAudit) ||
+                xpc_dictionary_get_value(request, "target-pid") || xpc_dictionary_get_value(request, "signal")) error = EPROTO;
+            else {
+                memcpy(&message->targetAudit, xpc_data_get_bytes_ptr(target), sizeof(message->targetAudit));
+                if (!message->targetAudit.val[5] || message->targetAudit.val[5] > INT_MAX) error = EPROTO;
+            }
+        } else if (!error && xpc_dictionary_get_value(request, "target-audit")) error = EPROTO;
     }
     if (error) {
         (void)LSBTransportReply(message, error, 0, message->requestID, NULL, NULL, NULL);

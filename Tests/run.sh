@@ -32,8 +32,13 @@ xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -arch arm64 -fno-bui
     LiveSimBooter/LocalPOSIX.cpp LiveSimBooter/LocalMach.cpp -o "$test_directory/DebuggerNotification"
 "$test_directory/DebuggerNotification"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
-    Tests/SpawnPlanTests.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnPlan"
+    Tests/SpawnPlanTests.c Guest/SpawnAttributes.c Guest/ProcessSession.c Guest/ProcessIdentity.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
+    -DLSB_PROCESS_IDENTITY_TESTING -DLSB_PROCESS_SESSION_TESTING -o "$test_directory/SpawnPlan"
 "$test_directory/SpawnPlan"
+LSB_SIMULATE_SESSIONS=1 LSB_TEST_SESSION_GROUP=1 "$test_directory/SpawnPlan"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SpawnAttributesTests.c Guest/SpawnAttributes.c -o "$test_directory/SpawnAttributes"
+"$test_directory/SpawnAttributes"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ChildMonitorTests.c Host/ChildMonitor.c -o "$test_directory/ChildMonitor"
 "$test_directory/ChildMonitor"
@@ -44,8 +49,27 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_
     Tests/ChildWaitTests.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -o "$test_directory/ChildWait"
 "$test_directory/ChildWait"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_KILL_TESTING \
-    Tests/ChildKillTests.c Guest/ChildKill.c -o "$test_directory/ChildKill"
+    Tests/ChildKillTests.c Guest/ChildKill.c Guest/ProcessIdentity.c Guest/ChildWait.c ProcessSupport/ChildStatus.c \
+    -DLSB_PROCESS_IDENTITY_TESTING -DLSB_CHILD_WAIT_TESTING -o "$test_directory/ChildKill"
 "$test_directory/ChildKill"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_KILL_TESTING \
+    Tests/ProcessIdentityTests.c Guest/ChildKill.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -DLSB_CHILD_WAIT_TESTING -o "$test_directory/ProcessIdentity"
+"$test_directory/ProcessIdentity"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ProcessSessionTests.c -o "$test_directory/ProcessSession"
+"$test_directory/ProcessSession"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -fblocks -DLSB_CHILD_WAIT_TESTING \
+    Tests/ProcessEventsTests.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -o "$test_directory/ProcessEvents"
+"$test_directory/ProcessEvents"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -fblocks -dynamiclib -DLSB_CHILD_WAIT_TESTING \
+    Guest/ProcessEvents.c Guest/ProcessIdentity.c Guest/ChildWait.c ProcessSupport/ChildStatus.c \
+    -install_name "$test_directory/libProcessEvents.dylib" -o "$test_directory/libProcessEvents.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ProcessEventsInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessEventsInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessEventsInterpose"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ProcessIdentityInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessIdentityInterpose"
+LSB_GUEST_PID=2147483000 DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessIdentityInterpose"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/CreationMaskTests.c -o "$test_directory/CreationMask"
 "$test_directory/CreationMask"
@@ -53,6 +77,11 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutableAccessTests.c -o "$test_directory/ExecutableAccess"
 "$test_directory/ExecutableAccess"
 python3 -B Tests/PatchIOSPlatformTests.py
+python3 -B Tests/LaunchdIdentityPatchTests.py
+python3 -B Tests/LaunchdIdentityVeneerTests.py
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdIdentityTests.c -o "$test_directory/LaunchdIdentity"
+"$test_directory/LaunchdIdentity"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_FAKE_PTY_TESTING \
     Tests/FakePTYTests.c Guest/FakePTY.c ProcessSupport/FakePTY.c -o "$test_directory/FakePTY"
 "$test_directory/FakePTY"
@@ -92,9 +121,18 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_XPC_WI
 DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=0x2 "$test_directory/XPCWireCompatibility"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/BrokerTests.m Host/TerminalSession.m Host/LaunchdConfiguration.m ProcessSupport/LaunchdHandshake.c ProcessSupport/LaunchdProbe.c \
-    ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
+    Host/IndigoHIDServer.m ProcessSupport/LaunchdEndpoint.c ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c \
     -framework Foundation -o "$test_directory/Broker"
 "$test_directory/Broker"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/IndigoHIDServerTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoHIDServer"
+"$test_directory/IndigoHIDServer"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdEndpointTests.c ProcessSupport/LaunchdEndpoint.c -o "$test_directory/LaunchdEndpoint"
+"$test_directory/LaunchdEndpoint"
+xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 Tests/SimulatorDisplayTests.m \
+    -framework Foundation -framework CoreGraphics -framework IOSurface -o "$test_directory/SimulatorDisplay"
+"$test_directory/SimulatorDisplay"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/LaunchdConfigurationTests.m Host/LaunchdConfiguration.m ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/LaunchdConfiguration"

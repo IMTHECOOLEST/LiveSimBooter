@@ -22,7 +22,8 @@
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
 static unsigned openDescriptorCount(void);
-enum { MalformedBootstrapCount = 14, MalformedKillCount = 12 };
+enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedBootstrapCount = 14 + MalformedPortsCount + MalformedIdentityCount,
+       MalformedKillCount = 14, MalformedAuditCount = 16, PortRoundTripCount = 6 };
 static volatile sig_atomic_t childSignals;
 static volatile sig_atomic_t signalAcknowledgementFD = -1;
 
@@ -46,6 +47,42 @@ int LSBTestCopyBrokerPort(mach_port_t *port) {
     return MACH_PORT_VALID(*port) ? 0 : ENOENT;
 }
 
+static void readyUsingHeldPort(uint64_t requestID) {
+    mach_port_t broker = MACH_PORT_NULL, bootstrap = MACH_PORT_NULL, receiveOnly = MACH_PORT_NULL;
+    mach_port_array_t registered = NULL;
+    mach_msg_type_number_t registeredCount = 0;
+    assert(!LSBTestCopyBrokerPort(&broker));
+    assert(!mach_ports_lookup(mach_task_self(), &registered, &registeredCount));
+    assert(!task_get_bootstrap_port(mach_task_self(), &bootstrap));
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receiveOnly));
+    assert(LSBTransportReadyOnPort(MACH_PORT_NULL, requestID, 0) == EINVAL);
+    assert(LSBTransportReadyOnPort(MACH_PORT_DEAD, requestID, 0) == EINVAL);
+    assert(LSBTransportReadyOnPort(receiveOnly, requestID, 0) == EINVAL);
+    assert(LSBTransportReadyOnPort(broker, 0, 0) == EINVAL);
+    assert(LSBTransportReadyOnPort(broker, requestID, -1) == EINVAL);
+    assert(!mach_port_mod_refs(mach_task_self(), receiveOnly, MACH_PORT_RIGHT_RECEIVE, -1));
+    const char *environment = getenv(LSB_BROKER_PORT_ENV);
+    char *savedEnvironment = environment ? strdup(environment) : NULL;
+    assert(!environment || savedEnvironment);
+    assert(!unsetenv(LSB_BROKER_PORT_ENV));
+    assert(!mach_ports_register(mach_task_self(), NULL, 0));
+    assert(!task_set_bootstrap_port(mach_task_self(), MACH_PORT_NULL));
+    mach_port_t unavailable = MACH_PORT_NULL;
+    assert(LSBTransportCopyBrokerPort(&unavailable) == ENOENT && unavailable == MACH_PORT_NULL);
+    mach_port_urefs_t before, after;
+    assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &before));
+    assert(!LSBTransportReadyOnPort(broker, requestID, 0));
+    assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &after) && after == before);
+    assert(!task_set_bootstrap_port(mach_task_self(), bootstrap));
+    assert(!mach_ports_register(mach_task_self(), registered, registeredCount));
+    if (savedEnvironment) { assert(!setenv(LSB_BROKER_PORT_ENV, savedEnvironment, 1)); free(savedEnvironment); }
+    for (unsigned i = 0; i < registeredCount; ++i) if (MACH_PORT_VALID(registered[i]))
+        assert(!mach_port_deallocate(mach_task_self(), registered[i]));
+    assert(!vm_deallocate(mach_task_self(), (vm_address_t)registered, registeredCount * sizeof(*registered)));
+    if (MACH_PORT_VALID(bootstrap)) assert(!mach_port_deallocate(mach_task_self(), bootstrap));
+    assert(!mach_port_deallocate(mach_task_self(), broker));
+}
+
 static LSBSpawnPlan makePlan(void) {
     LSBSpawnPlan plan = {.version = LSB_PLAN_VERSION, .argc = 2, .envc = 1, .fdCount = 1, .creationMask = 022};
     assert(!LSBPlanAddString(&plan, "/bin/df", &plan.path));
@@ -57,6 +94,186 @@ static LSBSpawnPlan makePlan(void) {
     plan.fds[0].flags = FD_CLOEXEC;
     assert(!LSBValidateSpawnPlan(&plan));
     return plan;
+}
+
+static void setWirePorts(xpc_object_t dictionary, mach_port_t port, int malformedVariant) {
+    xpc_dictionary_set_mach_send(dictionary, "bootstrap-port", port);
+    if (malformedVariant == 0) { xpc_dictionary_set_string(dictionary, "registered-ports", "not an array"); return; }
+    if (malformedVariant == 6) { xpc_dictionary_set_uint64(dictionary, "registered-ports", port); return; }
+    xpc_object_t array = xpc_array_create(NULL, 0);
+    assert(array);
+    xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, port);
+    if (malformedVariant == 1) {
+        for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, port);
+    } else if (malformedVariant == 2) xpc_array_set_string(array, XPC_ARRAY_APPEND, "wrong type after a valid right");
+    else if (malformedVariant == 3) {
+        xpc_object_t null = xpc_null_create();
+        assert(null);
+        xpc_array_append_value(array, null);
+        xpc_release(null);
+    } else if (malformedVariant == 4) {
+        xpc_object_t descriptor = xpc_fd_create(STDERR_FILENO);
+        assert(descriptor);
+        xpc_array_append_value(array, descriptor);
+        xpc_release(descriptor);
+    } else if (malformedVariant == 5) xpc_array_set_uint64(array, XPC_ARRAY_APPEND, port);
+    else {
+        xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, MACH_PORT_NULL);
+        xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, port);
+    }
+    xpc_dictionary_set_value(dictionary, "registered-ports", array);
+    xpc_release(array);
+    if (malformedVariant == 7) xpc_dictionary_set_string(dictionary, "bootstrap-port", "not a Mach send right");
+    else if (malformedVariant == 8) xpc_dictionary_set_uint64(dictionary, "bootstrap-port", port);
+    else if (malformedVariant == 9) {
+        xpc_object_t descriptor = xpc_fd_create(STDERR_FILENO);
+        assert(descriptor);
+        xpc_dictionary_set_value(dictionary, "bootstrap-port", descriptor);
+        xpc_release(descriptor);
+    }
+}
+
+static void testMalformedPorts(const LSBSpawnPlan *plan, int fd, mach_port_t sentPort, unsigned variant) {
+    mach_port_t port;
+    assert(!LSBTestCopyBrokerPort(&port));
+    xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
+    assert(pipe && request);
+    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "kind", variant % 2 ? LSB_REQUEST_EXEC : LSB_REQUEST_SPAWN);
+    xpc_dictionary_set_uint64(request, "request-id", 0);
+    xpc_dictionary_set_int64(request, "error", 0);
+    xpc_dictionary_set_data(request, "plan", plan, sizeof(*plan));
+    xpc_object_t fds = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(fd);
+    assert(fds && descriptor);
+    xpc_array_append_value(fds, descriptor);
+    xpc_dictionary_set_value(request, "fds", fds);
+    xpc_release(descriptor);
+    xpc_release(fds);
+    setWirePorts(request, sentPort, variant);
+    xpc_object_t reply = NULL;
+    assert(!xpc_pipe_routine(pipe, request, &reply));
+    assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
+    xpc_release(reply);
+    xpc_release(request);
+    xpc_release(pipe);
+    assert(!mach_port_deallocate(mach_task_self(), port));
+    mach_port_urefs_t references;
+    assert(!mach_port_get_refs(mach_task_self(), sentPort, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+}
+
+static LSBSpawnPorts orderedPorts(mach_port_t first, mach_port_t second, unsigned variant) {
+    LSBSpawnPorts ports = {.registeredPresent = variant < 4, .count = variant < 3 ? 3 : 0,
+                           .bootstrapPresent = variant < 3 || variant == 4};
+    if (variant == 0) { ports.registered[0] = first; ports.registered[2] = second; }
+    else if (variant == 1) { ports.registered[0] = second; ports.registered[1] = ports.registered[2] = first; }
+    if (variant == 0) ports.bootstrapPort = first;
+    else if (variant == 1 || variant == 4) ports.bootstrapPort = second;
+    return ports;
+}
+
+static void checkKernelRegistration(const LSBSpawnPorts *ports) {
+    mach_port_array_t saved = NULL, imported = NULL;
+    mach_msg_type_number_t savedCount = 0, count = 0;
+    if (ports->registeredPresent) {
+        assert(!mach_ports_lookup(mach_task_self(), &saved, &savedCount));
+        assert(!mach_ports_register(mach_task_self(), (mach_port_t *)ports->registered, ports->count));
+        assert(!mach_ports_lookup(mach_task_self(), &imported, &count) && count == LSB_MAX_REGISTERED_PORTS);
+        for (unsigned i = 0; i < count; ++i) assert(imported[i] == ports->registered[i]);
+        assert(!mach_ports_register(mach_task_self(), saved, savedCount));
+        for (unsigned i = 0; i < savedCount; ++i) if (MACH_PORT_VALID(saved[i])) assert(!mach_port_deallocate(mach_task_self(), saved[i]));
+        for (unsigned i = 0; i < count; ++i) if (MACH_PORT_VALID(imported[i])) assert(!mach_port_deallocate(mach_task_self(), imported[i]));
+        assert(!vm_deallocate(mach_task_self(), (vm_address_t)saved, savedCount * sizeof(*saved)));
+        assert(!vm_deallocate(mach_task_self(), (vm_address_t)imported, count * sizeof(*imported)));
+    }
+    if (ports->bootstrapPresent) {
+        mach_port_t savedBootstrap = MACH_PORT_NULL, importedBootstrap = MACH_PORT_NULL;
+        assert(!task_get_bootstrap_port(mach_task_self(), &savedBootstrap));
+        assert(!task_set_bootstrap_port(mach_task_self(), ports->bootstrapPort));
+        assert(!task_get_bootstrap_port(mach_task_self(), &importedBootstrap) && importedBootstrap == ports->bootstrapPort);
+        assert(!task_set_bootstrap_port(mach_task_self(), savedBootstrap));
+        if (MACH_PORT_VALID(savedBootstrap)) assert(!mach_port_deallocate(mach_task_self(), savedBootstrap));
+        if (MACH_PORT_VALID(importedBootstrap)) assert(!mach_port_deallocate(mach_task_self(), importedBootstrap));
+    }
+}
+
+static void registeredPortsClient(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
+    mach_port_t first, second, receiveOnly;
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &first));
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &second));
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receiveOnly));
+    assert(!mach_port_insert_right(mach_task_self(), first, first, MACH_MSG_TYPE_MAKE_SEND));
+    assert(!mach_port_insert_right(mach_task_self(), second, second, MACH_MSG_TYPE_MAKE_SEND));
+    LSBSpawnPorts invalid = {.registeredPresent = true, .count = LSB_MAX_REGISTERED_PORTS + 1};
+    pid_t pid = 1;
+    assert(LSBTransportSpawnWithPorts(plan, fds, &invalid, &pid) == EINVAL && pid == 0);
+    invalid.count = 0;
+    invalid.registered[2] = first;
+    assert(LSBTransportSpawnWithPorts(plan, fds, &invalid, &pid) == EINVAL && pid == 0);
+    invalid = (LSBSpawnPorts){.registeredPresent = true, .count = 1, .registered = {MACH_PORT_DEAD}};
+    assert(LSBTransportSpawnWithPorts(plan, fds, &invalid, &pid) == EBADF && pid == 0);
+    invalid.registered[0] = receiveOnly;
+    assert(LSBTransportSpawnWithPorts(plan, fds, &invalid, &pid) == EBADF && pid == 0);
+    invalid = (LSBSpawnPorts){.bootstrapPresent = true, .bootstrapPort = receiveOnly};
+    assert(LSBTransportExecWithPorts(plan, fds, &invalid) == EBADF);
+    invalid.bootstrapPort = MACH_PORT_DEAD;
+    assert(LSBTransportExecWithPorts(plan, fds, &invalid) == EBADF);
+    invalid = (LSBSpawnPorts){.count = 1, .registered = {first}};
+    assert(LSBTransportExecWithPorts(plan, fds, &invalid) == EINVAL);
+    invalid = (LSBSpawnPorts){.bootstrapPort = first};
+    assert(LSBTransportExecWithPorts(plan, fds, &invalid) == EINVAL);
+    assert(!mach_port_mod_refs(mach_task_self(), receiveOnly, MACH_PORT_RIGHT_RECEIVE, -1));
+    for (unsigned variant = 0; variant < PortRoundTripCount; ++variant) {
+        LSBSpawnPorts ports = orderedPorts(first, second, variant);
+        if (variant % 2) assert(!LSBTransportExecWithPorts(plan, fds, &ports));
+        else assert(!LSBTransportSpawnWithPorts(plan, fds, &ports, &pid) && pid == 4242);
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), first, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(!mach_port_get_refs(mach_task_self(), second, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        LSBBootstrapReply reply;
+        int received[LSB_MAX_FDS];
+        assert(!LSBTransportCheckIn(&reply, received) && reply.requestID == 80 + variant);
+        assert(reply.ports.registeredPresent == ports.registeredPresent && reply.ports.count == ports.count);
+        assert(!memcmp(reply.ports.registered, ports.registered, sizeof(ports.registered)));
+        assert(reply.ports.bootstrapPresent == ports.bootstrapPresent && reply.ports.bootstrapPort == ports.bootstrapPort);
+        assert(reply.pid == 4242);
+        assert(reply.guestPID == (variant % 2 ? variant == 5 ? INT_MAX : 1234 + (int)variant : 4242));
+        assert(reply.parentPID == (variant % 2 ? variant == 1 ? 0 : 4567 : getppid()));
+        assert(reply.launchdTankPort == (variant == 1 ? second : MACH_PORT_NULL));
+        unsigned firstCopies = ports.bootstrapPort == first, secondCopies = ports.bootstrapPort == second;
+        firstCopies += reply.launchdTankPort == first;
+        secondCopies += reply.launchdTankPort == second;
+        for (unsigned i = 0; i < ports.count; ++i) {
+            firstCopies += ports.registered[i] == first;
+            secondCopies += ports.registered[i] == second;
+        }
+        assert(!mach_port_get_refs(mach_task_self(), first, MACH_PORT_RIGHT_SEND, &references) && references == 1 + firstCopies);
+        assert(!mach_port_get_refs(mach_task_self(), second, MACH_PORT_RIGHT_SEND, &references) && references == 1 + secondCopies);
+        checkKernelRegistration(&reply.ports);
+        if (MACH_PORT_VALID(reply.launchdTankPort)) assert(!mach_port_deallocate(mach_task_self(), reply.launchdTankPort));
+        LSBSpawnPortsDispose(&reply.ports);
+        LSBSpawnPortsDispose(&reply.ports);
+        assert(!reply.ports.count && !reply.ports.registeredPresent && !reply.ports.bootstrapPresent && !reply.ports.bootstrapPort);
+        for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) assert(reply.ports.registered[i] == MACH_PORT_NULL);
+        assert(!mach_port_get_refs(mach_task_self(), first, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(!mach_port_get_refs(mach_task_self(), second, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        close(received[0]);
+        close(reply.statusFD);
+        close(reply.wakeFD);
+        for (unsigned target = 0; target < 2; ++target) {
+            mach_port_t port = target ? second : first;
+            for (unsigned i = 0; i < ports.count; ++i) if (ports.registered[i] == port) {
+                struct { mach_msg_header_t header; mach_msg_max_trailer_t trailer; } ping;
+                assert(!mach_msg(&ping.header, MACH_RCV_MSG, 0, sizeof(ping), port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
+                assert(ping.header.msgh_id == (int)(900 + 10 * variant + i));
+            }
+        }
+        assert(!LSBTransportReady(80 + variant, 0));
+    }
+    assert(LSBTransportExecWithPorts(plan, fds, NULL) == ENOTSUP);
+    assert(LSBTransportExecWithPorts(plan, fds, NULL) == EPROTO);
+    assert(!mach_port_deallocate(mach_task_self(), first) && !mach_port_deallocate(mach_task_self(), second));
+    assert(!mach_port_mod_refs(mach_task_self(), first, MACH_PORT_RIGHT_RECEIVE, -1));
+    assert(!mach_port_mod_refs(mach_task_self(), second, MACH_PORT_RIGHT_RECEIVE, -1));
 }
 
 static void testMalformedRequest(const LSBSpawnPlan *plan, unsigned variant) {
@@ -120,6 +337,13 @@ static void testMalformedKill(unsigned variant) {
         xpc_release(descriptor);
         xpc_release(fds);
     }
+    if (variant == 12) {
+        xpc_object_t array = xpc_array_create(NULL, 0);
+        xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, port);
+        xpc_dictionary_set_value(request, "registered-ports", array);
+        xpc_release(array);
+    }
+    if (variant == 13) xpc_dictionary_set_mach_send(request, "bootstrap-port", port);
     xpc_object_t reply = NULL;
     assert(!xpc_pipe_routine(pipe, request, &reply));
     assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
@@ -127,6 +351,100 @@ static void testMalformedKill(unsigned variant) {
     xpc_release(request);
     xpc_release(pipe);
     mach_port_deallocate(mach_task_self(), port);
+    assert(!LSBRequireSingleThread());
+}
+
+static audit_token_t ownerAudit(void) { return (audit_token_t){{1, 2, 3, 4, 5, 4242, 7, 8}}; }
+
+static void auditResolutionClient(void) {
+    audit_token_t target = ownerAudit(), original = target;
+    pid_t resolved = -1;
+    assert(LSBTransportResolveAuditPID(NULL, &resolved) == EINVAL && !resolved);
+    assert(LSBTransportResolveAuditPID(&target, NULL) == EINVAL);
+    target.val[5] = 0;
+    assert(LSBTransportResolveAuditPID(&target, &resolved) == EINVAL && !resolved);
+    target.val[5] = UINT32_MAX;
+    assert(LSBTransportResolveAuditPID(&target, &resolved) == EINVAL && !resolved);
+    target = original;
+    const int errors[] = {0, 0, ESRCH, EACCES, EPROTO, EPROTO, EPROTO};
+    for (unsigned variant = 0; variant < sizeof(errors) / sizeof(errors[0]); ++variant) {
+        resolved = -1;
+        assert(LSBTransportResolveAuditPID(&target, &resolved) == errors[variant]);
+        assert(resolved == (variant == 0 ? 4242 : variant == 1 ? 1212 : 0));
+        assert(!memcmp(&target, &original, sizeof(target)));
+        assert(!LSBRequireSingleThread());
+    }
+}
+
+static void auditResolutionHost(mach_port_t port, pid_t child) {
+    audit_token_t target = ownerAudit();
+    for (unsigned variant = 0; variant < 7; ++variant) {
+        LSBReceivedMessage message;
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_RESOLVE_AUDIT_PID);
+        assert(!message.requestID && !message.error && message.audit.val[5] == (unsigned)child);
+        assert(!memcmp(&message.targetAudit, &target, sizeof(target)));
+        assert(memcmp(&message.audit, &target, sizeof(target))); // Target payload never replaces the kernel-audited caller.
+        for (unsigned index = 0; index < LSB_MAX_FDS; ++index) assert(message.fds[index] == -1);
+        if (variant == 6) {
+            xpc_object_t reply = xpc_dictionary_create_reply(message.object);
+            assert(reply);
+            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "request-id", 0);
+            xpc_dictionary_set_int64(reply, "error", 0);
+            xpc_dictionary_set_uint64(reply, "pid", 4242);
+            assert(!xpc_pipe_routine_reply(reply));
+            xpc_release(reply);
+        } else {
+            int error = variant == 2 ? ESRCH : variant == 3 ? EACCES : 0;
+            pid_t pid = variant == 1 ? 1212 : variant == 4 ? 0 : 4242;
+            assert(!LSBTransportReply(&message, error, pid, variant == 5 ? 77 : 0, NULL, NULL, NULL));
+        }
+        LSBTransportDisposeMessage(&message);
+    }
+}
+
+static void testMalformedAudit(unsigned variant) {
+    mach_port_t port;
+    assert(!LSBTestCopyBrokerPort(&port));
+    xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
+    assert(pipe && request);
+    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "kind", variant == 15 ? LSB_REQUEST_CHECKIN : LSB_REQUEST_RESOLVE_AUDIT_PID);
+    xpc_dictionary_set_uint64(request, "request-id", variant == 6 ? 77 : 0);
+    xpc_dictionary_set_int64(request, "error", variant == 7 ? EACCES : 0);
+    audit_token_t target = ownerAudit();
+    if (variant == 4) target.val[5] = 0;
+    if (variant == 5) target.val[5] = (uint32_t)INT_MAX + 1;
+    unsigned char payload[sizeof(target) + 1] = {0};
+    memcpy(payload, &target, sizeof(target));
+    if (variant != 0) xpc_dictionary_set_data(request, "target-audit", payload, sizeof(target) + (variant == 2 ? -1 : variant == 3 ? 1 : 0));
+    if (variant == 1) xpc_dictionary_set_uint64(request, "target-audit", 4242);
+    if (variant == 8) xpc_dictionary_set_data(request, "plan", "unexpected", 10);
+    if (variant == 9) {
+        xpc_object_t array = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(STDERR_FILENO);
+        assert(array && descriptor);
+        xpc_array_append_value(array, descriptor);
+        xpc_dictionary_set_value(request, "fds", array);
+        xpc_release(descriptor);
+        xpc_release(array);
+    }
+    if (variant == 10) {
+        xpc_object_t array = xpc_array_create(NULL, 0);
+        xpc_array_set_mach_send(array, XPC_ARRAY_APPEND, port);
+        xpc_dictionary_set_value(request, "registered-ports", array);
+        xpc_release(array);
+    }
+    if (variant == 11) xpc_dictionary_set_mach_send(request, "bootstrap-port", port);
+    if (variant == 12) xpc_dictionary_set_int64(request, "target-pid", 4242);
+    if (variant == 13) xpc_dictionary_set_int64(request, "signal", 0);
+    if (variant == 14) xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_RESOLVE_AUDIT_PID + 1);
+    xpc_object_t reply = NULL;
+    assert(!xpc_pipe_routine(pipe, request, &reply));
+    assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
+    xpc_release(reply);
+    xpc_release(request);
+    xpc_release(pipe);
+    assert(!mach_port_deallocate(mach_task_self(), port));
     assert(!LSBRequireSingleThread());
 }
 
@@ -190,7 +508,8 @@ static int client(void) {
     int received[LSB_MAX_FDS];
     assert(!LSBTransportCheckIn(&reply, received));
     assert(reply.requestID == 77 && !reply.error && !strcmp(reply.runtimeRoot, "/tmp/RuntimeRoot"));
-    assert(reply.launchdTankPort == MACH_PORT_NULL);
+    assert(reply.guestPID == getpid() && reply.parentPID == getppid());
+    assert(reply.launchdTankPort == MACH_PORT_NULL && !reply.ports.count && !reply.ports.registeredPresent && !reply.ports.bootstrapPresent);
     assert(!memcmp(&reply.plan, &plan, sizeof(plan)) && received[0] >= 0);
     assert(reply.statusFD >= 0 && reply.wakeFD >= 0 && reply.statusFD != reply.wakeFD && reply.statusFD != received[0]);
     assert((fcntl(reply.statusFD, F_GETFD) & FD_CLOEXEC) && (fcntl(reply.wakeFD, F_GETFD) & FD_CLOEXEC));
@@ -208,7 +527,7 @@ static int client(void) {
     char byte = 0;
     assert(read(received[0], &byte, 1) == 1 && byte == 'b' && lseek(fd, 0, SEEK_CUR) == 2);
     close(received[0]);
-    assert(!LSBTransportReady(reply.requestID, 0));
+    readyUsingHeldPort(reply.requestID);
     // The optional tank is an independently owned send right, surviving release of the XPC reply and imported FD cleanup.
     mach_port_t tankAnchor = MACH_PORT_NULL;
     for (unsigned index = 0; index < 2; ++index) {
@@ -231,6 +550,8 @@ static int client(void) {
     mach_msg_header_t ping = {.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0), .msgh_size = sizeof(ping),
                               .msgh_remote_port = tankAnchor, .msgh_id = 885};
     assert(!mach_msg(&ping, MACH_SEND_MSG, sizeof(ping), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
+    registeredPortsClient(&plan, fds);
+    for (unsigned variant = 0; variant < MalformedPortsCount; ++variant) testMalformedPorts(&plan, fd, tankAnchor, variant);
     signalAcknowledgementFD = fd;
     struct sigaction action = {.sa_handler = childSignal}, previousAction;
     sigemptyset(&action.sa_mask);
@@ -246,10 +567,13 @@ static int client(void) {
     assert(!LSBRequireSingleThread());
     assert(!sigaction(SIGCHLD, &previousAction, NULL));
     signalAcknowledgementFD = -1;
+    auditResolutionClient();
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportCheckIn(&reply, received) == EPROTO);
         assert(reply.statusFD == -1 && reply.wakeFD == -1 && reply.launchdTankPort == MACH_PORT_NULL);
+        assert(!reply.ports.count && !reply.ports.registeredPresent && !reply.ports.bootstrapPresent && !reply.ports.bootstrapPort);
+        for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) assert(reply.ports.registered[i] == MACH_PORT_NULL);
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(received[i] == -1);
         assert(openDescriptorCount() == before);
         assert(!mach_port_get_refs(mach_task_self(), tankAnchor, MACH_PORT_RIGHT_SEND, &tankReferences) && tankReferences == 1);
@@ -266,6 +590,7 @@ static int client(void) {
     assert(LSBTransportSpawn(&plan, fds, &pid) == EPROTO && pid == 0);
     for (unsigned variant = 0; variant < 5; ++variant) testMalformedRequest(&plan, variant);
     for (unsigned variant = 0; variant < MalformedKillCount; ++variant) testMalformedKill(variant);
+    for (unsigned variant = 0; variant < MalformedAuditCount; ++variant) testMalformedAudit(variant);
     assert(LSBTransportReady(77, ENOEXEC) == ENOEXEC);
     assert(!LSBRequireSingleThread());
     close(fd);
@@ -290,7 +615,7 @@ static int client(void) {
             statistics.sentInline, statistics.sentOOL, statistics.receivedInline, statistics.receivedOOL, statistics.receiveRetries);
     assert(statistics.sentInline && statistics.receivedInline);
 #endif
-    puts("SpawnTransport child: payload, shared FD, optional tank rights, kill/SIGCHLD, malformed-message and single-thread checks passed");
+    puts("SpawnTransport child: spawn/exec, stable identity, FD/Mach ownership, kill/SIGCHLD, malformed-message and single-thread checks passed");
     return 0;
 }
 
@@ -343,6 +668,8 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
     xpc_dictionary_set_uint64(reply, "request-id", 77);
     xpc_dictionary_set_int64(reply, "error", 0);
     xpc_dictionary_set_int64(reply, "pid", 4242);
+    xpc_dictionary_set_int64(reply, "guest-pid", 4242);
+    xpc_dictionary_set_int64(reply, "parent-pid", 1);
     xpc_dictionary_set_string(reply, "runtime-root", "/tmp/RuntimeRoot");
     xpc_dictionary_set_data(reply, "plan", plan, sizeof(*plan));
     xpc_object_t array = xpc_array_create(NULL, 0), descriptor = xpc_fd_create(planFD);
@@ -351,6 +678,24 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
     xpc_dictionary_set_value(reply, "fds", array);
     xpc_release(descriptor);
     xpc_release(array);
+    setWirePorts(reply, tank, variant >= 14 && variant < 14 + MalformedPortsCount ? (int)variant - 14 : -1);
+    if (variant >= 14 + MalformedPortsCount) {
+        switch (variant - 14 - MalformedPortsCount) {
+            case 0: xpc_dictionary_set_value(reply, "guest-pid", NULL); break;
+            case 1: xpc_dictionary_set_string(reply, "guest-pid", "4242"); break;
+            case 2: xpc_dictionary_set_uint64(reply, "guest-pid", 4242); break;
+            case 3: xpc_dictionary_set_int64(reply, "guest-pid", 0); break;
+            case 4: xpc_dictionary_set_int64(reply, "guest-pid", -1); break;
+            case 5: xpc_dictionary_set_int64(reply, "guest-pid", (int64_t)INT_MAX + 1); break;
+            case 6: xpc_dictionary_set_value(reply, "parent-pid", NULL); break;
+            case 7: xpc_dictionary_set_uint64(reply, "parent-pid", 1); break;
+            case 8: xpc_dictionary_set_int64(reply, "parent-pid", -1); break;
+            case 9: xpc_dictionary_set_int64(reply, "parent-pid", (int64_t)INT_MAX + 1); break;
+            case 10: xpc_dictionary_set_int64(reply, "pid", 0); break;
+            case 11: xpc_dictionary_set_int64(reply, "pid", -1); break;
+            default: assert(false);
+        }
+    }
     if (variant == 10) xpc_dictionary_set_string(reply, "plan", "malformed plan");
     // Valid ports in the earlier-invalid variants must be released even though decoding never reaches the optional field.
     if (variant == 11) xpc_dictionary_set_string(reply, "launchd-tank-port", "not a Mach send right");
@@ -379,6 +724,67 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
     }
     assert(!xpc_pipe_routine_reply(reply));
     xpc_release(reply);
+}
+
+static void registeredPortsHost(mach_port_t broker, const BootstrapFDs *bootstrap) {
+    for (unsigned variant = 0; variant < PortRoundTripCount; ++variant) {
+        LSBReceivedMessage pending, message;
+        assert(!LSBTransportReceive(broker, &pending) && pending.kind == (variant % 2 ? LSB_REQUEST_EXEC : LSB_REQUEST_SPAWN));
+        assert(pending.ports.registeredPresent == (variant < 4) && pending.ports.count == (variant < 3 ? 3 : 0));
+        assert(pending.ports.bootstrapPresent == (variant < 3 || variant == 4));
+        if (variant == 0) assert(MACH_PORT_VALID(pending.ports.registered[0]) && !pending.ports.registered[1] &&
+                                 MACH_PORT_VALID(pending.ports.registered[2]) && pending.ports.registered[0] != pending.ports.registered[2]);
+        else if (variant == 1) assert(MACH_PORT_VALID(pending.ports.registered[0]) && MACH_PORT_VALID(pending.ports.registered[1]) &&
+                                      pending.ports.registered[1] == pending.ports.registered[2] &&
+                                      pending.ports.registered[0] != pending.ports.registered[1]);
+        else for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) assert(pending.ports.registered[i] == MACH_PORT_NULL);
+        if (variant == 0 || variant == 1) assert(pending.ports.bootstrapPort == pending.ports.registered[0]);
+        else if (variant == 4) assert(MACH_PORT_VALID(pending.ports.bootstrapPort));
+        else assert(pending.ports.bootstrapPort == MACH_PORT_NULL);
+        assert(!LSBTransportReply(&pending, 0, 4242, 80 + variant, NULL, NULL, NULL));
+        LSBSpawnPorts anchors = pending.ports; // Borrowed names used only to verify disposal below.
+        for (unsigned i = 0; i < pending.ports.count; ++i) {
+            mach_port_t port = pending.ports.registered[i];
+            if (!MACH_PORT_VALID(port)) continue;
+            mach_port_urefs_t references;
+            unsigned copies = pending.ports.bootstrapPort == port;
+            for (unsigned j = 0; j < pending.ports.count; ++j) copies += pending.ports.registered[j] == port;
+            assert(!mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &references) && references == copies);
+            mach_msg_header_t ping = {.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0), .msgh_size = sizeof(ping),
+                                      .msgh_remote_port = port, .msgh_id = (int)(900 + 10 * variant + i)};
+            assert(!mach_msg(&ping, MACH_SEND_MSG, sizeof(ping), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
+        }
+        assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_CHECKIN && !message.ports.count);
+        if (variant % 2) {
+            LSBBootstrapMetadata metadata = {.guestPID = variant == 5 ? INT_MAX : 1234 + (int)variant, .parentPID = variant == 1 ? 0 : 4567,
+                                             .ports = &pending.ports, .launchdTankPort = variant == 1 ? pending.ports.bootstrapPort : MACH_PORT_NULL};
+            assert(!LSBTransportReplyBootstrapWithMetadata(&message, 0, 4242, 80 + variant, "/tmp/RuntimeRoot", &pending.plan,
+                                                           pending.fds, bootstrap->status, bootstrap->wake[0], &metadata));
+        } else assert(!LSBTransportReplyBootstrapWithPorts(&message, 0, 4242, 80 + variant, "/tmp/RuntimeRoot", &pending.plan,
+                                                           pending.fds, bootstrap->status, bootstrap->wake[0], &pending.ports));
+        assert(!memcmp(&anchors, &pending.ports, sizeof(anchors)));
+        LSBTransportDisposeMessage(&message);
+        assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_READY && message.requestID == 80 + variant);
+        LSBTransportDisposeMessage(&pending);
+        assert(!pending.ports.count && !pending.ports.registeredPresent && !pending.ports.bootstrapPresent && !pending.ports.bootstrapPort);
+        assert(pending.fds[0] == -1);
+        for (unsigned i = 0; i < anchors.count; ++i) if (MACH_PORT_VALID(anchors.registered[i])) {
+            mach_port_type_t type;
+            assert(mach_port_type(mach_task_self(), anchors.registered[i], &type) == KERN_INVALID_NAME);
+        }
+        if (MACH_PORT_VALID(anchors.bootstrapPort)) {
+            mach_port_type_t type;
+            assert(mach_port_type(mach_task_self(), anchors.bootstrapPort, &type) == KERN_INVALID_NAME);
+        }
+        assert(!LSBTransportReply(&message, 0, 4242, 80 + variant, NULL, NULL, NULL));
+        LSBTransportDisposeMessage(&message);
+    }
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        LSBReceivedMessage message;
+        assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_EXEC);
+        assert(!LSBTransportReply(&message, variant == 0 ? ENOTSUP : 0, 0, 0, NULL, NULL, NULL));
+        LSBTransportDisposeMessage(&message);
+    }
 }
 
 static int host(const char *executable) {
@@ -436,6 +842,17 @@ static int host(const char *executable) {
     struct { mach_msg_header_t header; mach_msg_max_trailer_t trailer; } ping;
     assert(!mach_msg(&ping.header, MACH_RCV_MSG, 0, sizeof(ping), tank, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL));
     assert(ping.header.msgh_id == 885 && ping.header.msgh_size == sizeof(mach_msg_header_t));
+    registeredPortsHost(port, &bootstrap);
+    for (unsigned variant = 0; variant < MalformedPortsCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && !message.object && !message.ports.count);
+        assert(!message.ports.registeredPresent && !message.ports.bootstrapPresent && !message.ports.bootstrapPort);
+        for (unsigned i = 0; i < LSB_MAX_REGISTERED_PORTS; ++i) assert(message.ports.registered[i] == MACH_PORT_NULL);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), tank, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(openDescriptorCount() == before);
+    }
     const int signals[] = {0, SIGTERM, SIGKILL, SIGTERM, SIGTERM};
     for (unsigned variant = 0; variant < sizeof(signals) / sizeof(signals[0]); ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_KILL && !message.requestID && !message.error);
@@ -454,6 +871,7 @@ static int host(const char *executable) {
         assert(!LSBTransportReply(&message, variant == 2 ? ESRCH : 0, variant == 3 ? 4243 : 4242, variant == 4 ? 77 : 0, NULL, NULL, NULL));
         LSBTransportDisposeMessage(&message);
     }
+    auditResolutionHost(port, child);
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
         unsigned before = openDescriptorCount();
@@ -484,6 +902,12 @@ static int host(const char *executable) {
         assert(openDescriptorCount() == before);
     }
     for (unsigned variant = 0; variant < MalformedKillCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        assert(openDescriptorCount() == before);
+    }
+    for (unsigned variant = 0; variant < MalformedAuditCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);

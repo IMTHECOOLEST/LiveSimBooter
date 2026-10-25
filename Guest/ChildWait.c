@@ -34,6 +34,7 @@ int LSBChildWaitConfigure(LSBChildStatus *ledger, int wakeFD) {
 }
 
 int LSBGuestChildWakeFD(void) { return atomic_load_explicit(&childWakeFD, memory_order_relaxed); }
+LSBChildStatus *LSBGuestChildStatus(void) { return atomic_load_explicit(&childStatus, memory_order_acquire); }
 
 #ifndef LSB_CHILD_WAIT_TESTING
 __attribute__((constructor)) static void initializeChildWait(void) {
@@ -100,6 +101,11 @@ pid_t LSBWaitPID(pid_t selector, int *status, int options) {
 
 pid_t LSBWait(int *status) { return LSBWaitPID(-1, status, 0); }
 
+pid_t LSBWait4(pid_t selector, int *status, int options, struct rusage *usage) {
+    if (usage) { errno = ENOTSUP; return -1; }
+    return LSBWaitPID(selector, status, options);
+}
+
 int LSBSigaction(int number, const struct sigaction *action, struct sigaction *oldAction) {
     // action and oldAction may alias; the kernel can overwrite the caller's input with the previous disposition.
     struct sigaction requested;
@@ -123,6 +129,7 @@ sig_t LSBSignal(int number, sig_t handler) {
 #ifndef LSB_CHILD_WAIT_TESTING
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } interpositions[] = {
     {(const void *)&LSBWaitPID, (const void *)&waitpid}, {(const void *)&LSBWait, (const void *)&wait},
+    {(const void *)&LSBWait4, (const void *)&wait4},
     {(const void *)&LSBSigaction, (const void *)&sigaction}, {(const void *)&LSBSignal, (const void *)&signal}
 };
 #endif

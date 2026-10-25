@@ -10,11 +10,14 @@
 #define LSB_CHILD_STATUS_ENV "LSB_CHILD_STATUS"
 #define LSB_CHILD_WAKE_FD_ENV "LSB_CHILD_WAKE_FD"
 #define LSB_CHILD_STATUS_MAGIC 0x4c534243u
-#define LSB_CHILD_STATUS_VERSION 1u
+#define LSB_CHILD_STATUS_VERSION 3u
 #define LSB_CHILD_STATUS_CAPACITY 16u
 
 typedef struct {
+    // High 44 bits: ticket generation; next 16: observer pins; low 4: phase. One CAS protects reuse against new pins.
     _Atomic(uint64_t) state;
+    // Low 32 bits: native PID. High 32 bits: executable generation. One atomic prevents mixed replacement observations.
+    _Atomic(uint64_t) execution;
     _Atomic(int32_t) pid, group, status;
 } LSBChildSlot;
 
@@ -22,17 +25,51 @@ typedef struct {
     uint32_t magic, version, capacity, reserved;
     _Atomic(uint64_t) nextGeneration;
     _Atomic(uint32_t) discardExited;
+    _Atomic(int32_t) parentPID;
     LSBChildSlot slots[LSB_CHILD_STATUS_CAPACITY];
 } LSBChildStatus;
 
 typedef struct { uint32_t index; uint64_t generation; } LSBChildTicket;
+typedef struct {
+    LSBChildTicket ticket;
+    pid_t nativePID;
+    uint32_t execGeneration;
+    int exited, status;
+    pid_t guestPID, group;
+} LSBChildObservation;
+typedef struct {
+    LSBChildTicket ticket;
+    uint64_t previousExecution, replacementExecution;
+} LSBChildExecUpdate;
 
 void LSBChildStatusInitialize(LSBChildStatus *ledger);
 int LSBChildStatusValidate(const LSBChildStatus *ledger);
-// Reservations consume a new generation; reaped slots are reusable. No pointers cross a process boundary.
+// -1 means no broker-supplied parent identity; zero is a known native-host-only parent.
+int LSBChildStatusSetParentPID(LSBChildStatus *ledger, pid_t parentPID);
+pid_t LSBChildStatusGetParentPID(const LSBChildStatus *ledger);
+// Reservations consume a new generation; reaped slots become reusable after the final observer releases its pin.
+// No pointers cross a process boundary.
 int LSBChildStatusReserve(LSBChildStatus *ledger, LSBChildTicket *ticket);
 int LSBChildStatusPublishRunning(LSBChildStatus *ledger, LSBChildTicket ticket, pid_t pid, pid_t group);
+// Publishers serialize updates per ticket. Replacement preserves the logical PID/group and increments execGeneration from zero.
+int LSBChildStatusPublishExec(LSBChildStatus *ledger, LSBChildTicket ticket, pid_t nativePID);
+// Prepare excludes exit/other replacement publication. The owning publisher must serialize and finish exactly once.
+// Pending execution stays in the update, so a canceled replacement can never leak through a concurrent observation.
+int LSBChildStatusPrepareExec(LSBChildStatus *ledger, LSBChildTicket ticket, pid_t nativePID, LSBChildExecUpdate *update);
+int LSBChildStatusCommitExec(LSBChildStatus *ledger, const LSBChildExecUpdate *update);
+int LSBChildStatusCancelExec(LSBChildStatus *ledger, const LSBChildExecUpdate *update);
+// Nonconsuming snapshot. ECHILD means absent/reaped; EAGAIN means a publication raced the bounded scan. Output changes only on success.
+int LSBChildStatusObserve(const LSBChildStatus *ledger, pid_t guestPID, LSBChildObservation *observation);
+// Enumerates only unconsumed children for adoption. Import reserves a new ticket and preserves execution identity and final status.
+int LSBChildStatusObserveIndex(const LSBChildStatus *ledger, unsigned index, LSBChildObservation *observation);
+int LSBChildStatusImport(LSBChildStatus *ledger, const LSBChildObservation *observation, LSBChildTicket *ticket);
+// A successful acquire owns one pin. Reaped/discarded exit remains visible by exact ticket until every pin is released.
+// Pins and phase share one atomic, so reuse cannot race acquisition. Abandoning a live child reports ESTALE, never EXIT.
+int LSBChildStatusAcquireObservation(LSBChildStatus *ledger, pid_t guestPID, LSBChildObservation *observation);
+int LSBChildStatusObserveTicket(const LSBChildStatus *ledger, LSBChildTicket ticket, LSBChildObservation *observation);
+int LSBChildStatusReleaseObservation(LSBChildStatus *ledger, LSBChildTicket ticket);
 int LSBChildStatusPublishExit(LSBChildStatus *ledger, LSBChildTicket ticket, int waitStatus);
+// Removes ownership of a reserved/running/exited child. Existing observers retain an actual exit but never invent one for a live removal.
 int LSBChildStatusAbandon(LSBChildStatus *ledger, LSBChildTicket ticket);
 // 0: one child reaped; EAGAIN: matching live child; ECHILD: none. Outputs change only on success.
 int LSBChildStatusTryWait(LSBChildStatus *ledger, pid_t selector, pid_t currentGroup, pid_t *pid, int *status);

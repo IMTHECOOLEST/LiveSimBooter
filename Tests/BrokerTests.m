@@ -17,6 +17,7 @@ typedef struct {
     uint64_t requestID;
     bool deliveredPlan;
     mach_port_t launchdTank;
+    pid_t guestPID, parentPID;
 } RecordedReply;
 
 typedef struct { unsigned identifier; int retainedFD; } TestMessageObject;
@@ -31,6 +32,21 @@ static uint64_t signaledRequest;
 static int directSignalError, extensionSignalError, lastSignal;
 static audit_token_t signaledAudit;
 static LSBExtensionEvent extensionCallback;
+static void (^readyReplyHook)(void);
+
+// Keep these tests on broker decisions; IndigoHIDServerTests exercises its Mach authentication and receive lifecycle.
+@interface RecordedIndigoServer : LSBIndigoHIDServer
+@property unsigned authorizations, revocations;
+@property audit_token_t authorizedAudit;
+@end
+@implementation RecordedIndigoServer
+- (void)authorizeClientWithAuditToken:(const audit_token_t *)audit {
+    if (audit) { self.authorizedAudit = *audit; ++self.authorizations; }
+    else { self.authorizedAudit = (audit_token_t){{0}}; ++self.revocations; }
+}
+- (pid_t)connectedClientPID { return 0; }
+- (void)close {}
+@end
 
 int LSBRunningBoardValidateIdentity(const audit_token_t *audit) {
     ++identityChecks;
@@ -109,9 +125,10 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
         for (unsigned i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
     }
     unsigned identifier = ((TestMessageObject *)message->object)->identifier;
-    replies[replyCount++] = (RecordedReply){identifier, message->kind, error, sendError, pid, requestID, plan != NULL, MACH_PORT_NULL};
+    replies[replyCount++] = (RecordedReply){identifier, message->kind, error, sendError, pid, requestID, plan != NULL, MACH_PORT_NULL, 0, 0};
     releaseMessageObject(message->object);
     message->object = NULL;
+    if (message->kind == LSB_REQUEST_READY && readyReplyHook) readyReplyHook();
     return sendError;
 }
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
@@ -134,6 +151,18 @@ int LSBTransportReplyLaunchdBootstrap(LSBReceivedMessage *message, int error, pi
     if (launchdBootstrapSendError) replies[replyCount - 1].sendError = result = launchdBootstrapSendError;
     return result;
 }
+int LSBTransportReplyBootstrapWithMetadata(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
+                                           const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD,
+                                           const LSBBootstrapMetadata *metadata) {
+    assert(metadata && metadata->guestPID > 0 && metadata->parentPID >= 0 && metadata->ports);
+    int result;
+    if (metadata->launchdTankPort)
+        result = LSBTransportReplyLaunchdBootstrap(message, error, pid, requestID, root, plan, fds, statusFD, wakeFD, metadata->launchdTankPort);
+    else result = LSBTransportReplyBootstrap(message, error, pid, requestID, root, plan, fds, statusFD, wakeFD);
+    replies[replyCount - 1].guestPID = metadata->guestPID;
+    replies[replyCount - 1].parentPID = metadata->parentPID;
+    return result;
+}
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     assert(message);
     releaseMessageObject(message->object);
@@ -146,6 +175,9 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
 }
 
 static void resetBroker(void) {
+    if (adoptionRetrySource) dispatch_source_cancel(adoptionRetrySource);
+    adoptionRetrySource = nil;
+    pendingAdoptions = [NSMutableArray new];
     for (LSBJob *job in jobs) {
         if (job.exitMonitor) dispatch_source_cancel(job.exitMonitor);
         job.exitMonitor = nil;
@@ -153,6 +185,7 @@ static void resetBroker(void) {
         job.launchdSource = nil;
         if (job.runningBoardMonitor) LSBRunningBoardMonitorCancel(job.runningBoardMonitor);
         job.runningBoardMonitor = nil;
+        [job.indigo close];
         if (job.request) disposeMessage(job.request);
         job.request = NULL;
     }
@@ -161,6 +194,11 @@ static void resetBroker(void) {
     runtimeRoot = @"/tmp/RuntimeRoot";
     nextIdentifier = 1;
     launchLaneFailed = NO;
+    enableIndigo = NO;
+    retiredIdentityCount = auditResolutionLogs = 0;
+    retiredIdentitiesFull = NO;
+    memset(retiredIdentities, 0, sizeof(retiredIdentities));
+    readyReplyHook = nil;
     reportedPID = getpid();
     submitError = readySendError = launchdBootstrapSendError = monitorCreateError = identityCheckError = 0;
     runningBoardError = EACCES;
@@ -398,6 +436,98 @@ static LSBJob *runTestJob(LSBJob *parent, uint32_t generation) {
     return job;
 }
 
+static LSBJob *auditJob(pid_t nativePID, pid_t guestPID, unsigned generation, BOOL launchd) {
+    LSBJob *job = [LSBJob new];
+    job.identifier = nextIdentifier++;
+    job.pid = nativePID;
+    job.guestPID = guestPID;
+    job.pidVersion = generation;
+    job.audit = (audit_token_t){{1, 2, 3, 4, 5, (unsigned)nativePID, 7, generation}};
+    job.phase = JobRunning;
+    job.simulatorLaunchd = launchd;
+    [jobs addObject:job];
+    return job;
+}
+
+static RecordedReply *auditReply(audit_token_t caller, audit_token_t target) {
+    LSBReceivedMessage *request = messageFor(LSB_REQUEST_RESOLVE_AUDIT_PID, caller.val[5], caller.val[7], 0);
+    request->audit = caller;
+    request->targetAudit = target;
+    unsigned object = ((TestMessageObject *)request->object)->identifier;
+    handleMessage(request);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && reply->kind == LSB_REQUEST_RESOLVE_AUDIT_PID && !reply->requestID && !reply->deliveredPlan);
+    return reply;
+}
+
+static void testAuditOwnerAuthenticationAndIdentity(void) {
+    resetBroker();
+    LSBJob *launchd = auditJob(8100, 8100, 11, YES), *target = auditJob(8200, 8150, 12, NO);
+    audit_token_t targetAudit = target.audit, caller = launchd.audit;
+    RecordedReply *reply = auditReply(caller, targetAudit);
+    assert(!reply->error && reply->pid == target.guestPID);
+    assert(auditReply(targetAudit, targetAudit)->error == EACCES);
+    for (unsigned index = 0; index < 8; ++index) {
+        audit_token_t changed = caller;
+        changed.val[index] ^= 1;
+        assert(auditReply(changed, targetAudit)->error == EACCES);
+        if (index == 5) continue; // An unrelated native PID is not a managed target; trusted launchd supplies its actual audit token.
+        changed = targetAudit;
+        changed.val[index] ^= 1;
+        assert(auditReply(caller, changed)->error == ESRCH);
+    }
+    launchd.phase = JobDispatched;
+    assert(auditReply(caller, targetAudit)->error == EACCES);
+    launchd.phase = JobRunning;
+    launchd.retiredForExec = YES;
+    assert(auditReply(caller, targetAudit)->error == EACCES);
+    launchd.retiredForExec = NO;
+    target.phase = JobDispatched;
+    assert(auditReply(caller, targetAudit)->error == ESRCH);
+    target.phase = JobRunning;
+    target.retiredForExec = YES;
+    assert(auditReply(caller, targetAudit)->error == ESRCH);
+    target.retiredForExec = NO;
+    audit_token_t unknown = {{8, 7, 6, 5, 4, 8300, 2, 1}};
+    reply = auditReply(caller, unknown);
+    assert(!reply->error && reply->pid == 8300);
+    unknown.val[5] = target.guestPID;
+    assert(auditReply(caller, unknown)->error == ESRCH); // Native fallback cannot become a guest job by colliding with its stable PID.
+    unknown.val[5] = 0;
+    assert(auditReply(caller, unknown)->error == EINVAL);
+    unknown.val[5] = UINT32_MAX;
+    assert(auditReply(caller, unknown)->error == EINVAL);
+    finishJob(target, 0);
+    assert(retiredIdentityCount == 1 && !findJob(target.identifier));
+    assert(auditReply(caller, targetAudit)->error == ESRCH);
+    unknown.val[5] = target.guestPID;
+    assert(auditReply(caller, unknown)->error == ESRCH);
+    LSBJob *reused = auditJob(target.pid, 8400, 13, NO);
+    reply = auditReply(caller, reused.audit);
+    assert(!reply->error && reply->pid == 8400); // A newly committed exact identity remains usable even when its native PID was retired.
+    assert(auditReply(caller, targetAudit)->error == ESRCH);
+}
+
+static void testAuditIdentityHistoryNeverEvicts(void) {
+    resetBroker();
+    LSBJob *launchd = auditJob(8100, 8100, 11, YES), *current = auditJob(8200, 8150, 12, NO);
+    LSBJob *old = [LSBJob new];
+    for (unsigned index = 0; index < RetiredIdentityCapacity + 3; ++index) {
+        old.pid = 9000 + index;
+        old.guestPID = 10000 + index;
+        old.audit = (audit_token_t){{1, 2, 3, 4, 5, (unsigned)old.pid, 7, 200 + index}};
+        retireAuditIdentity(old);
+    }
+    assert(retiredIdentitiesFull && retiredIdentityCount == RetiredIdentityCapacity);
+    assert(retiredIdentities[0].audit.val[5] == 9000);
+    assert(retiredIdentities[RetiredIdentityCapacity - 1].audit.val[5] == 9000 + RetiredIdentityCapacity - 1);
+    audit_token_t unknown = {{1, 2, 3, 4, 5, 20000, 7, 30}};
+    assert(auditReply(launchd.audit, unknown)->error == ESRCH);
+    assert(auditReply(launchd.audit, old.audit)->error == ESRCH); // Even an identity beyond the bound cannot escape through fallback.
+    RecordedReply *reply = auditReply(launchd.audit, current.audit);
+    assert(!reply->error && reply->pid == current.guestPID);
+}
+
 static void testExitStatusesAndRepeatedReaping(void) {
     resetBroker();
     LSBJob *parent = runTestJob(nil, 10);
@@ -421,6 +551,200 @@ static void testExitStatusesAndRepeatedReaping(void) {
     }
     recordChildExit(parent.identifier, 0);
     assert(!jobs.count);
+}
+
+static void testExecReplacement(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 100);
+    LSBJob *old = runTestJob(parent, 101);
+    LSBJob *grandchild = runTestJob(old, 102);
+    pid_t guestPID = old.guestPID;
+    LSBChildTicket ticket = old.parentTicket;
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    request->kind = LSB_REQUEST_EXEC;
+    request->audit = old.audit;
+    handleMessage(request);
+    LSBJob *replacement = startingJob;
+    assert(replacement && replacement != old && replacement.guestPID == guestPID && old.replacementIdentifier == replacement.identifier);
+    assert(replacement.childStatus != old.childStatus);
+    LSBChildObservation observation;
+    assert(!LSBChildStatusObserve(replacement.childStatus, grandchild.guestPID, &observation));
+    assert(!observation.execGeneration && !observation.exited);
+    reportedPID = getpid() + 200;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 103, 0));
+    assert(replies[replyCount - 1].guestPID == guestPID && replies[replyCount - 1].parentPID == parent.guestPID);
+    handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 103, replacement.identifier));
+    assert(!findJob(old.identifier) && findJob(replacement.identifier) && !startingJob);
+    assert(replacement.parentIdentifier == parent.identifier && grandchild.parentIdentifier == replacement.identifier);
+    assert(replacement.parentTicket.index == ticket.index && replacement.parentTicket.generation == ticket.generation);
+    assert(replyFor(object) && !replyFor(object)->error && replyFor(object)->pid == guestPID);
+    assert(lastSignal == SIGKILL && signaledAudit.val[7] == 101);
+    assert(!LSBChildStatusObserve(parent.childStatus, guestPID, &observation));
+    assert(observation.nativePID == reportedPID && observation.execGeneration == 1 && !observation.exited);
+    assert(!signalChild(parent, guestPID, SIGTERM) && signaledAudit.val[5] == (unsigned)reportedPID && signaledAudit.val[7] == 103);
+    pid_t waited = -1;
+    int status = -1;
+    assert(LSBChildStatusTryWait(parent.childStatus, guestPID, getpgrp(), &waited, &status) == EAGAIN);
+    recordChildExit(old.identifier, SIGKILL); // A queued notification from the retired native instance is ignored.
+    assert(LSBChildStatusTryWait(parent.childStatus, guestPID, getpgrp(), &waited, &status) == EAGAIN);
+    recordChildExit(replacement.identifier, 23 << 8);
+    assert(!LSBChildStatusTryWait(parent.childStatus, guestPID, getpgrp(), &waited, &status) && waited == guestPID && status == (23 << 8));
+    assert(grandchild.parentIdentifier == 0);
+}
+
+static void testExecFailurePreservesCaller(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 110);
+    LSBJob *old = runTestJob(parent, 111);
+    for (unsigned failReply = 0; failReply < 2; ++failReply) {
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        request->kind = LSB_REQUEST_EXEC;
+        request->audit = old.audit;
+        handleMessage(request);
+        LSBJob *replacement = startingJob;
+        reportedPID = getpid() + 200;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 112 + failReply, 0));
+        LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, reportedPID, 112 + failReply, replacement.identifier);
+        if (failReply) readySendError = EPIPE;
+        else ready->error = ENOEXEC;
+        handleMessage(ready);
+        readySendError = 0;
+        assert(findJob(old.identifier) && !old.replacementIdentifier && !findJob(replacement.identifier));
+        assert(!deliveredSignals && replyFor(object)->error == (failReply ? EPIPE : ENOEXEC));
+        LSBChildObservation observation;
+        assert(!LSBChildStatusObserve(parent.childStatus, old.guestPID, &observation));
+        assert(!observation.execGeneration && !observation.exited && observation.nativePID == old.pid);
+    }
+}
+
+static void setRequestProgram(LSBReceivedMessage *request, const char *program) {
+    assert(!LSBPlanAddString(&request->plan, program, &request->plan.path));
+    request->plan.argv[0] = request->plan.path;
+}
+
+static void testIndigoRegistrationGatesExecOnly(void) {
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        resetBroker();
+        LSBJob *parent = runTestJob(nil, 200);
+        parent.simulatorLaunchd = YES;
+        RecordedIndigoServer *indigo = [RecordedIndigoServer new];
+        parent.indigo = indigo;
+        parent.servicesPending = YES;
+        int fd;
+        unsigned proxyObject;
+        LSBReceivedMessage *request = spawnRequest(&fd, &proxyObject);
+        setRequestProgram(request, "/usr/libexec/xpcproxy_sim");
+        unsigned launches = submittedLaunches;
+        enqueueSpawn(request, parent);
+        LSBJob *proxy = startingJob;
+        // Launchd cannot answer endpoint-registration requests until its initial spawn returns from READY.
+        assert(proxy && proxy.phase == JobStarting && submittedLaunches == launches + 1 && parent.servicesPending);
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 201, 0));
+        handleMessage(messageFor(LSB_REQUEST_READY, getpid(), 201, proxy.identifier));
+        assert(proxy.phase == JobRunning && !startingJob && replyFor(proxyObject) && !replyFor(proxyObject)->error);
+        assert(!indigo.authorizations && !parent.indigoAuthorizedIdentifier);
+
+        unsigned execObject;
+        request = spawnRequest(&fd, &execObject);
+        request->kind = LSB_REQUEST_EXEC;
+        request->audit = proxy.audit;
+        setRequestProgram(request, scenario == 1 ? "/tmp/RuntimeRoot/usr/libexec/backboardd" : "/usr/libexec/backboardd");
+        handleMessage(request);
+        LSBJob *replacement = findJob(proxy.replacementIdentifier);
+        assert(replacement && replacement.phase == JobQueued && !startingJob && submittedLaunches == launches + 1);
+        assert(!replyFor(execObject) && fcntl(fd, F_GETFD) >= 0 && !indigo.authorizations);
+        startNextJob();
+        assert(!startingJob && replacement.phase == JobQueued && !replyFor(execObject));
+
+        parent.servicesPending = NO;
+        parent.servicesError = scenario == 2 ? EACCES : 0;
+        startNextJob();
+        if (parent.servicesError) {
+            assert(replyFor(execObject) && replyFor(execObject)->error == EACCES && !replyFor(execObject)->pid);
+            assert(!findJob(replacement.identifier) && !proxy.replacementIdentifier && findJob(proxy.identifier));
+            assert(submittedLaunches == launches + 1 && !indigo.authorizations && !indigo.revocations && !deliveredSignals);
+            assertClosed(fd);
+            continue;
+        }
+        assert(startingJob == replacement && replacement.phase == JobStarting && submittedLaunches == launches + 2);
+        reportedPID = getpid() + 200;
+        LSBReceivedMessage *checkIn = messageFor(LSB_REQUEST_CHECKIN, reportedPID, 202, 0);
+        checkIn->audit.val[0] = 91;
+        checkIn->audit.val[6] = 92;
+        audit_token_t identity = checkIn->audit;
+        handleMessage(checkIn);
+        audit_token_t authorized = indigo.authorizedAudit;
+        assert(indigo.authorizations == 1 && !indigo.revocations && !memcmp(&authorized, &identity, sizeof(identity)));
+        assert(parent.indigoAuthorizedIdentifier == replacement.identifier && !indigo.connectedClientPID);
+        LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, reportedPID, 202, replacement.identifier);
+        ready->audit = identity;
+        ready->error = scenario == 3 ? ENOEXEC : 0;
+        handleMessage(ready);
+        if (scenario == 3) {
+            assert(replyFor(execObject)->error == ENOEXEC && findJob(proxy.identifier) && !proxy.replacementIdentifier);
+            assert(!findJob(replacement.identifier) && indigo.revocations == 1 && !parent.indigoAuthorizedIdentifier);
+            assert(!deliveredSignals);
+            continue;
+        }
+        assert(!findJob(proxy.identifier) && replacement.phase == JobRunning && !replyFor(execObject)->error);
+        // Retiring xpcproxy must not revoke the newly authorized replacement.
+        assert(indigo.authorizations == 1 && !indigo.revocations && parent.indigoAuthorizedIdentifier == replacement.identifier);
+        recordChildExit(proxy.identifier, SIGKILL);
+        assert(!indigo.revocations);
+        // Death before the first Indigo connection still revokes this exact native identity.
+        assert(!indigo.connectedClientPID);
+        recordChildExit(replacement.identifier, SIGTERM);
+        authorized = indigo.authorizedAudit;
+        audit_token_t empty = {{0}};
+        assert(indigo.revocations == 1 && !memcmp(&authorized, &empty, sizeof(empty)) && !parent.indigoAuthorizedIdentifier);
+        recordChildExit(replacement.identifier, SIGTERM);
+        assert(indigo.revocations == 1);
+    }
+}
+
+static void testIndigoOwnerExecIsRejectedWithoutChangingAuthorization(void) {
+    resetBroker();
+    LSBJob *parent = runTestJob(nil, 210);
+    parent.simulatorLaunchd = YES;
+    RecordedIndigoServer *indigo = [RecordedIndigoServer new];
+    parent.indigo = indigo;
+    int fd;
+    unsigned firstObject;
+    LSBReceivedMessage *request = spawnRequest(&fd, &firstObject);
+    setRequestProgram(request, "/usr/libexec/backboardd");
+    enqueueSpawn(request, parent);
+    LSBJob *old = startingJob;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 211, 0));
+    handleMessage(messageFor(LSB_REQUEST_READY, getpid(), 211, old.identifier));
+    audit_token_t identity = old.audit;
+    assert(old.phase == JobRunning && indigo.authorizations == 1 && parent.indigoAuthorizedIdentifier == old.identifier);
+    unsigned launches = submittedLaunches;
+    uint64_t next = nextIdentifier;
+    LSBChildStatus *ledger = old.childStatus;
+    for (unsigned differentProgram = 0; differentProgram < 2; ++differentProgram) {
+        unsigned execObject;
+        request = spawnRequest(&fd, &execObject);
+        setRequestProgram(request, differentProgram ? "/bin/df" : "/usr/libexec/backboardd");
+        request->kind = LSB_REQUEST_EXEC;
+        request->audit = identity;
+        handleMessage(request);
+        assert(replyFor(execObject) && replyFor(execObject)->error == ENOTSUP && !replyFor(execObject)->pid);
+        assert(findJob(old.identifier) && old.phase == JobRunning && !old.replacementIdentifier && old.childStatus == ledger);
+        assert(jobs.count == 2 && !startingJob && submittedLaunches == launches && nextIdentifier == next && !deliveredSignals);
+        audit_token_t authorized = indigo.authorizedAudit;
+        assert(parent.indigoAuthorizedIdentifier == old.identifier && !memcmp(&authorized, &identity, sizeof(identity)));
+        assert(indigo.authorizations == 1 && !indigo.revocations);
+        assertClosed(fd);
+        LSBChildObservation observation;
+        assert(!LSBChildStatusObserve(parent.childStatus, old.guestPID, &observation));
+        assert(!observation.execGeneration && !observation.exited && observation.nativePID == old.pid);
+    }
+    recordChildExit(old.identifier, SIGTERM);
+    assert(!parent.indigoAuthorizedIdentifier && indigo.revocations == 1);
 }
 
 static void testMonitorFailureAndEarlyExit(void) {
@@ -494,9 +818,126 @@ static void testParentDeathDetachesOrphans(void) {
     recordChildExit(parent.identifier, SIGKILL);
     assert(!findJob(parent.identifier) && !findJob(pending));
     assert(replyFor(object)->error == ECANCELED && !running.parentIdentifier);
+    assert(LSBChildStatusGetParentPID(running.childStatus) == 0);
     assert(jobs.count == 1 && !launchLaneFailed && !startingJob);
     recordChildExit(running.identifier, 7 << 8);
     assert(!jobs.count && !deliveredSignals);
+}
+
+// Adoption cases use distinct logical/native identities without launching real subprocesses.
+static LSBJob *managedJob(LSBJob *parent, pid_t identity) {
+    LSBJob *job = [LSBJob new];
+    job.identifier = nextIdentifier++;
+    job.phase = JobRunning;
+    job.pid = job.guestPID = identity;
+    job.pidVersion = (uint32_t)job.identifier;
+    job.audit = (audit_token_t){{0, 0, 0, 0, 0, (unsigned)identity, 0, job.pidVersion}};
+    assert(!prepareChildStatus(job));
+    assert(!LSBChildStatusSetParentPID(job.childStatus, parent ? parent.guestPID : getpid()));
+    if (parent) {
+        LSBChildTicket ticket;
+        assert(!LSBChildStatusReserve(parent.childStatus, &ticket));
+        job.parentTicket = ticket;
+        assert(!LSBChildStatusPublishRunning(parent.childStatus, job.parentTicket, identity, identity));
+        job.parentIdentifier = parent.identifier;
+    }
+    [jobs addObject:job];
+    return job;
+}
+
+static void testLaunchdAdoptsRunningAndZombieChildren(void) {
+    resetBroker();
+    LSBJob *init = managedJob(nil, 7001);
+    init.simulatorLaunchd = YES;
+    LSBJob *parent = managedJob(init, 7002), *child = managedJob(parent, 7003), *grandchild = managedJob(child, 7004);
+    LSBJob *zombie = managedJob(parent, 7005);
+    recordChildExit(zombie.identifier, 23 << 8);
+    assert(!LSBChildStatusPublishExec(parent.childStatus, child.parentTicket, 7103));
+    child.pid = 7103;
+    child.executed = YES;
+    recordChildExit(parent.identifier, 0);
+    assert(child.parentIdentifier == init.identifier && grandchild.parentIdentifier == child.identifier);
+    assert(LSBChildStatusGetParentPID(child.childStatus) == init.guestPID);
+    assert(LSBChildStatusGetParentPID(grandchild.childStatus) == child.guestPID);
+    LSBChildObservation observation;
+    assert(!LSBChildStatusObserve(init.childStatus, child.guestPID, &observation));
+    assert(observation.nativePID == 7103 && observation.execGeneration == 1 && !observation.exited);
+    assert(!LSBChildStatusObserve(init.childStatus, zombie.guestPID, &observation) && observation.exited && observation.status == (23 << 8));
+    assert(!pendingAdoptions.count);
+    recordChildExit(child.identifier, 37 << 8);
+    assert(grandchild.parentIdentifier == init.identifier && LSBChildStatusGetParentPID(grandchild.childStatus) == init.guestPID);
+    pid_t waited;
+    int status;
+    assert(!LSBChildStatusTryWait(init.childStatus, child.guestPID, 0, &waited, &status) && status == (37 << 8));
+    assert(!LSBChildStatusTryWait(init.childStatus, zombie.guestPID, 0, &waited, &status) && status == (23 << 8));
+    assert(!LSBChildStatusTryWait(init.childStatus, parent.guestPID, 0, &waited, &status) && status == 0);
+}
+
+static void fillExitedLedger(LSBJob *parent) {
+    for (unsigned index = 0; index < LSB_CHILD_STATUS_CAPACITY; ++index) {
+        LSBChildTicket ticket;
+        assert(!LSBChildStatusReserve(parent.childStatus, &ticket));
+        assert(!LSBChildStatusPublishRunning(parent.childStatus, ticket, 10000 + index, 10000 + index));
+        assert(!LSBChildStatusPublishExit(parent.childStatus, ticket, 0));
+    }
+}
+
+static void testAdoptionCapacityPreservesExitAndExec(void) {
+    resetBroker();
+    LSBJob *init = managedJob(nil, 7201);
+    init.simulatorLaunchd = YES;
+    fillExitedLedger(init);
+    LSBJob *parent = managedJob(nil, 7202), *child = managedJob(parent, 7203), *zombie = managedJob(parent, 7204);
+    recordChildExit(zombie.identifier, 41 << 8);
+    recordChildExit(parent.identifier, 0);
+    assert(pendingAdoptions.count == 2 && child.parentStatusPending && child.parentIdentifier == init.identifier);
+    assert(LSBChildStatusGetParentPID(child.childStatus) == init.guestPID);
+    int fd;
+    unsigned object;
+    enqueueSpawn(spawnRequest(&fd, &object), child);
+    assert(replyFor(object)->error == EAGAIN && !startingJob);
+    LSBReceivedMessage *exec = spawnRequest(&fd, &object);
+    exec->kind = LSB_REQUEST_EXEC;
+    exec->audit = child.audit;
+    handleMessage(exec);
+    LSBJob *replacement = startingJob;
+    reportedPID = getpid() + 400;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 7205, 0));
+    handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 7205, replacement.identifier));
+    assert(!findJob(child.identifier) && replacement.parentStatusPending && replacement.parentIdentifier == init.identifier);
+    assert(LSBChildStatusGetParentPID(replacement.childStatus) == init.guestPID);
+    LSBPendingAdoption *pending = pendingAdoption(replacement.identifier);
+    assert(pending && pending.observation.nativePID == reportedPID && pending.observation.execGeneration == 1);
+    recordChildExit(replacement.identifier, SIGTERM);
+    assert(pendingAdoptions.count == 2);
+    pid_t waited;
+    int status;
+    assert(!LSBChildStatusTryWait(init.childStatus, 10000, 0, &waited, &status));
+    retryAdoptions();
+    assert(pendingAdoptions.count == 1);
+    assert(!LSBChildStatusTryWait(init.childStatus, child.guestPID, 0, &waited, &status) && status == SIGTERM);
+    retryAdoptions();
+    assert(!pendingAdoptions.count && !adoptionRetrySource);
+    assert(!LSBChildStatusTryWait(init.childStatus, zombie.guestPID, 0, &waited, &status) && status == (41 << 8));
+}
+
+static void testLaunchdDeathAndCyclesDoNotAdopt(void) {
+    resetBroker();
+    LSBJob *parent = managedJob(nil, 7301), *init = managedJob(parent, 7302), *child = managedJob(parent, 7303);
+    init.simulatorLaunchd = YES; // A descendant cannot become its sibling's ancestor through adoption.
+    recordChildExit(parent.identifier, 0);
+    assert(!child.parentIdentifier && !init.parentIdentifier && LSBChildStatusGetParentPID(child.childStatus) == 0);
+    resetBroker();
+    init = managedJob(nil, 7401);
+    init.simulatorLaunchd = YES;
+    fillExitedLedger(init);
+    parent = managedJob(nil, 7402);
+    child = managedJob(parent, 7403);
+    recordChildExit(parent.identifier, 0);
+    assert(pendingAdoptions.count == 1);
+    recordChildExit(init.identifier, SIGKILL);
+    assert(!pendingAdoptions.count && !adoptionRetrySource && !child.parentIdentifier);
+    assert(LSBChildStatusGetParentPID(child.childStatus) == 0);
 }
 
 static RecordedReply *requestKill(LSBJob *parent, pid_t targetPID, int signalNumber) {
@@ -598,6 +1039,46 @@ static void runMainQueueUntil(BOOL (^done)(void)) {
     while (!done() && deadline.timeIntervalSinceNow > 0)
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.001]];
     assert(done());
+}
+
+static void testAuditResolutionSeesCommittedExecOnly(void) {
+    for (unsigned failReady = 0; failReady < 2; ++failReady) {
+        resetBroker();
+        LSBJob *launchd = runTestJob(nil, 800), *old = runTestJob(launchd, 801);
+        launchd.simulatorLaunchd = YES;
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        request->kind = LSB_REQUEST_EXEC;
+        request->audit = old.audit;
+        handleMessage(request);
+        LSBJob *replacement = startingJob;
+        reportedPID = getpid() + 200;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 802, 0));
+        assert(replacement.phase == JobDispatched);
+        assert(auditReply(launchd.audit, replacement.audit)->error == ESRCH);
+        RecordedReply *reply = auditReply(launchd.audit, old.audit);
+        assert(!reply->error && reply->pid == old.guestPID);
+        __block BOOL queried = NO;
+        readyReplyHook = ^{
+            assert(replacement.phase == JobDispatched); // The kernel may wake the candidate here, before publication.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                RecordedReply *newReply = auditReply(launchd.audit, replacement.audit);
+                RecordedReply *oldReply = auditReply(launchd.audit, old.audit);
+                assert(failReady ? newReply->error == ESRCH : (!newReply->error && newReply->pid == old.guestPID));
+                assert(failReady ? (!oldReply->error && oldReply->pid == old.guestPID) : oldReply->error == ESRCH);
+                queried = YES;
+            });
+        };
+        readySendError = failReady ? EPIPE : 0;
+        handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 802, replacement.identifier));
+        readyReplyHook = nil;
+        readySendError = 0;
+        assert(!queried);
+        runMainQueueUntil(^BOOL { return queried; });
+        assert(failReady ? findJob(old.identifier) != nil : findJob(replacement.identifier) != nil);
+        assert(retiredIdentityCount == 1);
+    }
 }
 
 static LSBReceivedMessage *launchdRequest(int *fd, unsigned *object, const char *path, const char *marker) {
@@ -729,17 +1210,27 @@ int main(void) {
         testSubmissionFailureAndSpawnAuthentication();
         testInitialGuestArguments();
         testExitStatusesAndRepeatedReaping();
+        testExecReplacement();
+        testExecFailurePreservesCaller();
+        testAuditOwnerAuthenticationAndIdentity();
+        testAuditIdentityHistoryNeverEvicts();
+        testAuditResolutionSeesCommittedExecOnly();
+        testIndigoRegistrationGatesExecOnly();
+        testIndigoOwnerExecIsRejectedWithoutChangingAuthorization();
         testMonitorFailureAndEarlyExit();
         testAuditedGenerationDisappearsBeforeBootstrap();
         testRunningBoardFallback();
         testParentDeathDetachesOrphans();
+        testLaunchdAdoptsRunningAndZombieChildren();
+        testAdoptionCapacityPreservesExitAndExec();
+        testLaunchdDeathAndCyclesDoNotAdopt();
         testKillAuthenticationAndExit();
         testKillFallbackErrors();
         testLaunchdModeRequiresInitialPathAndMarker();
         testLaunchdHandshakeDispatchAndRights();
         testLaunchdCancellationAndFailedBootstrap();
         resetBroker();
-        puts("Broker: authentication, FD ownership, exit/kill, orphan cleanup, launchd mode, Mach handoff, and source cancellation passed");
+        puts("Broker: authentication, FD ownership, exit/kill, orphan cleanup, Indigo exec gating, Mach handoff, and source cancellation passed");
     }
     return 0;
 }

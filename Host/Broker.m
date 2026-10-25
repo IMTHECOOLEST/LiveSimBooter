@@ -9,6 +9,8 @@
 #include "LaunchdHandshake.h"
 #include "LaunchdProbe.h"
 #include "LaunchdConfiguration.h"
+#include "LaunchdEndpoint.h"
+#import "IndigoHIDServer.h"
 #import "TerminalSession.h"
 #include "FakePTY.h"
 #include <errno.h>
@@ -24,6 +26,9 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property uint64_t identifier;
 @property int phase;
 @property pid_t pid;
+@property pid_t guestPID;
+@property uint64_t replacesIdentifier, replacementIdentifier;
+@property BOOL executed;
 @property uint32_t pidVersion;
 @property pid_t extensionPID;
 @property LSBReceivedMessage *request;
@@ -32,13 +37,17 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property audit_token_t audit;
 @property uint64_t parentIdentifier;
 @property LSBChildTicket parentTicket;
-@property BOOL parentStatusPublished;
+@property BOOL parentStatusPublished, parentStatusPending, retiredForExec;
 @property LSBChildStatus *childStatus;
 @property int statusFD, wakeReadFD, wakeWriteFD;
 @property BOOL terminalSession;
 @property BOOL simulatorLaunchd;
 @property LSBLaunchdHandshake *launchdHandshake;
 @property dispatch_source_t launchdSource;
+@property (nonatomic, strong) LSBIndigoHIDServer *indigo;
+@property BOOL servicesPending;
+@property int servicesError;
+@property uint64_t indigoAuthorizedIdentifier;
 @end
 @implementation LSBJob
 - (instancetype)init {
@@ -54,16 +63,37 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 }
 @end
 
+@interface LSBPendingAdoption : NSObject
+@property uint64_t childIdentifier, parentIdentifier;
+@property LSBChildObservation observation;
+@end
+@implementation LSBPendingAdoption
+@end
+
 static NSMutableArray<LSBJob *> *jobs;
+static NSMutableArray<LSBPendingAdoption *> *pendingAdoptions;
+static dispatch_source_t adoptionRetrySource;
 static LSBJob *startingJob;
 static NSString *runtimeRoot;
 static uint64_t nextIdentifier = 1;
 static BOOL launchLaneFailed;
 static unsigned finishingDepth;
 static LSBTerminalSession *hostTerminal;
+static BOOL enableIndigo;
+enum { RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
+typedef struct { audit_token_t audit; pid_t guestPID; } LSBRetiredIdentity;
+static LSBRetiredIdentity retiredIdentities[RetiredIdentityCapacity];
+static unsigned retiredIdentityCount, auditResolutionLogs;
+static BOOL retiredIdentitiesFull;
+NSString *const LSBHostIndigoDidChangeNotification = @"LSBHostIndigoDidChange";
 static void startNextJob(void);
 
 LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
+int LSBHostUsesSimulatorDisplay(void) { return enableIndigo; }
+LSBIndigoHIDServer *LSBHostIndigoHIDServer(void) {
+    for (LSBJob *job in jobs) if (job.simulatorLaunchd && job.indigo) return job.indigo;
+    return nil;
+}
 
 static LSBJob *findJob(uint64_t identifier) {
     for (LSBJob *job in jobs) if (job.identifier == identifier) return job;
@@ -105,11 +135,142 @@ static int prepareChildStatus(LSBJob *job) {
     return 0;
 }
 
+static int inheritChildStatus(LSBJob *job, LSBJob *old) {
+    // An exec retains the process's children. Both native instances briefly map the same ledger and wake endpoint.
+    job.statusFD = fcntl(old.statusFD, F_DUPFD_CLOEXEC, 3);
+    if (job.statusFD < 0) return errno;
+    job.wakeReadFD = fcntl(old.wakeReadFD, F_DUPFD_CLOEXEC, 3);
+    if (job.wakeReadFD < 0) return errno;
+    job.wakeWriteFD = fcntl(old.wakeWriteFD, F_DUPFD_CLOEXEC, 3);
+    if (job.wakeWriteFD < 0) return errno;
+    void *mapping = mmap(NULL, LSB_CHILD_STATUS_MAPPING_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, job.statusFD, 0);
+    if (mapping == MAP_FAILED) return errno;
+    job.childStatus = mapping;
+    return LSBChildStatusValidate(job.childStatus);
+}
+
 static void wakeParent(LSBJob *parent) {
     const char hint = 1;
     ssize_t written;
     do { written = write(parent.wakeWriteFD, &hint, 1); } while (written < 0 && errno == EINTR);
     if (written < 0 && errno != EAGAIN) fprintf(stderr, "[broker] Child wake failed: %s\n", strerror(errno));
+}
+
+static void signalChildExit(LSBJob *parent) {
+    wakeParent(parent);
+    audit_token_t identity = parent.audit;
+    int error = LSBChildSignal(&identity, SIGCHLD);
+    if (error == EACCES || error == EPERM) {
+        error = LSBSignalExtension(parent.identifier, SIGCHLD);
+        if (!error) fprintf(stderr, "[broker] SIGCHLD submitted through launchd for request=%llu pid=%d\n", parent.identifier, parent.pid);
+    }
+    if (error && error != ESRCH) fprintf(stderr, "[broker] SIGCHLD delivery failed: %s\n", strerror(error));
+}
+
+static LSBPendingAdoption *pendingAdoption(uint64_t childIdentifier) {
+    for (LSBPendingAdoption *pending in pendingAdoptions) if (pending.childIdentifier == childIdentifier) return pending;
+    return nil;
+}
+
+static void retryAdoptions(void) {
+    for (LSBPendingAdoption *pending in [pendingAdoptions copy]) {
+        LSBJob *parent = findJob(pending.parentIdentifier), *child = findJob(pending.childIdentifier);
+        if (!parent || parent.phase != JobRunning || (!pending.observation.exited && !child)) {
+            if (child) {
+                child.parentIdentifier = 0;
+                child.parentStatusPending = NO;
+                LSBChildStatusSetParentPID(child.childStatus, 0);
+            }
+            [pendingAdoptions removeObject:pending];
+            continue;
+        }
+        LSBChildTicket ticket;
+        LSBChildObservation observation = pending.observation;
+        int error = LSBChildStatusImport(parent.childStatus, &observation, &ticket);
+        if (error == EAGAIN) continue;
+        if (error) {
+            fprintf(stderr, "[broker] Orphan import guest=%d failed: %s\n", observation.guestPID, strerror(error));
+            continue;
+        }
+        if (child) { child.parentTicket = ticket; child.parentStatusPending = NO; }
+        [pendingAdoptions removeObject:pending];
+        if (observation.exited) signalChildExit(parent);
+        else wakeParent(parent);
+        fprintf(stderr, "[broker] adopted guest=%d by guest=%d native=%d exited=%d\n",
+                observation.guestPID, parent.guestPID, observation.nativePID, observation.exited);
+    }
+    if (!pendingAdoptions.count && adoptionRetrySource) {
+        dispatch_source_cancel(adoptionRetrySource);
+        adoptionRetrySource = nil;
+    }
+}
+
+static void queueAdoption(LSBJob *parent, LSBJob *child, const LSBChildObservation *observation) {
+    if (!pendingAdoptions) pendingAdoptions = [NSMutableArray new];
+    LSBPendingAdoption *pending = [LSBPendingAdoption new];
+    pending.parentIdentifier = parent.identifier;
+    pending.childIdentifier = child.identifier;
+    pending.observation = *observation;
+    [pendingAdoptions addObject:pending];
+    if (child) {
+        child.parentIdentifier = parent.identifier;
+        child.parentStatusPending = YES;
+        LSBChildStatusSetParentPID(child.childStatus, parent.guestPID);
+    }
+    retryAdoptions();
+    if (pendingAdoptions.count && !adoptionRetrySource) {
+        // Keep copied statuses until launchd reaps a slot. Backpressure on new spawns bounds this backlog.
+        adoptionRetrySource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(adoptionRetrySource, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), 10 * NSEC_PER_MSEC, NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(adoptionRetrySource, ^{ retryAdoptions(); });
+        dispatch_resume(adoptionRetrySource);
+    }
+}
+
+static LSBJob *adoptiveLaunchd(LSBJob *exiting) {
+    // Simulator launchd is a host-rooted process. Requiring that root also excludes a descendant or an adoption cycle.
+    for (LSBJob *job in jobs)
+        if (job != exiting && job.simulatorLaunchd && job.phase == JobRunning && !job.parentIdentifier) return job;
+    return nil;
+}
+
+static void retireAuditIdentity(LSBJob *job) {
+    if (job.pid <= 0 || job.audit.val[5] != (uint32_t)job.pid) return;
+    if (retiredIdentityCount < RetiredIdentityCapacity) {
+        retiredIdentities[retiredIdentityCount++] = (LSBRetiredIdentity){job.audit, job.guestPID};
+    } else if (!retiredIdentitiesFull) {
+        // Never evict an old identity and accidentally let it alias a guest job through the native fallback.
+        retiredIdentitiesFull = YES;
+        fprintf(stderr, "[broker] Audit identity history full; unmanaged owner resolution now fails closed\n");
+    }
+}
+
+static int resolveAuditPID(const audit_token_t *audit, pid_t *result) {
+    *result = 0;
+    if (!audit || !audit->val[5] || audit->val[5] > INT_MAX) return EINVAL;
+    pid_t native = (pid_t)audit->val[5];
+    // Exact full-token matching precedes PID alias checks, including when a native PID has been reused legitimately.
+    for (LSBJob *job in jobs) {
+        audit_token_t current = job.audit;
+        if (memcmp(audit, &current, sizeof(current))) continue;
+        if (job.phase != JobRunning || job.retiredForExec || job.guestPID <= 0) return ESRCH;
+        *result = job.guestPID;
+        if (native != *result && auditResolutionLogs < AuditResolutionLogLimit) {
+            fprintf(stderr, "[broker] audit owner native=%d version=%u -> guest=%d\n", native, audit->val[7], *result);
+            if (++auditResolutionLogs == AuditResolutionLogLimit) fprintf(stderr, "[broker] Further audit owner resolution logs suppressed\n");
+        }
+        return 0;
+    }
+    // A different credential/generation, a pending replacement, or a native identity equal to a stable guest PID cannot inherit ownership.
+    for (LSBJob *job in jobs) if (native == job.pid || native == job.guestPID) return ESRCH;
+    for (unsigned index = 0; index < retiredIdentityCount; ++index) {
+        const LSBRetiredIdentity *old = &retiredIdentities[index];
+        if (native == (pid_t)old->audit.val[5] || native == old->guestPID) return ESRCH;
+    }
+    if (retiredIdentitiesFull) return ESRCH;
+    // Only authenticated simulator launchd can supply this token, copied from its own kernel-audited request.
+    *result = native;
+    return 0;
 }
 
 static void finishJob(LSBJob *job, int error) {
@@ -128,19 +289,53 @@ static void finishJob(LSBJob *job, int error) {
     }
     if (job.exitMonitor) { dispatch_source_cancel(job.exitMonitor); job.exitMonitor = nil; }
     if (job.launchdSource) { dispatch_source_cancel(job.launchdSource); job.launchdSource = nil; }
+    if (job.indigo) [job.indigo close];
+    for (LSBJob *owner in jobs) if (owner.indigoAuthorizedIdentifier == job.identifier) {
+        [owner.indigo authorizeClientWithAuditToken:NULL];
+        owner.indigoAuthorizedIdentifier = 0;
+    }
     if (job.runningBoardMonitor) { LSBRunningBoardMonitorCancel(job.runningBoardMonitor); job.runningBoardMonitor = nil; }
+    LSBJob *old = findJob(job.replacesIdentifier);
+    if (old && old.replacementIdentifier == job.identifier) old.replacementIdentifier = 0;
+    LSBJob *replacement = findJob(job.replacementIdentifier);
+    job.replacementIdentifier = 0;
+    if (replacement) finishJob(replacement, ECANCELED);
     LSBJob *parent = findJob(job.parentIdentifier);
-    if (parent && !job.parentStatusPublished && !LSBChildStatusAbandon(parent.childStatus, job.parentTicket)) wakeParent(parent);
-    // No other process inherits the simulated parent's children. Running orphans retain their own monitor and ledger.
-    // Pending spawns have no surviving caller; cancel them before starting another queued extension.
+    if (parent && !job.parentStatusPublished && !job.parentStatusPending && !LSBChildStatusAbandon(parent.childStatus, job.parentTicket)) wakeParent(parent);
+    LSBPendingAdoption *pending = pendingAdoption(job.identifier);
+    if (pending) [pendingAdoptions removeObject:pending]; // Unknown monitor failure must not invent a successful exit.
+    LSBJob *adopter = job.retiredForExec ? nil : adoptiveLaunchd(job);
     for (LSBJob *child in [jobs copy]) {
         if (child.parentIdentifier != job.identifier) continue;
-        child.parentIdentifier = 0;
-        if (child.phase != JobRunning) finishJob(child, ECANCELED);
+        if (child.phase != JobRunning) {
+            child.parentIdentifier = 0;
+            finishJob(child, ECANCELED);
+            continue;
+        }
+        LSBChildObservation observation;
+        int observed = LSBChildStatusObserve(job.childStatus, child.guestPID, &observation);
+        if (adopter && !observed) queueAdoption(adopter, child, &observation);
+        else {
+            child.parentIdentifier = 0;
+            child.parentStatusPending = NO;
+            LSBChildStatusSetParentPID(child.childStatus, 0);
+            fprintf(stderr, "[broker] orphan guest=%d has no simulated wait owner; getppid=0\n", child.guestPID);
+        }
+        if (!observed) LSBChildStatusAbandon(job.childStatus, observation.ticket);
+    }
+    // Exited but unreaped children no longer have LSBJob objects. Preserve their statuses as well.
+    if (!job.retiredForExec && adopter) for (unsigned index = 0; index < LSB_CHILD_STATUS_CAPACITY; ++index) {
+        LSBChildObservation observation;
+        if (!LSBChildStatusObserveIndex(job.childStatus, index, &observation) && observation.exited) {
+            queueAdoption(adopter, nil, &observation);
+            LSBChildStatusAbandon(job.childStatus, observation.ticket);
+        }
     }
     LSBReleaseExtension(job.identifier);
+    retireAuditIdentity(job);
     if (startingJob == job) startingJob = nil;
     [jobs removeObject:job];
+    retryAdoptions();
     BOOL terminalAlive = NO;
     for (LSBJob *remaining in jobs) if (remaining.terminalSession) terminalAlive = YES;
     if (job.terminalSession && !terminalAlive) {
@@ -157,18 +352,18 @@ static void recordChildExit(uint64_t identifier, int waitStatus) {
     fprintf(stderr, "[broker] request=%llu pid=%d exited wait-status=0x%x\n", identifier, job.pid, waitStatus);
     LSBJob *parent = findJob(job.parentIdentifier);
     if (job.phase == JobRunning && parent) {
-        int error = LSBChildStatusPublishExit(parent.childStatus, job.parentTicket, waitStatus);
-        if (error) fprintf(stderr, "[broker] Could not publish child status: %s\n", strerror(error));
-        else {
+        LSBPendingAdoption *pending = job.parentStatusPending ? pendingAdoption(job.identifier) : nil;
+        if (pending) {
+            LSBChildObservation observation = pending.observation;
+            observation.exited = 1;
+            observation.status = waitStatus;
+            pending.observation = observation;
+            pending.childIdentifier = 0;
             job.parentStatusPublished = YES;
-            wakeParent(parent);
-            audit_token_t identity = parent.audit;
-            int signalError = LSBChildSignal(&identity, SIGCHLD);
-            if (signalError == EACCES || signalError == EPERM) {
-                signalError = LSBSignalExtension(parent.identifier, SIGCHLD);
-                if (!signalError) fprintf(stderr, "[broker] SIGCHLD submitted through launchd for request=%llu pid=%d\n", parent.identifier, parent.pid);
-            }
-            if (signalError && signalError != ESRCH) fprintf(stderr, "[broker] SIGCHLD delivery failed: %s\n", strerror(signalError));
+        } else {
+            int error = LSBChildStatusPublishExit(parent.childStatus, job.parentTicket, waitStatus);
+            if (error) fprintf(stderr, "[broker] Could not publish child status: %s\n", strerror(error));
+            else { job.parentStatusPublished = YES; signalChildExit(parent); }
         }
     }
     finishJob(job, job.phase == JobRunning ? 0 : ECHILD);
@@ -193,6 +388,11 @@ static void startNextJob(void) {
     }
     for (LSBJob *job in jobs) {
         if (job.phase != JobQueued) continue;
+        LSBJob *old = findJob(job.replacesIdentifier);
+        LSBJob *parent = findJob(old ? old.parentIdentifier : job.parentIdentifier);
+        // Let xpcproxy return READY so launchd can service the registration MIG before its SETEXEC replacement runs.
+        if (old && parent.servicesPending) continue;
+        if (old && parent.servicesError) { finishJob(job, parent.servicesError); return; }
         startingJob = job;
         job.phase = JobStarting;
         uint64_t identifier = job.identifier;
@@ -208,6 +408,8 @@ static void startNextJob(void) {
 }
 
 static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
+    retryAdoptions();
+    if (pendingAdoptions.count) { replyError(message, EAGAIN); return; }
     if (launchLaneFailed) { replyError(message, EBUSY); return; }
     if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
     LSBJob *job = [LSBJob new];
@@ -231,6 +433,26 @@ static void enqueueSpawn(LSBReceivedMessage *message, LSBJob *parent) {
     startNextJob();
 }
 
+static void enqueueExec(LSBReceivedMessage *message, LSBJob *old) {
+    if (launchLaneFailed) { replyError(message, EBUSY); return; }
+    if (old.replacementIdentifier || old.simulatorLaunchd) { replyError(message, ENOTSUP); return; }
+    // Authorizing a replacement drops the current Indigo event port and gestures. Token rollback cannot restore those capabilities.
+    for (LSBJob *owner in jobs) if (owner.indigoAuthorizedIdentifier == old.identifier) { replyError(message, ENOTSUP); return; }
+    if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
+    LSBJob *job = [LSBJob new];
+    int error = inheritChildStatus(job, old);
+    if (error) { replyError(message, error); return; }
+    job.identifier = nextIdentifier++;
+    job.guestPID = old.guestPID;
+    job.terminalSession = old.terminalSession;
+    job.replacesIdentifier = old.identifier;
+    old.replacementIdentifier = job.identifier;
+    job.request = message;
+    [jobs addObject:job];
+    fprintf(stderr, "[broker] exec guest=%d old-native=%d replacement-request=%llu\n", old.guestPID, old.pid, job.identifier);
+    startNextJob();
+}
+
 static int signalJob(LSBJob *child, int signalNumber) {
     audit_token_t identity = child.audit;
     // A retained job can outlive the process until its queued exit notification runs. Validate the full PID generation.
@@ -250,7 +472,7 @@ static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
     if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
     if (targetPID <= 0) return ENOTSUP;
     for (LSBJob *job in jobs) {
-        if (job.pid == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) return signalJob(job, signalNumber);
+        if (job.guestPID == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) return signalJob(job, signalNumber);
     }
     return ESRCH;
 }
@@ -272,6 +494,13 @@ static int signalTerminal(pid_t foreground, int signalNumber) {
 }
 
 static int prepareLaunchdHandshake(LSBJob *job) {
+    if (enableIndigo) {
+        int error = 0;
+        job.indigo = [[LSBIndigoHIDServer alloc] initWithError:&error];
+        if (!job.indigo) return error ? error : ENOMEM;
+        job.servicesPending = YES;
+        [NSNotificationCenter.defaultCenter postNotificationName:LSBHostIndigoDidChangeNotification object:nil];
+    }
     job.launchdHandshake = calloc(1, sizeof(*job.launchdHandshake));
     if (!job.launchdHandshake) return ENOMEM;
     audit_token_t audit = job.audit;
@@ -293,6 +522,28 @@ static int prepareLaunchdHandshake(LSBJob *job) {
                     LSBLaunchdHandshakeServicePort(active.launchdHandshake));
             const char *probe = getenv("LSB_LAUNCHD_HEALTHCHECK");
             mach_port_t service = LSBLaunchdHandshakeServicePort(active.launchdHandshake);
+            if (active.indigo && active.servicesPending) {
+                kern_return_t copied = mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1);
+                if (copied) { active.servicesPending = NO; active.servicesError = EPIPE; startNextJob(); }
+                else {
+                    audit_token_t expected = active.audit;
+                    LSBIndigoHIDServer *indigo = active.indigo;
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        kern_return_t status = -1;
+                        int endpointError = LSBLaunchdRegisterEndpoint(service, &expected, "IndigoHIDRegistrationPort",
+                                                                       indigo.registrationPort, &status);
+                        mach_port_deallocate(mach_task_self(), service);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            LSBJob *current = findJob(identifier);
+                            if (!current) return;
+                            current.servicesPending = NO;
+                            current.servicesError = endpointError;
+                            fprintf(stderr, "[Indigo] registration error=%d bootstrap=%d\n", endpointError, status);
+                            startNextJob();
+                        });
+                    });
+                }
+            }
             if (probe && !strcmp(probe, "1") && !mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1)) {
                 audit_token_t expected = active.audit;
                 pid_t process = active.pid;
@@ -322,10 +573,24 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
             enqueueSpawn(message, sender);
             return;
+        case LSB_REQUEST_EXEC:
+            if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
+            enqueueExec(message, sender);
+            return;
         case LSB_REQUEST_KILL: {
             if (!sender || sender.phase != JobRunning) { replyError(message, EACCES); return; }
             int error = signalChild(sender, message->targetPID, message->signalNumber);
             LSBTransportReply(message, error, error ? 0 : message->targetPID, 0, NULL, NULL, NULL);
+            disposeMessage(message);
+            return;
+        }
+        case LSB_REQUEST_RESOLVE_AUDIT_PID: {
+            if (!sender || !sender.simulatorLaunchd || sender.phase != JobRunning || sender.retiredForExec) { replyError(message, EACCES); return; }
+            audit_token_t senderAudit = sender.audit;
+            if (memcmp(&message->audit, &senderAudit, sizeof(senderAudit))) { replyError(message, EACCES); return; }
+            pid_t resolved = 0;
+            int error = resolveAuditPID(&message->targetAudit, &resolved);
+            LSBTransportReply(message, error, error ? 0 : resolved, 0, NULL, NULL, NULL);
             disposeMessage(message);
             return;
         }
@@ -339,7 +604,14 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (!job.extensionPID) job.extensionPID = LSBExtensionProcessIdentifier(job.identifier);
             if (job.extensionPID <= 0) { replyError(message, EAGAIN); return; }
             if (job.extensionPID != pid) { replyError(message, EACCES); return; }
+            // A retired native PID can be reused while its guest identity still belongs to an exec replacement.
+            if (!job.guestPID) for (LSBJob *active in jobs) {
+                if (active != job && active.executed && active.guestPID == pid && active.pid != pid) {
+                    replyError(message, EAGAIN); finishJob(job, EAGAIN); return;
+                }
+            }
             job.pid = pid;
+            if (!job.guestPID) job.guestPID = pid;
             job.pidVersion = generation;
             job.audit = message->audit;
             job.phase = JobDispatched;
@@ -382,12 +654,22 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (job.simulatorLaunchd) {
                 error = prepareLaunchdHandshake(job);
                 if (error) { replyError(message, error); finishJob(job, error); return; }
-                error = LSBTransportReplyLaunchdBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
-                    &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD, LSBLaunchdHandshakeTankPort(job.launchdHandshake));
-            } else {
-                error = LSBTransportReplyBootstrap(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
-                                                   &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD);
             }
+            LSBJob *old = findJob(job.replacesIdentifier);
+            LSBJob *parent = findJob(old ? old.parentIdentifier : job.parentIdentifier);
+            const char *program = job.request->plan.strings + job.request->plan.path;
+            NSString *backboardPath = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec/backboardd"];
+            if (parent.indigo && (!strcmp(program, "/usr/libexec/backboardd") || !strcmp(program, backboardPath.fileSystemRepresentation))) {
+                audit_token_t backboardIdentity = job.audit;
+                [parent.indigo authorizeClientWithAuditToken:&backboardIdentity];
+                parent.indigoAuthorizedIdentifier = job.identifier;
+            }
+            LSBChildStatusSetParentPID(job.childStatus, parent ? parent.guestPID : old ? LSBChildStatusGetParentPID(old.childStatus) : getpid());
+            LSBBootstrapMetadata metadata = { .guestPID = job.guestPID, .parentPID = LSBChildStatusGetParentPID(job.childStatus),
+                .launchdTankPort = job.simulatorLaunchd ? LSBLaunchdHandshakeTankPort(job.launchdHandshake) : MACH_PORT_NULL,
+                .ports = &job.request->ports };
+            error = LSBTransportReplyBootstrapWithMetadata(message, 0, pid, identifier, runtimeRoot.fileSystemRepresentation,
+                &job.request->plan, job.request->fds, job.statusFD, job.wakeReadFD, &metadata);
             disposeMessage(message);
             // Don't keep pipe writers alive while waiting for READY; the child now owns copies.
             for (unsigned i = 0; i < job.request->plan.fdCount; ++i) {
@@ -404,22 +686,78 @@ static void handleMessage(LSBReceivedMessage *message) {
             }
             int error = message->error;
             LSBJob *parent = findJob(sender.parentIdentifier);
+            LSBJob *old = findJob(sender.replacesIdentifier);
+            LSBChildExecUpdate execution = {0};
+            BOOL preparedExec = NO;
+            if (sender.replacesIdentifier && (!old || old.phase != JobRunning || old.replacementIdentifier != sender.identifier)) error = ESRCH;
+            if (!error && old) {
+                parent = findJob(old.parentIdentifier);
+                if (parent && !old.parentStatusPending) {
+                    error = LSBChildStatusPrepareExec(parent.childStatus, old.parentTicket, pid, &execution);
+                    preparedExec = !error;
+                } else if (old.parentStatusPending) {
+                    LSBPendingAdoption *pending = pendingAdoption(old.identifier);
+                    if (!pending) error = ESRCH;
+                    else if (pending.observation.execGeneration == UINT32_MAX) error = EOVERFLOW;
+                }
+            }
             // The child is still blocked in READY: capture its real group before it can run and exit.
-            if (!error && parent) {
+            if (!error && parent && !old) {
                 pid_t group = getpgid(pid);
-                error = group < 0 ? errno : LSBChildStatusPublishRunning(parent.childStatus, sender.parentTicket, pid, group);
+                error = group < 0 ? errno : LSBChildStatusPublishRunning(parent.childStatus, sender.parentTicket, sender.guestPID, group);
             }
             int replyError = LSBTransportReply(message, message->error ? 0 : error, pid, sender.identifier, NULL, NULL, NULL);
             disposeMessage(message);
-            if (error || replyError) { finishJob(sender, error ? error : replyError); return; }
+            if (error || replyError) {
+                if (preparedExec) LSBChildStatusCancelExec(parent.childStatus, &execution);
+                finishJob(sender, error ? error : replyError);
+                return;
+            }
             sender.phase = JobRunning;
+            if (old) {
+                // This main-queue transaction owns Replacing until publication; exit callbacks cannot interleave it.
+                // READY can release the child first: its subsequent owner-resolution RPC is also handled on this serial main queue,
+                // so it cannot observe the candidate until this commit and retirement finish. A failed READY still preserves the old job.
+                if (preparedExec) error = LSBChildStatusCommitExec(parent.childStatus, &execution);
+                if (error) {
+                    signalJob(sender, SIGKILL);
+                    finishJob(sender, error);
+                    return;
+                }
+                sender.parentIdentifier = old.parentIdentifier;
+                sender.executed = YES;
+                sender.parentTicket = old.parentTicket;
+                sender.parentStatusPending = old.parentStatusPending;
+                if (old.parentStatusPending) {
+                    LSBPendingAdoption *pending = pendingAdoption(old.identifier);
+                    LSBChildObservation observation = pending.observation;
+                    observation.nativePID = pid;
+                    ++observation.execGeneration;
+                    pending.observation = observation;
+                    pending.childIdentifier = sender.identifier;
+                    old.parentStatusPending = NO;
+                }
+                old.retiredForExec = YES;
+                sender.replacesIdentifier = 0;
+                old.replacementIdentifier = 0;
+                old.parentIdentifier = 0;
+                for (LSBJob *child in jobs) if (child.parentIdentifier == old.identifier) child.parentIdentifier = sender.identifier;
+                if (parent) wakeParent(parent);
+                fprintf(stderr, "[broker] exec committed guest=%d native=%d -> %d\n", sender.guestPID, old.pid, pid);
+            }
             if (sender.request->object) {
-                error = LSBTransportReply(sender.request, 0, pid, sender.identifier, NULL, NULL, NULL);
-                if (error) { finishJob(sender, error); return; }
+                error = LSBTransportReply(sender.request, 0, sender.guestPID, sender.identifier, NULL, NULL, NULL);
+                // Once committed, a dead old RPC peer cannot roll the replacement back.
+                if (error && !old) { finishJob(sender, error); return; }
             }
             disposeMessage(sender.request);
             sender.request = NULL;
-            fprintf(stderr, "[broker] spawn ready pid=%d request=%llu\n", pid, sender.identifier);
+            if (old) {
+                int retireError = signalJob(old, SIGKILL);
+                if (retireError && retireError != ESRCH) fprintf(stderr, "[broker] retire old exec instance pid=%d: %s\n", old.pid, strerror(retireError));
+                finishJob(old, 0);
+            }
+            fprintf(stderr, "[broker] spawn ready guest=%d native=%d request=%llu\n", sender.guestPID, pid, sender.identifier);
             startingJob = nil;
             startNextJob();
             return;
@@ -455,6 +793,14 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
     if (argc > 1 && !strcmp(argv[1], "--launchd"))
         return argc == 2 ? LSBPrepareLaunchdPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
+    if (argc > 1 && !strcmp(argv[1], "--launchd-df"))
+        return argc == 2 ? LSBPrepareLaunchdDFPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
+    if (argc > 1 && !strcmp(argv[1], "--launchd-backboardd")) {
+        enableIndigo = YES;
+        return argc == 2 ? LSBPrepareLaunchdBackboardPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--launchd-lifecycle"))
+        return argc == 2 ? LSBPrepareLaunchdLifecyclePlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     plan->version = LSB_PLAN_VERSION;
     const char *defaultArgs[] = {"/bin/fish", "-i", "-N", "-P", "-C",
         "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end", NULL};

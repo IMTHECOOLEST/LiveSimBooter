@@ -11,7 +11,12 @@ static int pathSearch;
 static int internalWakeFD = -1;
 static int creationMaskError;
 static uint32_t capturedCreationMask = 027;
+static unsigned execCalls;
+static mach_port_t expectedRegisteredPort;
+static bool inspectPorts;
+extern int posix_spawn_file_actions_add_fileportdup2_np(posix_spawn_file_actions_t *, mach_port_t, int);
 int LSBGuestChildWakeFD(void) { return internalWakeFD; }
+LSBChildStatus *LSBGuestChildStatus(void) { return NULL; }
 // CreationMaskTests exercises the kernel-aware snapshot; this suite verifies serialization and error propagation.
 int LSBReadCreationMask(uint32_t *mask) {
     if (creationMaskError) return creationMaskError;
@@ -19,10 +24,12 @@ int LSBReadCreationMask(uint32_t *mask) {
     return 0;
 }
 
-int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_t *pid) {
+int LSBTransportSpawnWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports, pid_t *pid) {
     assert(LSBValidateSpawnPlan(plan) == 0);
     assert(plan->creationMask == capturedCreationMask);
     for (uint32_t i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
+    assert(ports && ports->registeredPresent && ports->bootstrapPresent);
+    if (inspectPorts) assert(ports->count && ports->registered[0] == expectedRegisteredPort && ports->bootstrapPort == MACH_PORT_NULL);
     ++transportCalls;
     if (pathSearch) {
         assert(!strcmp(plan->strings + plan->path, transportCalls == 1 ? "/first/tool" : "/second/tool"));
@@ -31,6 +38,12 @@ int LSBTransportSpawn(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], pid_
     if (transportFailure) return transportFailure;
     *pid = 4242;
     return 0;
+}
+
+int LSBTransportExecWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports) {
+    ++execCalls;
+    pid_t ignored;
+    return LSBTransportSpawnWithPorts(plan, fds, ports, &ignored);
 }
 
 static LSBSpawnPlan *newPlan(void) {
@@ -245,16 +258,23 @@ static void defaultProcessGroup(void) {
 
 static void shimSerialization(void) {
     LSBSpawnPlan *plan = newPlan();
+    LSBAdditionalSpawnAttributes additional;
     posix_spawnattr_t attributes;
     assert(!posix_spawnattr_init(&attributes));
-    assert(readAttributes(plan, &attributes) == 0);
+    assert(readAttributes(plan, &attributes, &additional) == 0);
     assert(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC));
-    assert(readAttributes(plan, &attributes) == ENOTSUP);
+    assert(readAttributes(plan, &attributes, &additional) == 0 && (plan->spawnFlags & POSIX_SPAWN_SETEXEC));
     assert(!posix_spawnattr_setflags(&attributes, 0));
     cpu_type_t architecture = CPU_TYPE_ARM64;
     size_t count;
     assert(!posix_spawnattr_setbinpref_np(&attributes, 1, &architecture, &count));
-    assert(readAttributes(plan, &attributes) == ENOTSUP);
+    assert(readAttributes(plan, &attributes, &additional) == 0);
+    uint32_t processType = 0x600;
+    memcpy((char *)attributes + 0x24, &processType, sizeof(processType));
+    assert(readAttributes(plan, &attributes, &additional) == 0);
+    processType = 0x300;
+    memcpy((char *)attributes + 0x24, &processType, sizeof(processType));
+    assert(readAttributes(plan, &attributes, &additional) == ENOTSUP);
     assert(!posix_spawnattr_destroy(&attributes));
     free(plan);
 
@@ -264,7 +284,9 @@ static void shimSerialization(void) {
     assert(!posix_spawn_file_actions_adddup2(&actions, 60, 61));
     assert(!posix_spawn_file_actions_addclose(&actions, 60));
     plan = newPlan();
-    assert(readActions(plan, &actions) == 0 && plan->actionCount == 3);
+    int temporaryFDs[LSB_MAX_ACTIONS];
+    for (unsigned i = 0; i < LSB_MAX_ACTIONS; ++i) temporaryFDs[i] = -1;
+    assert(readActions(plan, &actions, temporaryFDs) == 0 && plan->actionCount == 3);
     assert(plan->actions[0].kind == LSB_ACTION_OPEN && plan->actions[0].mode == 0640);
     assert(!strcmp(plan->strings + plan->actions[0].path, "output"));
     assert(plan->actions[1].kind == LSB_ACTION_DUP2 && plan->actions[1].fd == 60 && plan->actions[1].target == 61);
@@ -292,7 +314,136 @@ static void shimSerialization(void) {
     assert(LSBPosixSpawnP(&pid, "tool", NULL, NULL, argv, environment) == 0 && transportCalls == 2 && pid == 4242 && errno == EDOM);
 }
 
+static void portInheritanceAndExecFailure(void) {
+    mach_port_t port;
+    CHECK(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port) == KERN_SUCCESS);
+    CHECK(mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS);
+    CHECK(mach_ports_register(mach_task_self(), &port, 1) == KERN_SUCCESS);
+    CHECK(task_set_bootstrap_port(mach_task_self(), MACH_PORT_NULL) == KERN_SUCCESS);
+    expectedRegisteredPort = port;
+    inspectPorts = true;
+    char *argv[] = {"tool", NULL}, *environment[] = {NULL};
+    posix_spawnattr_t attributes;
+    CHECK(!posix_spawnattr_init(&attributes));
+    CHECK(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC));
+    transportFailure = ENOENT;
+    pid_t pid = 123;
+    errno = EDOM;
+    CHECK(LSBPosixSpawn(&pid, "/bin/missing", NULL, &attributes, argv, environment) == ENOENT && errno == EDOM && pid == 123);
+    CHECK(execCalls == 1);
+    mach_port_urefs_t refs;
+    CHECK(mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 1);
+    LSBSpawnPorts requested = {.registeredPresent = true, .count = 1, .registered = {port}, .bootstrapPresent = true, .bootstrapPort = port};
+    LSBSpawnPorts copied;
+    CHECK(snapshotPorts(&requested, &copied) == 0 && copied.bootstrapPort == port && copied.registered[0] == port);
+    CHECK(mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 3);
+    LSBSpawnPortsDispose(&copied);
+    CHECK(mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 1);
+    CHECK(!posix_spawnattr_destroy(&attributes));
+    CHECK(mach_port_deallocate(mach_task_self(), port) == KERN_SUCCESS);
+    CHECK(mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1) == KERN_SUCCESS);
+}
+
+static void execNeverReturns(void) {
+    posix_spawnattr_t attributes;
+    CHECK(!posix_spawnattr_init(&attributes));
+    CHECK(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC));
+    char *argv[] = {"tool", NULL}, *environment[] = {NULL};
+    (void)LSBPosixSpawn(NULL, "/bin/tool", NULL, &attributes, argv, environment);
+    _exit(99);
+}
+
+static void fileportActionOrdering(void) {
+    int a[2], b[2];
+    CHECK(!pipe(a) && !pipe(b));
+    CHECK(write(a[1], "a", 1) == 1 && write(b[1], "b", 1) == 1);
+    mach_port_t first, second;
+    CHECK(!fileport_makeport(a[0], &first) && !fileport_makeport(b[0], &second));
+    posix_spawn_file_actions_t actions;
+    CHECK(!posix_spawn_file_actions_init(&actions));
+    CHECK(!posix_spawn_file_actions_add_fileportdup2_np(&actions, first, 60));
+    CHECK(!posix_spawn_file_actions_adddup2(&actions, 60, 61));
+    CHECK(!posix_spawn_file_actions_add_fileportdup2_np(&actions, second, 60));
+    LSBSpawnPlan *plan = newPlan();
+    plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    int temporaryFDs[LSB_MAX_ACTIONS], received[LSB_MAX_FDS];
+    for (unsigned i = 0; i < LSB_MAX_ACTIONS; ++i) temporaryFDs[i] = -1;
+    emptyFDs(received);
+    CHECK(readActions(plan, &actions, temporaryFDs) == 0);
+    CHECK(temporaryFDs[0] > 61 && temporaryFDs[2] > 61 && temporaryFDs[0] != temporaryFDs[2]);
+    CHECK(snapshotFDs(plan, received) == 0);
+    CHECK(!posix_spawn_file_actions_destroy(&actions));
+    CHECK(LSBApplySpawnPlan(plan, received) == 0);
+    char left, right;
+    CHECK(read(60, &left, 1) == 1 && left == 'b');
+    CHECK(read(61, &right, 1) == 1 && right == 'a');
+    CHECK(fcntl(temporaryFDs[0], F_GETFD) == -1 && fcntl(temporaryFDs[2], F_GETFD) == -1);
+    mach_port_urefs_t refs;
+    CHECK(mach_port_get_refs(mach_task_self(), first, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 1);
+    CHECK(mach_port_get_refs(mach_task_self(), second, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 1);
+}
+
+static int countOpenFDs(void) {
+    int count = 0;
+    for (int fd = 0, limit = getdtablesize(); fd < limit; ++fd) if (fcntl(fd, F_GETFD) >= 0) ++count;
+    return count;
+}
+
+static void fileportFailureCleanup(void) {
+    int fd = open("/dev/null", O_RDONLY);
+    CHECK(fd >= 0);
+    mach_port_t port;
+    CHECK(!fileport_makeport(fd, &port));
+    posix_spawn_file_actions_t actions;
+    CHECK(!posix_spawn_file_actions_init(&actions));
+    CHECK(!posix_spawn_file_actions_add_fileportdup2_np(&actions, port, 60));
+    CHECK(!posix_spawn_file_actions_add_fileportdup2_np(&actions, port, 61));
+    NativeActions *native = (NativeActions *)actions;
+    native->actions[1].fd = MACH_PORT_NULL;
+    char *argv[] = {"tool", NULL}, *environment[] = {NULL};
+    int before = countOpenFDs();
+    unsigned calls = transportCalls;
+    pid_t pid = 123;
+    CHECK(LSBPosixSpawn(&pid, "/bin/tool", &actions, NULL, argv, environment) != 0 && pid == 123);
+    CHECK(transportCalls == calls && countOpenFDs() == before);
+    native->actions[1].fd = (int32_t)port;
+    transportFailure = EACCES;
+    CHECK(LSBPosixSpawn(&pid, "/bin/tool", &actions, NULL, argv, environment) == EACCES && pid == 123);
+    CHECK(countOpenFDs() == before);
+    mach_port_urefs_t refs;
+    CHECK(mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS && refs == 1);
+    CHECK(fcntl(fd, F_GETFD) >= 0);
+    CHECK(!posix_spawn_file_actions_destroy(&actions));
+}
+
+static void simulatedSessionRejectsProcessGroup(void) {
+    pid_t session, group;
+    assert(LSBProcessSessionSnapshot(&session, &group) == 0);
+    pid_t nativeGroup = getpgrp();
+    posix_spawnattr_t attributes;
+    assert(!posix_spawnattr_init(&attributes));
+    char *argv[] = {"tool", NULL}, *environment[] = {NULL};
+    const short flags[] = {POSIX_SPAWN_SETPGROUP, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETEXEC};
+    const pid_t groups[] = {0, group};
+    for (unsigned i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        assert(!posix_spawnattr_setflags(&attributes, flags[i]));
+        for (unsigned j = 0; j < sizeof(groups) / sizeof(groups[0]); ++j) {
+            assert(!posix_spawnattr_setpgroup(&attributes, groups[j]));
+            pid_t pid = 123;
+            errno = EDOM;
+            assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, &attributes, argv, environment) == ENOTSUP);
+            assert(pid == 123 && errno == EDOM && !transportCalls && !execCalls);
+        }
+    }
+    assert(!posix_spawnattr_destroy(&attributes));
+    pid_t afterSession, afterGroup;
+    assert(LSBProcessSessionSnapshot(&afterSession, &afterGroup) == 0 && afterSession == session && afterGroup == group);
+    assert(getpgrp() == nativeGroup);
+    puts("Spawn plan: simulated sessions reject native group changes before transport");
+}
+
 int main(void) {
+    if (getenv("LSB_TEST_SESSION_GROUP")) { simulatedSessionRejectsProcessGroup(); return 0; }
     validation();
     runChild(cyclesAndOrdering, "descriptor cycles and ordered actions");
     runChild(normalCloseOnExec, "close-on-exec");
@@ -316,6 +467,10 @@ int main(void) {
     snprintf(childPath, sizeof(childPath), "%s/after", workingDirectory);
     assert(!unlink(childPath) && !rmdir(workingDirectory));
     runChild(shimSerialization, "guest attribute and file-action serialization");
+    runChild(portInheritanceAndExecFailure, "registered/bootstrap port inheritance and failed SETEXEC cleanup");
+    runChild(execNeverReturns, "successful SETEXEC does not return");
+    runChild(fileportActionOrdering, "fileportdup2 ownership and ordered descriptor replacement");
+    runChild(fileportFailureCleanup, "fileport conversion and RPC failure close all temporary descriptors");
     puts("Spawn plan tests passed");
     return 0;
 }

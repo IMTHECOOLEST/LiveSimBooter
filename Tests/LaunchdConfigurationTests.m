@@ -35,6 +35,169 @@ static void assertUnchanged(const LSBReceivedMessage *message) {
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message->fds[i] == -1);
 }
 
+static NSDictionary *readPlist(NSString *path) {
+    return [NSPropertyListSerialization propertyListWithData:[NSData dataWithContentsOfFile:path] options:NSPropertyListImmutable format:NULL error:NULL];
+}
+
+static void testDeviceProfile(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    const char *overrides[] = {"SIMULATOR_PRODUCT_CLASS=D83", "SIMULATOR_MODEL_IDENTIFIER=iPhone16,1", "SIMULATOR_PRODUCT_CLASS=ignored", NULL};
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, overrides));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_PRODUCT_CLASS"), "D83"));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_MODEL_IDENTIFIER"), "iPhone16,1"));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    for (NSString *scope in @[@"Self", @"Child"]) {
+        assert([bootstrap[scope][@"SIMULATOR_PRODUCT_CLASS"] isEqualToString:@"D83"]);
+        assert([bootstrap[scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqualToString:@"iPhone16,1"]);
+    }
+    dispose(message);
+    const char *oneOverride[] = {"SIMULATOR_PRODUCT_CLASS=D83", NULL};
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, oneOverride));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_PRODUCT_CLASS"), "D83"));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_MODEL_IDENTIFIER"), "iPhone16,2"));
+    dispose(message);
+    NSData *previous = [NSData dataWithContentsOfFile:configPath];
+    const char *invalid[] = {"SIMULATOR_PRODUCT_CLASS=", "SIMULATOR_MODEL_IDENTIFIER=", "SIMULATOR_PRODUCT_CLASS=\xff",
+                             "SIMULATOR_MODEL_IDENTIFIER=\xff"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        const char *environment[] = {invalid[i], NULL};
+        assert(LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, environment) == EINVAL);
+        assertUnchanged(message);
+        assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:previous]);
+    }
+}
+
+static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath, const char *const inherited[]) {
+    NSString *jobDirectory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-LaunchDaemons"];
+    NSString *jobPath = [jobDirectory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.df.plist"];
+    NSString *dfLog = [dataPath stringByAppendingPathComponent:@"Library/Logs/df.log"];
+    assert(![NSFileManager.defaultManager fileExistsAtPath:jobDirectory]);
+    assert(!LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, inherited));
+    assert(!LSBValidateSpawnPlan(&message->plan));
+    assert(!strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim"));
+    assert(!strcmp(message->plan.strings + message->plan.argv[1], configPath.fileSystemRepresentation));
+    assert(!strcmp(environmentValue(&message->plan, "LSB_DEBUG_STOP_BEFORE_HANDOFF"), "1"));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    assert([bootstrap[@"Paths"] isEqualToArray:@[jobDirectory]]);
+    assert(!bootstrap[@"Child"][@"LSB_SIMULATOR_LAUNCHD"]);
+    assert([[NSFileManager.defaultManager contentsOfDirectoryAtPath:jobDirectory error:NULL] isEqualToArray:@[@"com.kdt.LiveSimBooter.df.plist"]]);
+    NSDictionary *job = readPlist(jobPath);
+    NSSet *expectedKeys = [NSSet setWithArray:@[@"Label", @"ProgramArguments", @"WorkingDirectory", @"StandardOutPath", @"StandardErrorPath",
+                                              @"RunAtLoad", @"KeepAlive"]];
+    assert([[NSSet setWithArray:job.allKeys] isEqualToSet:expectedKeys]);
+    assert([job[@"Label"] isEqualToString:@"com.kdt.LiveSimBooter.df"]);
+    assert([job[@"ProgramArguments"] isEqualToArray:@[@"/bin/df"]]);
+    assert([job[@"WorkingDirectory"] isEqualToString:@"/private/var/mobile/"]);
+    assert([job[@"StandardOutPath"] isEqualToString:@"/private/var/mobile/Library/Logs/df.log"] &&
+           [job[@"StandardErrorPath"] isEqualToString:job[@"StandardOutPath"]]);
+    assert([job[@"RunAtLoad"] boolValue] && ![job[@"KeepAlive"] boolValue]);
+    struct stat originalJob, originalConfig, status;
+    assert(!stat(jobPath.fileSystemRepresentation, &originalJob) && S_ISREG(originalJob.st_mode));
+    assert(originalJob.st_uid == geteuid() && (originalJob.st_mode & 0777) == 0600);
+    assert(!stat(configPath.fileSystemRepresentation, &originalConfig));
+    assert(!stat(dfLog.fileSystemRepresentation, &status) && S_ISREG(status.st_mode) && status.st_nlink == 1);
+    assert(status.st_uid == geteuid() && (status.st_mode & 0777) == 0600);
+    dispose(message);
+
+    // Regeneration replaces both plists atomically and preserves the existing df log.
+    assert([@"df prior output\n" writeToFile:dfLog atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    assert(!LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL));
+    assert(!stat(jobPath.fileSystemRepresentation, &status) && status.st_ino != originalJob.st_ino);
+    assert(!stat(configPath.fileSystemRepresentation, &status) && status.st_ino != originalConfig.st_ino);
+    assert([readPlist(jobPath) isEqualToDictionary:job]);
+    assert([[NSString stringWithContentsOfFile:dfLog encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"df prior output\n"]);
+    dispose(message);
+    NSData *priorConfig = [NSData dataWithContentsOfFile:configPath], *priorJob = [NSData dataWithContentsOfFile:jobPath];
+
+    // Unknown jobs, stale temporary files and directories are never loaded or deleted by the probe generator.
+    NSString *unexpected = [jobDirectory stringByAppendingPathComponent:@"other.plist"];
+    assert([@"unrelated" writeToFile:unexpected atomically:NO encoding:NSUTF8StringEncoding error:NULL]);
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) == EEXIST);
+    assertUnchanged(message);
+    assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:priorConfig]);
+    assert([[NSData dataWithContentsOfFile:jobPath] isEqualToData:priorJob]);
+    assert([[NSString stringWithContentsOfFile:unexpected encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"unrelated"]);
+    assert(!unlink(unexpected.fileSystemRepresentation));
+    unexpected = [jobDirectory stringByAppendingPathComponent:@".launchd-bootstrap.stale"];
+    assert(!mkdir(unexpected.fileSystemRepresentation, 0700));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) == EEXIST);
+    assertUnchanged(message);
+    assert(!rmdir(unexpected.fileSystemRepresentation));
+
+    // The probe log cannot be a symlink, FIFO, or multiply linked file, and a job symlink cannot redirect publication.
+    assert(!unlink(dfLog.fileSystemRepresentation) && !symlink(configPath.fileSystemRepresentation, dfLog.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(dfLog.fileSystemRepresentation) && !mkfifo(dfLog.fileSystemRepresentation, 0600));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) != 0);
+    assertUnchanged(message);
+    assert(!unlink(dfLog.fileSystemRepresentation) && !link(configPath.fileSystemRepresentation, dfLog.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) == EINVAL);
+    assertUnchanged(message);
+    assert(!unlink(dfLog.fileSystemRepresentation));
+    assert(!unlink(jobPath.fileSystemRepresentation) && !symlink(configPath.fileSystemRepresentation, jobPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) == ELOOP);
+    assertUnchanged(message);
+    assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:priorConfig]);
+    assert(!unlink(jobPath.fileSystemRepresentation));
+    assert(!rmdir(jobDirectory.fileSystemRepresentation) && !symlink(root.fileSystemRepresentation, jobDirectory.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL) != 0);
+    assertUnchanged(message);
+    assert(!unlink(jobDirectory.fileSystemRepresentation));
+    assert(!LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, NULL));
+    dispose(message);
+
+    // The original entry point always publishes an empty bootstrap even after the opt-in probe has been prepared.
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] count] == 0);
+    assert([[NSFileManager.defaultManager contentsOfDirectoryAtPath:jobDirectory error:NULL] isEqualToArray:@[@"com.kdt.LiveSimBooter.df.plist"]]);
+    dispose(message);
+}
+
+static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
+    NSData *previous = [NSData dataWithContentsOfFile:configPath];
+    assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ENOENT);
+    assertUnchanged(message);
+    assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:previous]);
+    NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
+    assert([NSFileManager.defaultManager createDirectoryAtPath:stockDirectory withIntermediateDirectories:YES attributes:nil error:NULL]);
+    NSString *stockPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.backboardd.plist"];
+    NSDictionary *services = @{@"com.apple.CARenderServer": @{@"ResetAtClose": @YES}, @"com.apple.backboardd.virtualframebuffer": @YES};
+    NSDictionary *stock = @{@"MachServices": services, @"KeepAlive": @YES, @"POSIXSpawnType": @"Interactive", @"UserName": @"root"};
+    assert([stock writeToFile:stockPath atomically:YES]);
+    const char *inherited[] = {
+        "SIMULATOR_FRAMEBUFFER_FRAMEWORK=/System/Library/PrivateFrameworks/SimFramebufferClient.framework/SimFramebufferClient",
+        "SIMULATOR_FRAMEBUFFER_FRAMEWORK=", "SIMULATOR_FRAMEBUFFER_FRAMEWORK_EXTRA=preserved", NULL
+    };
+    NSString *uncanonicalRoot = [root stringByAppendingString:@"/."];
+    assert(!LSBPrepareLaunchdBackboardPlan(message, uncanonicalRoot.fileSystemRepresentation, inherited));
+    NSString *provider = [root stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimFramebuffer.framework/SimFramebuffer"];
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"), provider.fileSystemRepresentation));
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK_EXTRA"), "preserved"));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    for (NSString *scope in @[@"Self", @"Child"])
+        assert([bootstrap[scope][@"SIMULATOR_FRAMEBUFFER_FRAMEWORK"] isEqualToString:provider]);
+    NSString *directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-BackboardDaemons"];
+    NSDictionary *job = readPlist([directory stringByAppendingPathComponent:@"com.apple.backboardd.plist"]);
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqualToArray:@[directory]]);
+    assert([job[@"Label"] isEqualToString:@"com.apple.backboardd"] && [job[@"MachServices"] isEqualToDictionary:services]);
+    assert([job[@"ProgramArguments"] isEqualToArray:@[@"/usr/libexec/backboardd"]]);
+    assert(![job[@"KeepAlive"] boolValue] && ![job[@"EnableTransactions"] boolValue]);
+    assert(!job[@"POSIXSpawnType"] && !job[@"UserName"]);
+    assert([job[@"StandardOutPath"] isEqualToString:@"/private/var/mobile/Library/Logs/backboardd.log"]);
+    dispose(message);
+    assert(!LSBPrepareLaunchdLifecyclePlan(message, root.fileSystemRepresentation, NULL));
+    assert(!environmentValue(&message->plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"));
+    for (NSString *scope in @[@"Self", @"Child"])
+        assert(!readPlist(configPath)[@"Bootstrap"][scope][@"SIMULATOR_FRAMEBUFFER_FRAMEWORK"]);
+    directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-LifecycleDaemons"];
+    job = readPlist([directory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.lifecycle.plist"]);
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqualToArray:@[directory]]);
+    assert([job[@"ProgramArguments"] isEqualToArray:@[@"/bin/lifecycle-probe"]]);
+    assert(!job[@"MachServices"] && ![job[@"KeepAlive"] boolValue]);
+    dispose(message);
+    assert([NSFileManager.defaultManager removeItemAtPath:[root stringByAppendingPathComponent:@"System"] error:NULL]);
+}
+
 int main(void) {
     @autoreleasepool {
         char temporary[] = "/tmp/LiveSimBooter-launchd-config.XXXXXX", canonical[PATH_MAX];
@@ -61,6 +224,9 @@ int main(void) {
         assert(!strcmp(environmentValue(plan, "XPC_SIMULATOR_HOLDING_TANK_HACK"), "-1"));
         assert(!strcmp(environmentValue(plan, "XPC_FLAGS"), "0x0000000000000000"));
         assert(!strcmp(environmentValue(plan, "LSB_SIMULATOR_LAUNCHD"), "1"));
+        assert(!strcmp(environmentValue(plan, "SIMULATOR_PRODUCT_CLASS"), "D84"));
+        assert(!strcmp(environmentValue(plan, "SIMULATOR_MODEL_IDENTIFIER"), "iPhone16,2"));
+        assert(!environmentValue(plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"));
         assert(!strcmp(environmentValue(plan, "HOME"), dataPath.fileSystemRepresentation));
         assert(!environmentValue(plan, "TERM") && !environmentValue(plan, "LSB_FAKE_PTY_STATE"));
         assert(!environmentValue(plan, "XPC_USERSPACE_REBOOT_TO_BOOT_MODE") && !environmentValue(plan, "XPC_SIMULATOR_HOLDING_TANK_FD_HACK"));
@@ -72,6 +238,12 @@ int main(void) {
         assert([config[@"Bootstrap"][@"SimulatorRuntimeRoot"] isEqualToString:root]);
         assert([config[@"Bootstrap"][@"Self"][@"HOME"] isEqualToString:dataPath]);
         assert([config[@"Bootstrap"][@"Child"][@"HOME"] isEqualToString:dataPath]);
+        assert([config[@"Bootstrap"][@"Child"][@"SIMULATOR_HID_SYSTEM_MANAGER"]
+            isEqualToString:[root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"]]);
+        for (NSString *scope in @[@"Self", @"Child"]) {
+            assert([config[@"Bootstrap"][scope][@"SIMULATOR_PRODUCT_CLASS"] isEqualToString:@"D84"]);
+            assert([config[@"Bootstrap"][scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqualToString:@"iPhone16,2"]);
+        }
         assert(!config[@"Bootstrap"][@"Child"][@"XPC_SIMULATOR_HOLDING_TANK_HACK"]);
         assert(!config[@"Bootstrap"][@"Child"][@"LSB_DEBUG_STOP_BEFORE_HANDOFF"]);
         assert([config[@"Bootstrap"][@"Self"][@"LSB_SIMULATOR_LAUNCHD"] isEqualToString:@"1"]);
@@ -92,6 +264,9 @@ int main(void) {
         assert(write(message->fds[1], "again\n", 6) == 6);
         dispose(message);
         assert([[NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"stdout\nstderr\nagain\n"]);
+        testDeviceProfile(message, root, configPath);
+        testDFMode(message, root, dataPath, configPath, inherited);
+        testAdditionalJobs(message, root, dataPath, configPath);
 
         // Invalid/oversized plans never publish partial strings or descriptors and do not replace the existing configuration.
         NSData *priorConfig = [NSData dataWithContentsOfFile:configPath];
@@ -99,6 +274,9 @@ int main(void) {
         for (unsigned i = 0; i < LSB_MAX_VECTOR + 1; ++i) tooMany[i] = "KEEP=1";
         tooMany[LSB_MAX_VECTOR + 1] = NULL;
         assert(LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, tooMany) == E2BIG);
+        assertUnchanged(message);
+        assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:priorConfig]);
+        assert(LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, tooMany) == E2BIG);
         assertUnchanged(message);
         assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:priorConfig]);
         assert(LSBPrepareLaunchdPlan(message, "relative", NULL) == EINVAL);
@@ -124,7 +302,7 @@ int main(void) {
         assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:NULL].count == 0);
         assert([NSFileManager.defaultManager removeItemAtPath:group error:NULL]);
         free(message);
-        puts("LaunchdConfiguration: isolated empty bootstrap, preserved debug env, regular stdio, regeneration and failure cleanup passed");
+        puts("LaunchdConfiguration: isolated jobs, device profile defaults/overrides, regular logs, atomic regeneration and failure cleanup passed");
     }
     return 0;
 }

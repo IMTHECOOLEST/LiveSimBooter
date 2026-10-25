@@ -76,8 +76,10 @@
 				Broker.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
+				IndigoHIDServer.m = "-fobjc-arc";
 				LaunchdConfiguration.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
+				SimulatorDisplayView.m = "-fobjc-arc";
 				TerminalSession.m = "-fobjc-arc";
 				TerminalView.m = "-fobjc-arc";
 				ViewController.m = "-fobjc-arc";
@@ -423,6 +425,8 @@
 					"$(inherited)",
 					"-framework",
 					RunningBoardServices,
+					"-framework",
+					IOSurface,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -467,6 +471,8 @@
 					"$(inherited)",
 					"-framework",
 					RunningBoardServices,
+					"-framework",
+					IOSurface,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
