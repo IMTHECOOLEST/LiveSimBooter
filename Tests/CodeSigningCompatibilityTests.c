@@ -57,7 +57,7 @@ static bool entitlementOperation(unsigned int operation) {
 }
 
 static int originalQuery(pid_t pid, unsigned int operation, void *buffer, size_t size, audit_token_t *token) {
-    assert(!calls.originalCalls++ && !calls.selfCalls && !calls.brokerCalls); // Exactly one original query, always before fallback.
+    assert(!calls.originalCalls++ && !calls.selfCalls && !calls.brokerCalls); // Native paths query once, before any EPERM fallback.
     calls.pid = pid;
     calls.operation = operation;
     calls.buffer = buffer;
@@ -105,7 +105,7 @@ static int brokerHashQuery(const audit_token_t *target, unsigned char hash[LSB_G
 }
 
 static int brokerQuery(const audit_token_t *target, unsigned int operation, unsigned char **blob, size_t *size) {
-    assert(calls.originalCalls == 1 && !calls.brokerCalls++ && !calls.selfCalls && target != calls.token);
+    assert(!calls.originalCalls && !calls.brokerCalls++ && !calls.selfCalls && target != calls.token);
     calls.brokerTarget = *target;
     calls.brokerOperation = operation;
     *blob = NULL;
@@ -169,11 +169,18 @@ static void testDisabledAndOriginalResults(void) {
             assert(LSBCSopsAuditToken(1234, readOperations[j], buffer, sizeof(buffer), &token) == -1 && errno == EPERM);
             assertOriginal(1234, readOperations[j], buffer, sizeof(buffer), &token);
             assert(!calls.selfCalls && buffer[0] == 0xa5 && buffer[31] == 0xa5 && !memcmp(&token, &before, sizeof(token)));
+            resetCalls();
+            calls.originalResult = 0;
+            calls.originalError = EDOM;
+            assert(!LSBCSopsAuditToken(1234, readOperations[j], buffer, sizeof(buffer), &token) && errno == EDOM);
+            assertOriginal(1234, readOperations[j], buffer, sizeof(buffer), &token);
+            assert(!calls.brokerCalls && !calls.selfCalls && !memcmp(buffer, originalBytes, sizeof(originalBytes)));
         }
     }
     assert(!setenv(LSB_CODE_SIGNING_ENABLE_ENV, "1", 1));
     const int untouchedErrors[] = {ESRCH, EINVAL, EFAULT, ERANGE, EACCES, ENOMEM, EINTR, 0};
     for (size_t operation = 0; operation < sizeof(readOperations) / sizeof(*readOperations); ++operation) {
+        if (entitlementOperation(readOperations[operation])) continue;
         for (size_t i = 0; i < sizeof(untouchedErrors) / sizeof(*untouchedErrors); ++i) {
             resetCalls();
             calls.originalError = untouchedErrors[i];
@@ -184,6 +191,7 @@ static void testDisabledAndOriginalResults(void) {
     }
     const int originalResults[] = {0, 1, -2};
     for (size_t operation = 0; operation < sizeof(readOperations) / sizeof(*readOperations); ++operation) {
+        if (entitlementOperation(readOperations[operation])) continue;
         for (size_t i = 0; i < sizeof(originalResults) / sizeof(*originalResults); ++i) {
             memset(buffer, 0xa5, sizeof(buffer));
             resetCalls();
@@ -196,6 +204,50 @@ static void testDisabledAndOriginalResults(void) {
     }
 }
 
+static void testEntitlementSnapshotPriority(void) {
+    audit_token_t target = {{1, 2, 3, 4, 5, 777, 7, 8}};
+    const unsigned operations[] = {LSBCSOpEntitlementsBlob, LSBCSOpDEREntitlementsBlob};
+    const struct { int result, error; } nativeResults[] = {{0, 0}, {0, EDOM}, {-1, EINVAL}, {-1, ERANGE}, {-1, EPERM}, {-1, ESRCH}};
+    for (size_t op = 0; op < sizeof(operations) / sizeof(*operations); ++op) {
+        for (size_t native = 0; native < sizeof(nativeResults) / sizeof(*nativeResults); ++native) {
+            unsigned char header[8], blob[512];
+            resetCalls();
+            calls.originalResult = nativeResults[native].result;
+            calls.originalError = nativeResults[native].error;
+            calls.profile = 1;
+            // Security's eight-byte probe must negotiate the guest blob, never cache an empty native self result.
+            assert(LSBCSopsAuditToken(777, operations[op], header, sizeof(header), &target) == -1 && errno == ERANGE);
+            uint32_t length = readBE32(header + 4);
+            assert(!calls.originalCalls && calls.brokerCalls == 1 && !readBE32(header) && length > 8 && length <= sizeof(blob));
+            assert(!memcmp(&calls.brokerTarget, &target, sizeof(target)));
+            resetCalls();
+            calls.originalResult = nativeResults[native].result;
+            calls.originalError = nativeResults[native].error;
+            calls.profile = 1;
+            assert(!LSBCSopsAuditToken(777, operations[op], blob, length, &target) && errno == EDOM);
+            assert(!calls.originalCalls && calls.brokerCalls == 1 && !calls.selfCalls && readBE32(blob + 4) == length);
+            assert(LSBGuestEntitlementsHasValidBlobHeaderForOperation(blob, length, operations[op]));
+            if (operations[op] == LSBCSOpEntitlementsBlob) {
+                CFDataRef data = CFDataCreate(NULL, blob + 8, length - 8);
+                CFPropertyListRef value = CFPropertyListCreateWithData(NULL, data, 0, NULL, NULL);
+                assert(value && CFGetTypeID(value) == CFDictionaryGetTypeID());
+                assert(CFDictionaryGetValue(value, CFSTR("peer")) == kCFBooleanTrue);
+                CFRelease(value);
+                CFRelease(data);
+            }
+        }
+    }
+    unsigned char empty[512];
+    resetCalls();
+    calls.originalResult = 0;
+    assert(!LSBCSopsAuditToken(777, LSBCSOpEntitlementsBlob, empty, sizeof(empty), &target));
+    CFDataRef data = CFDataCreate(NULL, empty + 8, readBE32(empty + 4) - 8);
+    CFPropertyListRef value = CFPropertyListCreateWithData(NULL, data, 0, NULL, NULL);
+    assert(value && CFGetTypeID(value) == CFDictionaryGetTypeID() && !CFDictionaryGetCount(value)); // An empty snapshot grants nothing.
+    CFRelease(value);
+    CFRelease(data);
+}
+
 static void testReadAllowlistAndIdentity(void) {
     audit_token_t token = {{0x91, 0x32, 0x13, 0x44, 0x55, 9988, 0x77, 0x88}}, before = token;
     for (unsigned int operation = 0; operation <= 64; ++operation) {
@@ -206,7 +258,8 @@ static void testReadAllowlistAndIdentity(void) {
         resetCalls();
         size_t size = operation == LSBCSOpCDHash ? LSB_GUEST_CDHASH_BYTES : sizeof(buffer);
         int result = LSBCSopsAuditToken(9988, operation, buffer, size, &token);
-        assertOriginal(9988, operation, buffer, size, &token);
+        if (!entitlementOperation(operation)) assertOriginal(9988, operation, buffer, size, &token);
+        else assert(!calls.originalCalls);
         assert(!memcmp(&token, &before, sizeof(token)));
         if (!allowed) {
             assert(result == -1 && errno == EPERM && !calls.selfCalls && buffer[0] == 0xa5);
@@ -334,7 +387,7 @@ static void testDistinctPeersAndUncachedSnapshots(void) {
             audit_token_t before = targets[target];
             resetCalls();
             assert(!LSBCSopsAuditToken((pid_t)before.val[5], operations[operation], profiles[target], sizeof(profiles[target]), &targets[target]));
-            assertOriginal((pid_t)before.val[5], operations[operation], profiles[target], sizeof(profiles[target]), &targets[target]);
+            assert(!calls.originalCalls);
             assert(!calls.selfCalls && calls.brokerCalls == 1 && errno == EDOM && !memcmp(&before, &targets[target], sizeof(before)));
             assert(!memcmp(&calls.brokerTarget, &before, sizeof(before)) && calls.brokerOperation == operations[operation]);
             assert(LSBGuestEntitlementsHasValidBlobHeaderForOperation(profiles[target], readBE32(profiles[target] + 4), operations[operation]));
@@ -363,6 +416,7 @@ static void testBrokerErrorsAndMalformedReplies(void) {
             unsigned char output[512];
             memset(output, 0xa5, sizeof(output));
             resetCalls();
+            calls.originalResult = 0; // A native success must never hide an unavailable or unauthenticated guest snapshot.
             calls.brokerError = errors[i];
             assert(LSBCSopsAuditToken(777, operations[op], output, sizeof(output), &target) == -1 && errno == errors[i]);
             assert(calls.brokerCalls == 1 && !calls.selfCalls);
@@ -426,8 +480,15 @@ static void testAuditTokenValidation(void) {
         assert(LSBCSopsAuditToken(777, LSBCSOpDEREntitlementsBlob, output, sizeof(output), badTokens[i]) == -1 && errno == EFAULT);
         assert(!calls.brokerCalls && !calls.selfCalls);
         resetCalls();
-        calls.originalResult = 0; // A successful original query must not inspect even an invalid audit-token pointer.
+        calls.originalResult = 0; // Enabled virtualization still validates the token even if a native query would succeed.
+        assert(LSBCSopsAuditToken(777, LSBCSOpDEREntitlementsBlob, output, sizeof(output), badTokens[i]) == -1 && errno == EFAULT);
+        assert(!calls.brokerCalls && !calls.originalCalls);
+        assert(!unsetenv(LSB_CODE_SIGNING_ENABLE_ENV));
+        resetCalls();
+        calls.originalResult = 0; // Opt-out forwards the original pointer without reading it in the adapter.
         assert(!LSBCSopsAuditToken(777, LSBCSOpDEREntitlementsBlob, output, sizeof(output), badTokens[i]) && !calls.brokerCalls);
+        assertOriginal(777, LSBCSOpDEREntitlementsBlob, output, sizeof(output), badTokens[i]);
+        assert(!setenv(LSB_CODE_SIGNING_ENABLE_ENV, "1", 1));
     }
     memcpy(pages + 1, &peer, sizeof(peer));
     assert(!mprotect(pages, (size_t)pageSize, PROT_READ));
@@ -527,6 +588,7 @@ static void testCodeDirectoryHashes(void) {
 
 int main(void) {
     testDisabledAndOriginalResults();
+    testEntitlementSnapshotPriority();
     testReadAllowlistAndIdentity();
     testFallbackErrorsAndStatusBounds();
     testKernelOutputValidation();
@@ -535,6 +597,6 @@ int main(void) {
     testAuditTokenValidation();
     testEntitlementBufferSemantics();
     testCodeDirectoryHashes();
-    puts("CodeSigningCompatibility: EPERM-only reads, per-peer XML/DER/CDHash, full audit validation, native forwarding and kernel copies passed");
+    puts("CodeSigningCompatibility: XML/DER snapshot priority, EPERM-only other reads, audit validation, opt-out and kernel copies passed");
     return 0;
 }

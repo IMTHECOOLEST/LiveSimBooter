@@ -17,6 +17,10 @@ int LSBLaunchdRegisterEndpoint(mach_port_t service, const audit_token_t *expecte
 // Keep one request alive while startup is busy; never retry an unknown registration after a timeout.
 int LSBLaunchdRegisterEndpointWithTimeout(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
                                          mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *bootstrapStatus);
+// Stock 23A343 bridge removal (MIG 709); same authentication, borrowed service right and bounded transaction rules.
+// ESRCH means an authenticated reply confirmed that the name was already absent. Never retry a timed-out removal blindly.
+int LSBLaunchdUnregisterEndpointWithTimeout(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
+                                           uint32_t timeoutMilliseconds, kern_return_t *bootstrapStatus);
 #ifdef __cplusplus
 }
 #endif

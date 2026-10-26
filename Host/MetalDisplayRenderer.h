@@ -11,18 +11,21 @@ NS_ASSUME_NONNULL_BEGIN
 @interface LSBMetalDisplayRenderer : NSObject
 @property (nonatomic, readonly) BOOL hasFrame;
 @property (nonatomic, readonly) CGSize pixelSize;
+// Default YES. Hidden presentation keeps consuming dirty updates into the owned baseline without requesting a drawable.
+// Reenabling asynchronously presents that baseline; it never rereads a producer surface. Main-thread only.
+@property (nonatomic, getter=isPresentationEnabled) BOOL presentationEnabled;
 
 - (nullable instancetype)initWithLayer:(CAMetalLayer *)layer error:(int * _Nullable)error NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 
 // Retain a complete, nonplanar BGRA surface until completion. The caller must prevent producer writes until that callback.
-// Copies only dirtyRect into a private baseline, then copies the complete baseline into CAMetalLayer's bounded three-drawable pool.
+// Copies only dirtyRect into a private baseline, then, when enabled, into CAMetalLayer's bounded three-drawable pool.
 // Drawable acquisition and GPU completion waits run on a serial worker. The main thread never waits for those operations.
 // Completion reports an errno value after all GPU reads end; only then may the caller release the producer fence/reuse the surface.
 // One presentation may be outstanding; overlapping requests complete with EAGAIN. Immediate validation errors can complete inline.
 // The first frame, and the first frame after reset or a size change, must cover the complete surface.
-// Validation/allocation/drawable failures preserve the previous baseline. A submitted GPU failure invalidates it and hides the layer.
+// Validation/allocation/drawable failures preserve the previous baseline. A submitted GPU write failure invalidates it and hides the layer.
 - (void)presentSurface:(IOSurfaceRef)surface dirtyRect:(CGRect)dirtyRect completion:(void (^)(int error))completion;
 
 // Blocking test/diagnostic convenience. Production presentation must use the completion-based method above.

@@ -75,6 +75,40 @@ static void testLayoutBounds(void) {
     assert(!LSBDisplayBGRALayout(1, 1, SIZE_MAX, 4, &row, &bytes) && row == 4 && bytes == 4);
 }
 
+static void testBeginningEdges(void) {
+    CGRect viewport = CGRectMake(10, 20, 300, 600);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 20)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 32)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 32.01)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 608)) == LSBIndigoTouchEdgeBottom);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 620)) == LSBIndigoTouchEdgeBottom);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(22, 320)) == LSBIndigoTouchEdgeLeft);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(298, 320)) == LSBIndigoTouchEdgeRight);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 320)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(10, 20)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(310, 20)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(10, 620)) == LSBIndigoTouchEdgeBottom);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(310, 620)) == LSBIndigoTouchEdgeBottom);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(15, 25)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(14, 25)) == LSBIndigoTouchEdgeLeft);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(9, 20)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 19)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(311, 320)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(160, 621)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(CGRectZero, CGPointZero) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(CGRectMake(0, 0, INFINITY, 100), CGPointZero) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(NAN, 20)) == LSBIndigoTouchEdgeNone);
+    // Aspect-fit letterboxing never becomes an input edge, and the 5% cap prevents a tiny image becoming all edge.
+    viewport = LSBDisplayViewport(CGRectMake(0, 0, 300, 200), CGSizeMake(100, 200));
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(99, 100)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(105, 100)) == LSBIndigoTouchEdgeLeft);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(105.01, 100)) == LSBIndigoTouchEdgeNone);
+    viewport = CGRectMake(0, 0, 10, 20);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(5, 0.5)) == LSBIndigoTouchEdgeTop);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(5, 0.51)) == LSBIndigoTouchEdgeNone);
+    assert(LSBDisplayBeginningEdge(viewport, CGPointMake(5, 10)) == LSBIndigoTouchEdgeNone);
+}
+
 static void testSnapshotCapture(void) {
     const uint8_t expected[] = {1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255};
     uint8_t pixels[16];
@@ -91,7 +125,7 @@ static void testSnapshotCapture(void) {
 }
 
 int main(void) {
-    @autoreleasepool { testCoordinates(); testLayoutBounds(); testSnapshotCapture(); }
-    puts("SimulatorDisplayTests: coordinate mapping and diagnostic PNG publication passed");
+    @autoreleasepool { testCoordinates(); testBeginningEdges(); testLayoutBounds(); testSnapshotCapture(); }
+    puts("SimulatorDisplayTests: coordinate mapping, edge origins, and diagnostic PNG publication passed");
     return 0;
 }

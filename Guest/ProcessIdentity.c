@@ -22,12 +22,14 @@ static char nativeRunningBoardServicesPath[PATH_MAX];
 static char nativeFrontBoardPath[PATH_MAX];
 static char nativeUIKitCorePath[PATH_MAX];
 static char nativeFrontBoardServicesPath[PATH_MAX];
+static char nativeBackBoardServicesPath[PATH_MAX];
 static const char baseBoardInstallPath[] = "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
 static const char runningBoardServicesInstallPath[] =
     "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
 static const char frontBoardInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard";
 static const char uiKitCoreInstallPath[] = "/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore";
 static const char frontBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices";
+static const char backBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices";
 
 static void configureNativeImagePath(char path[PATH_MAX], const char *suffix) {
     path[0] = '\0';
@@ -80,7 +82,12 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
     // See docs/springboard-services.md and the pinned disassembly analysis in tmp/app-launch-fix/routine712-runningboard-pid-source.md.
     bool frontBoardServices = !strcmp(path, frontBoardServicesInstallPath) ||
         (nativeFrontBoardServicesPath[0] && !strcmp(path, nativeFrontBoardServicesPath));
-    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard && !uiKitCore && !frontBoardServices) return;
+    // iOS 26 23A343 BackBoardServices +0x673b4 registers the HID client's PID; +0xcc58 and +0x15bbc construct HID dispatch targets.
+    // Those identities, and the delivery-policy self comparison at +0x183f0, must match the kernel audit PID used by the event client.
+    bool backBoardServices = !strcmp(path, backBoardServicesInstallPath) ||
+        (nativeBackBoardServicesPath[0] && !strcmp(path, nativeBackBoardServicesPath));
+    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard &&
+        !uiKitCore && !frontBoardServices && !backBoardServices) return;
     const struct mach_header_64 *header = (const struct mach_header_64 *)image;
     const unsigned char *command = (const unsigned char *)(header + 1), *end = command + header->sizeofcmds;
     forgetNativeIdentityImage(image);
@@ -154,6 +161,7 @@ __attribute__((constructor)) static void initializeIdentity(void) {
     configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
     configureNativeImagePath(nativeUIKitCorePath, uiKitCoreInstallPath);
     configureNativeImagePath(nativeFrontBoardServicesPath, frontBoardServicesInstallPath);
+    configureNativeImagePath(nativeBackBoardServicesPath, backBoardServicesInstallPath);
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);

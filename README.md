@@ -4,8 +4,11 @@ Experimental arm64 simulator runtime on an iPhone. The native app has a minimal 
 It discovers `LiveProcess.appex` through `NSExtension` and launches separate instances through PlugInKit's pkd launch operation.
 Its C entry receives a launch plan and descriptors through synchronous XPC,
 maps `dyld_sim` and the requested executable, detaches the native cache, then invokes `start_sim`.
-The native view starts interactive `/bin/fish` with a socket-backed terminal once from `viewDidLoad`; app launch arguments can
-select another RuntimeRoot executable. Pass `/bin/spawn-probe` explicitly for the process tests. UIKit is confined to the native host; the original delegates,
+The native window has persistent **IOSurface** and **Fish** tabs. A normal app-icon launch boots the graphical simulator launchd
+session; its fixed `terminal-fish` job replaces itself with interactive Fish through `POSIX_SPAWN_SETEXEC`. The host attaches
+the socket terminal to that authenticated job's lineage. Switching tabs does not start or stop guests. Explicit `--terminal`
+retains the earlier direct-shell diagnostic mode, and other launch arguments can select a RuntimeRoot executable.
+Pass `/bin/spawn-probe` explicitly for the process tests. UIKit is confined to the native host; the original delegates,
 controller and storyboards remain in `unused/`, outside the app target.
 
 `RuntimeRoot` lives inside App Group `group.com.kdt.LiveSimBooter`. On first launch, the broker moves an existing
@@ -44,8 +47,10 @@ pool; drawable and GPU waits stay off the UI thread. Apple-logo/progress renderi
 See [backboardd progress and cache measurements](docs/backboardd.md), [framebuffer transport](docs/framebuffer.md), and
 [the native IOSurface service](docs/iosurface.md).
 
-`--launchd-services` adds selected matching-runtime daemons to that bootstrap. Optional trailing stock job labels replace
-the default selection. See [services toward SpringBoard](docs/springboard-services.md) for the staged tests and limits.
+`--launchd-services`, also the no-argument default, adds selected matching-runtime daemons including SpringBoard, sleepd and
+IconServices to that bootstrap. Optional trailing stock job labels replace the default selection. The fixed Fish helper is
+included in graphical launchd modes. See [services toward SpringBoard](docs/springboard-services.md) for the selection and
+[the terminal architecture and validation boundary](docs/fake-pty.md#launchd-owned-fish-and-tabs).
 
 The native Metal backend uses matching simulator serializer/server libraries adapted through platform, dependency and
 export metadata, with their code sections unchanged. A phone probe running as the backboardd job compiled shader source

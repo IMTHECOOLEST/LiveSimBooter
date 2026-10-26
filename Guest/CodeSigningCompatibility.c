@@ -95,10 +95,8 @@ static bool supportedRead(unsigned int operation) {
     switch (operation) {
         case LSBCSOpStatus:
         case LSBCSOpCDHash:
-        case LSBCSOpEntitlementsBlob:
         case LSBCSOpIdentity:
         case LSBCSOpTeamID:
-        case LSBCSOpDEREntitlementsBlob:
         case LSBCSOpValidationCategory:
             return true;
         default:
@@ -108,6 +106,14 @@ static bool supportedRead(unsigned int operation) {
 
 int LSBCSopsAuditToken(pid_t pid, unsigned int operation, void *buffer, size_t size, audit_token_t *token) {
     int incomingErrno = errno;
+    if (operation == LSBCSOpEntitlementsBlob || operation == LSBCSOpDEREntitlementsBlob) {
+        const char *enabled = getenv(LSB_CODE_SIGNING_ENABLE_ENV);
+        // Native self reads describe LiveProcess, not the mapped guest. Security caches EINVAL/empty success as no entitlements,
+        // so these two opted-in operations must use the registered image snapshot even when the kernel would not return EPERM.
+        // The broker authenticates the complete target audit token; missing, stale or unknown guest identities never fall back.
+        if (enabled && !strcmp(enabled, "1")) return copyGuestEntitlements(pid, operation, buffer, size, token, incomingErrno);
+        errno = incomingErrno;
+    }
     int result = csops_audittoken(pid, operation, buffer, size, token);
     int originalErrno = errno;
     if (result != -1 || originalErrno != EPERM || !supportedRead(operation)) return result;
@@ -127,8 +133,6 @@ int LSBCSopsAuditToken(pid_t pid, unsigned int operation, void *buffer, size_t s
     // errno before this syscall so a successful fallback does not leak the preceding, handled EPERM.
     errno = incomingErrno;
     if (operation == LSBCSOpCDHash) return copyGuestCodeDirectoryHash(pid, buffer, size, token, incomingErrno);
-    if (operation == LSBCSOpEntitlementsBlob || operation == LSBCSOpDEREntitlementsBlob)
-        return copyGuestEntitlements(pid, operation, buffer, size, token, incomingErrno);
     result = csops(0, operation, buffer, size);
     if (result == 0 && operation == LSBCSOpStatus && buffer) {
         // Revalidate through a kernel copy: another thread may invalidate the destination after the successful self query.

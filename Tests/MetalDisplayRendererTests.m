@@ -13,6 +13,7 @@
 @property NSUInteger drawableRequests;
 @property (strong) dispatch_semaphore_t drawableEntered;
 @property (strong) dispatch_semaphore_t unblockDrawable;
+@property (strong) id<MTLTexture> lastDrawableTexture;
 @end
 
 @implementation LSBTestMetalLayer
@@ -24,7 +25,9 @@
         dispatch_semaphore_signal(entered);
         assert(!dispatch_semaphore_wait(unblock, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)));
     }
-    return _denyDrawable ? nil : [super nextDrawable];
+    id<CAMetalDrawable> drawable = _denyDrawable ? nil : [super nextDrawable];
+    self.lastDrawableTexture = drawable.texture;
+    return drawable;
 }
 @end
 
@@ -124,6 +127,120 @@ static void present(LSBMetalDisplayRenderer *renderer, IOSurfaceRef surface, CGR
     if (error) fprintf(stderr, "Unexpected Metal presentation error: %d (%s)\n", error, strerror(error));
     assert(!error);
     drainPresentation();
+}
+
+static void assertDrawable(LSBTestMetalLayer *layer, const uint8_t pixels[ImageBytes]) {
+    id<MTLTexture> texture = layer.lastDrawableTexture;
+    assert(texture && texture.width == Width && texture.height == Height);
+    id<MTLBuffer> buffer = [layer.device newBufferWithLength:256 * Height options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> command = [[layer.device newCommandQueue] commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(Width, Height, 1)
+                toBuffer:buffer destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:256 * Height];
+    [blit endEncoding]; [command commit]; [command waitUntilCompleted];
+    assert(command.status == MTLCommandBufferStatusCompleted && buffer.contents);
+    for (unsigned row = 0; row < Height; ++row)
+        assert(!memcmp((const uint8_t *)buffer.contents + row * 256, pixels + row * Width * 4, Width * 4));
+}
+
+static void testHiddenPresentation(void) {
+    LSBTestMetalLayer *layer = [LSBTestMetalLayer layer];
+    layer.frame = CGRectMake(0, 0, Width, Height);
+    layer.denyDrawable = YES;
+    int error;
+    LSBMetalDisplayRenderer *renderer = [[LSBMetalDisplayRenderer alloc] initWithLayer:layer error:&error];
+    assert(renderer && !error && renderer.isPresentationEnabled);
+    renderer.presentationEnabled = NO;
+    IOSurfaceRef source = createSurface(Width, Height, 0x42475241);
+    CGRect full = CGRectMake(0, 0, Width, Height), dirty = CGRectMake(2, 3, 4, 2);
+    uint8_t expected[ImageBytes], incoming[ImageBytes];
+    memset(expected, 0x72, sizeof(expected));
+    writeSurface(source, expected);
+    assert(presentResult(renderer, source, dirty) == ENODATA);
+    present(renderer, source, full);
+    assert(renderer.hasFrame && layer.hidden && !layer.drawableRequests);
+    poisonSurface(source, 0x91);
+    CGImageRef image = checkBaseline(renderer, expected, Width, Height); CGImageRelease(image);
+    const uint8_t color[] = {15, 37, 91, 255};
+    memset(incoming, 0xDD, sizeof(incoming)); patchPixels(incoming, dirty, color); patchPixels(expected, dirty, color);
+    writeSurface(source, incoming);
+    present(renderer, source, dirty);
+    poisonSurface(source, 0xE1); CFRelease(source);
+    assert(layer.hidden && !layer.drawableRequests); // Hidden updates release the producer even when the drawable pool is unavailable.
+    image = checkBaseline(renderer, expected, Width, Height); CGImageRelease(image);
+
+    renderer.presentationEnabled = YES;
+    waitUntil(^BOOL { return layer.drawableRequests == 1; });
+    image = checkBaseline(renderer, expected, Width, Height); CGImageRelease(image); // Wait behind the unsuccessful baseline-only presentation.
+    assert(layer.hidden); // No drawable: retain the baseline for a later visible frame or a retry, without exposing stale pixels.
+    renderer.presentationEnabled = NO;
+    layer.denyDrawable = NO;
+    renderer.presentationEnabled = YES;
+    waitUntil(^BOOL { return !layer.hidden; });
+    assert(layer.drawableRequests == 2);
+    assertDrawable(layer, expected); // The producer was overwritten and released before resuming.
+    image = checkBaseline(renderer, expected, Width, Height); CGImageRelease(image);
+    renderer.presentationEnabled = YES;
+    drainPresentation();
+    assert(layer.drawableRequests == 2); // Idempotent enable does not queue unbounded presentation work.
+    puts("MetalDisplayRendererTests: hidden dirty accumulation, producer reuse and owned-baseline presentation passed");
+}
+
+static void testVisibilityDuringWork(void) {
+    LSBTestMetalLayer *layer = [LSBTestMetalLayer layer];
+    layer.frame = CGRectMake(0, 0, Width, Height);
+    layer.denyDrawable = YES;
+    layer.drawableEntered = dispatch_semaphore_create(0);
+    layer.unblockDrawable = dispatch_semaphore_create(0);
+    int error;
+    LSBMetalDisplayRenderer *renderer = [[LSBMetalDisplayRenderer alloc] initWithLayer:layer error:&error];
+    assert(renderer && !error);
+    IOSurfaceRef source = createSurface(Width, Height, 0x42475241);
+    CGRect full = CGRectMake(0, 0, Width, Height);
+    uint8_t expected[ImageBytes]; memset(expected, 0xA7, sizeof(expected));
+    writeSurface(source, expected);
+    __block BOOL completed = NO;
+    [renderer presentSurface:source dirtyRect:full completion:^(int result) { assert(!result && !completed); completed = YES; }];
+    waitUntil(^BOOL { return dispatch_semaphore_wait(layer.drawableEntered, DISPATCH_TIME_NOW) == 0; });
+    renderer.presentationEnabled = NO;
+    dispatch_semaphore_signal(layer.unblockDrawable);
+    waitUntil(^BOOL { return completed; });
+    poisonSurface(source, 0);
+    assert(renderer.hasFrame && layer.hidden);
+    CGImageRef image = checkBaseline(renderer, expected, Width, Height); CGImageRelease(image);
+
+    // A newer show request must survive the prior refresh, but its canceled callback must not reveal stale presentation.
+    layer.denyDrawable = NO;
+    renderer.presentationEnabled = YES;
+    waitUntil(^BOOL { return dispatch_semaphore_wait(layer.drawableEntered, DISPATCH_TIME_NOW) == 0; });
+    renderer.presentationEnabled = NO;
+    renderer.presentationEnabled = YES; // Coalesce a second refresh behind the paused one.
+    dispatch_semaphore_signal(layer.unblockDrawable);
+    waitUntil(^BOOL { return dispatch_semaphore_wait(layer.drawableEntered, DISPATCH_TIME_NOW) == 0; });
+    assert(layer.hidden && layer.drawableRequests == 3);
+    dispatch_semaphore_signal(layer.unblockDrawable);
+    waitUntil(^BOOL { return !layer.hidden; });
+    assertDrawable(layer, expected);
+
+    // Reset during baseline-only presentation must not resurrect its frame or unhide an old layer generation.
+    renderer.presentationEnabled = NO;
+    renderer.presentationEnabled = YES;
+    waitUntil(^BOOL { return dispatch_semaphore_wait(layer.drawableEntered, DISPATCH_TIME_NOW) == 0; });
+    renderer.presentationEnabled = NO;
+    renderer.presentationEnabled = YES;
+    [renderer reset];
+    dispatch_semaphore_signal(layer.unblockDrawable);
+    assert(!copyImage(renderer, &error) && error == ENODATA);
+    assert(!renderer.hasFrame && layer.hidden && layer.drawableRequests == 4);
+    layer.drawableEntered = nil; layer.unblockDrawable = nil;
+    renderer.presentationEnabled = NO;
+    writeSurface(source, expected);
+    present(renderer, source, full);
+    poisonSurface(source, 0); CFRelease(source);
+    renderer.presentationEnabled = YES;
+    waitUntil(^BOOL { return !layer.hidden; });
+    assertDrawable(layer, expected);
+    puts("MetalDisplayRendererTests: visibility changes during acquisition and stale reset callbacks passed");
 }
 
 static void testAsyncLifecycle(void) {
@@ -293,7 +410,7 @@ int main(void) {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) { puts("MetalDisplayRendererTests SKIPPED: no native Metal device available"); return 0; }
         fprintf(stderr, "MetalDisplayRendererTests device=%s\n", device.name.UTF8String);
-        testAsyncLifecycle(); testRenderer();
+        testAsyncLifecycle(); testRenderer(); testHiddenPresentation(); testVisibilityDuringWork();
     }
     return 0;
 }

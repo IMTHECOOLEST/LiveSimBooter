@@ -1,9 +1,12 @@
 # Socket-backed terminal
 
-The native app now starts `/bin/fish -i -N -P` with an inherited terminal endpoint when launched without guest arguments.
-An initialization command disables job control, enables `fish_use_posix_spawn`, and selects a simple `fish> ` prompt.
-This keeps the upstream Fish executable unchanged. The integrated terminal and pthread bridge reached an interactive prompt
-on the iPhone, accepted editing keys, ran `df` and Bash, interrupted a running child, and exited cleanly on Ctrl-D.
+A normal app launch now starts the graphical simulator launchd session and presents persistent IOSurface and Fish tabs.
+Launchd starts the fixed terminal helper, which replaces itself with `/bin/fish -i -N -P` using the existing SETEXEC transport.
+An initialization command disables job control, enables `fish_use_posix_spawn`, and selects a simple `fish> ` prompt. The Fish
+executable remains unchanged. The earlier direct-terminal mode reached an interactive prompt on the iPhone, accepted editing
+keys, ran `df` and Bash, interrupted a running child, and exited cleanly on Ctrl-D. The launchd-owned Fish tab has now also
+reached its prompt and run `df` with exit status 0 on the iPhone. The newer lifecycle-label and toolbar layout changes still
+need device verification; the two launch paths' results are recorded separately below.
 
 The terminal runs in the native UIKit host. LiveProcess remains C, releases native XPC state before its single-thread check,
 and detaches the host cache as before. The guest additions are C interposers compiled into `libLiveSimSpawn.dylib` and use
@@ -11,16 +14,18 @@ the Simulator's libc after handoff. The terminal does not create a native kernel
 
 ## Launch and files
 
-The runtime needs the existing cache, dyld_sim, updated spawn shim, and the [pristine Fish build](fish.md) at `bin/fish`.
-Keep the app foregrounded. A normal app launch opens its terminal; explicit commands keep their previous console behavior
-unless prefixed with `--terminal`:
+The runtime needs the existing cache, dyld_sim, updated spawn shim, the [pristine Fish build](fish.md) at `bin/fish`, and the
+signed helper at `usr/libexec/terminal-fish`. `sh Tools/build-terminal-fish.sh` builds the arm64 simulator helper into
+`tmp/terminal-fish/`; sign and stage it using the runtime's existing procedure. Keep the app foregrounded. A normal app launch
+opens the IOSurface tab; select Fish for the terminal. Explicit commands keep their console behavior unless prefixed with
+the legacy diagnostic option `--terminal`:
 
 ```sh
-# Default interactive Fish terminal.
+# Default graphical launchd session, with IOSurface and launchd-owned Fish tabs.
 xcrun devicectl device process launch --device 00008130-00021D122680011C --terminate-existing --console \
   -- com.kdt.LiveSimBooter
 
-# Wrap an explicitly configured shell in the terminal.
+# Legacy direct-shell diagnostic: this bypasses simulator launchd ownership.
 xcrun devicectl device process launch --device 00008130-00021D122680011C --terminate-existing --console \
   -- com.kdt.LiveSimBooter --terminal /bin/fish -i -N -P -C 'status job-control none; set -g fish_use_posix_spawn 1'
 
@@ -29,10 +34,55 @@ xcrun devicectl device process launch --device 00008130-00021D122680011C --termi
   -- com.kdt.LiveSimBooter /bin/spawn-probe --repeat 2 --verify-statuses
 ```
 
-Terminal mode sets `TERM=xterm-256color`, `HOME` to `RuntimeRoot/home/mobile`, and `PATH` to the actual RuntimeRoot `bin` and
-`usr/bin` directories. It creates the home directory when needed. Programs can then find `df` through PATH without a general
-`chroot` implementation. Explicit `--terminal` commands choose their own job-control policy; only the default Fish arguments
-disable it automatically. The loader continues to leave `DYLD_PRINT_*` diagnostics off unless supplied explicitly.
+The launchd helper sets `TERM=xterm-256color`, `HOME` and `CFFIXED_USER_HOME` to the owned `SimulatorData` directory, changes
+into that directory, and uses the physical RuntimeRoot `bin`, `usr/bin`, `usr/sbin` and `sbin` directories in `PATH`. It checks
+the simulator platform, attached terminal descriptors and canonical sibling RuntimeRoot/SimulatorData paths before SETEXEC.
+The explicit `--terminal` diagnostic retains its earlier `RuntimeRoot/home/mobile` home and `bin:usr/bin` path setup.
+Explicit shell arguments choose their own job-control policy; the provided Fish arguments disable it. This is not a general
+`chroot` implementation. The loader leaves `DYLD_PRINT_*` diagnostics off unless supplied explicitly.
+
+## Launchd-owned Fish and tabs
+
+`Host/LaunchdConfiguration.m` generates `com.kdt.LiveSimBooter.terminal-fish` with program `/usr/libexec/terminal-fish`,
+`RunAtLoad=true`, `KeepAlive=false`, and working directory `/private/var/mobile/`. Both graphical launchd modes include it.
+The normal icon launch and bare `--launchd-services` select eleven stock services, including SpringBoard and IconServices;
+backboardd, cfprefsd and this terminal helper are the three fixed jobs. Explicit service labels still replace only the
+stock selection. There is no additional host-to-guest terminal RPC and no host-direct Fish fallback for this path.
+
+The broker accepts the exact helper path only from the authenticated running simulator launchd, or through SETEXEC by its
+direct child whose captured executable identity is exactly `/usr/libexec/xpcproxy_sim`. It preserves the genuine sender audit
+token checks and rejects a second active terminal lineage. After the original ordered spawn actions, attachment adds a
+staging socket FD and final `dup2` operations for 0/1/2 followed by closing the staging FD. The operation is transactional;
+failure preserves the request and closes newly created resources. Existing terminal-state environment entries are replaced
+with the new session's state path.
+
+Simulator launchd constructs the physical proxy path with a doubled separator at `RuntimeRoot//usr/libexec/xpcproxy_sim`.
+The broker originally rejected it before taking the immutable executable-identity snapshot, leaving `peerIdentityError=EINVAL`
+and rejecting the terminal helper's SETEXEC with `EACCES`. It now accepts that one physical-root boundary spelling, including
+the strict `/var` alias of `/private/var`, while retaining traversal rejection and opened-descriptor containment checks.
+The stored identity is still the canonical logical `/usr/libexec/xpcproxy_sim`. The helper recognizer accepts the same
+specific boundary spelling; other duplicate components, doubled separators under unrelated alias roots and escaping symlinks remain rejected.
+
+`Guest/TerminalFish.c` then requests only `POSIX_SPAWN_SETEXEC` for Fish. The existing replacement protocol preserves the
+logical job PID, parent ledger and wait ownership across xpcproxy → helper → Fish. Terminal ownership follows that lineage
+and its descendants. Simulator launchd, Metal helpers and unrelated launchd jobs do not become terminal jobs merely because
+a global terminal session exists. A failed replacement exits the helper with an error; it does not spawn an ordinary child
+as a fallback. When the final terminal process exits, the host reader drains to EOF and the tab reports that it is closed.
+
+`Host/ViewController.m` keeps both tab controllers and their runtime connections alive. It loads the hidden terminal consumer
+early so Fish's cursor/status queries can receive replies before that tab is selected; only the visible tab acquires keyboard
+focus. The broker publishes the terminal-change notification before starting its reader, and the session retains up to
+256 KiB of output until a consumer binds, including output drained just before EOF. Switching away cancels active simulator
+contacts and pauses drawable presentation. Dirty updates continue into the display's owned baseline, so returning to IOSurface
+can present the current image without restarting backboardd or losing pending frame acknowledgments.
+
+The focused broker/configuration suites cover authenticated attachment, xpcproxy/helper/Fish replacement, subtree isolation,
+concurrent-session rejection, default icon-launch job selection and preserved explicit diagnostic modes. TerminalSession tests
+cover transactional final actions, FD/environment failure rollback, late output binding, EOF and closure notification.
+TerminalFish tests check platform/TTY/data-root guards, environment setup, SETEXEC-only replacement and failure reporting.
+The full `sh Tests/run.sh` suite passed in [the integrated log](../tmp/terminal-launchd-tests/full-suite.log), and the native
+app build succeeded. [The icon-default broker run](../tmp/terminal-launchd-tests/broker-icon-default.log) also passed.
+The subsequent broker path-boundary regression passed, and the device run described below verifies the new launch path.
 
 ## Transport and guest controls
 
@@ -58,19 +108,27 @@ is not an openable device node.
 
 The host forwards VINTR/VQUIT and resize notifications through the broker's existing audited signal path. With job control
 disabled, it targets all live jobs belonging to that terminal, not a kernel foreground process group. The stored foreground
-identifier satisfies the shell's terminal queries but does not virtualize `setpgid`, sessions, or stopped/continued jobs.
+identifier satisfies the shell's terminal queries without creating a native foreground group or supplying stopped/continued
+job control. Initial foreground selection calls `LSBGuestProcessGroup()` directly, keeping it consistent with the existing
+logical session model across SETEXEC. Calling `getpgrp()` from inside the interposing shim bypassed its own interposition
+and seeded the native group instead; Fish then saw a different group from its own logical `getpgrp()` result.
 The [creation-mask tracker](creation-mask.md) lets the existing spawn path capture a known mask after Fish starts workers.
 
 Interactive Fish also starts pthread workers. XNU retains the native pthread startup PC after cache detachment, and rejects
 the simulator's repeat registration. The shim's [thread-start bridge](runtime-handoff.md#new-guest-pthreads) creates each
 supported new pthread suspended through the real syscall, redirects its initial PC to simulator libpthread, and resumes it.
 This preserves kernel thread/TSD initialization while avoiding entry into the unmapped native cache. It supports the pinned
-custom-stack pthread ABI; kernel workqueue startup remains unsupported.
+custom-stack pthread ABI; the separate [launchd workqueue bridge](launchd.md) handles the supported workqueue startup path.
 
 ## Native display and input
 
-`Host/TerminalView.m` provides software-keyboard input, hardware arrow/control keys, and an accessory row with Escape, Tab,
-Ctrl-C, Ctrl-D, arrows, and Return. The display parses UTF-8, cursor movement, erasure, basic insert/delete operations, and
+`Host/TerminalView.m` provides software-keyboard input, hardware arrow/control keys, and a shortcut row with Escape, Tab,
+Ctrl-C, Ctrl-D, arrows, and Return. The row is inside the terminal view, whose bottom stays above both the safe-area bottom
+and keyboard top; it no longer uses an `inputAccessoryView` that can overlap the floating tab bar. A separate lifecycle
+label changes from waiting to attached or closed without polluting the guest's output. The controller rechecks its binding
+when the tab appears, retains failure output after EOF, and disables keyboard focus without a live input handler. These
+status/layout changes pass local iPhoneOS syntax checks and await device verification. The display parses UTF-8, cursor
+movement, erasure, basic insert/delete operations, and
 device/status queries, with bounded scrollback. Size changes update the shared window and ask the broker to send SIGWINCH.
 Raw output is also mirrored to a connected `devicectl --console` stream. A usable pipe/TTY on the host app's stdin can feed
 the same session, but `devicectl` did not forward stdin on the tested iPhone; keyboard input and the opt-in test FIFO work independently.
@@ -86,7 +144,8 @@ visual effect, Unicode cell widths are incomplete, and full-screen terminal appl
 - Guest flush/drain controls, `TCSADRAIN`, `TCSAFLUSH`, flow control, breaks, and unsupported terminal ioctls return `ENOTSUP`.
 - Canonical EOF on an empty line, software flow control, suspend characters, timed reads, and nondefault minimum-length reads
   are unsupported. In Fish's noncanonical mode Ctrl-D is an ordinary input byte that Fish can interpret itself.
-- Full job control, stopped/continued wait events, generic `fork`, and process-image replacement remain unsupported.
+- Full job control, stopped/continued wait events, generic `fork`, and generic `execve` remain unsupported; the broker supports
+  the separate-process `POSIX_SPAWN_SETEXEC` replacement used by the terminal helper.
   Pipelines, external command substitutions, background jobs, and arbitrary shell applications need separate execution tests.
 - Input and signal delivery are separate operations. Text followed immediately by Ctrl-C in the same input burst can leave
   text already queued in the slave socket when SIGINT reaches Fish; Fish may display that text afterward. A separate Ctrl-C
@@ -101,7 +160,16 @@ replace the separate device checks below.
 
 ## Device checks and diagnostics
 
-On 2026-10-25, the integrated terminal and worker shim ran on `iphone-0xf-26-cua-duy.local` (iOS 26.1, build `23B50`):
+On 2026-10-26, the graphical host **10396** started the launchd-owned terminal job with logical PID **10516**. Its xpcproxy
+instance **10516** replaced itself with helper **10517**, then Fish **10518**, preserving the logical job identity. Fish
+reached `fish> ` and accepted interactive input. The command `df -h >/dev/null; echo DF_STATUS=$status` launched **10554**;
+the broker recorded wait status `0x0`, Fish printed **`DF_STATUS=0`**, and its prompt returned. Evidence is
+[`console-path.log`](../tmp/terminal-launchd-tests/console-path.log) and the older-layout
+[`fish-tab-live.png`](../tmp/terminal-launchd-tests/fish-tab-live.png). This verifies Fish and its child wait path, not
+SpringBoard helper restart or Spotlight recovery. The newer terminal status/toolbar changes have not been installed in
+that captured run.
+
+On 2026-10-25, the earlier direct-terminal mode and worker shim ran on `iphone-0xf-26-cua-duy.local` (iOS 26.1, build `23B50`):
 
 - Fish PID `79627` reached the prompt and accepted typed commands. `ls` was absent from the test runtime; typing `df` spawned
   PID `79629`, printed its output, and produced exit status 0.

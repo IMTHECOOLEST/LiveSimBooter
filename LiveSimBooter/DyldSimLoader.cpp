@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <libkern/OSByteOrder.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <pthread.h>
 #include <string>
@@ -63,6 +64,12 @@ struct FileMapping {
     int fd = -1;
     void *bytes = MAP_FAILED;
     size_t size = 0;
+    bool releaseBytes() {
+        if (bytes == MAP_FAILED) return true;
+        if (munmap(bytes, size)) return false;
+        bytes = MAP_FAILED;
+        return true;
+    }
     ~FileMapping() {
         if (bytes != MAP_FAILED) munmap(bytes, size);
         if (fd != -1) close(fd);
@@ -165,6 +172,95 @@ bool readCacheReservation(const char *path, CacheReservation &cache, std::string
     return parseCacheReservation(header, info.st_size, cache, error);
 }
 
+bool readRuntimeCacheReservation(const char *rootPath, CacheReservation &cache, std::string &error) {
+    if (!rootPath || rootPath[0] != '/') return fail(error, "An absolute RuntimeRoot path is required");
+    std::string path = std::string(rootPath) + "/System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64";
+    return readCacheReservation(path.c_str(), cache, error);
+}
+
+bool lowImageRange(const Layout &layout, const CacheReservation &cache, size_t pageSize,
+                   uintptr_t &begin, uintptr_t &end, std::string &error) {
+    begin = end = 0;
+    if (!pageSize || (pageSize & (pageSize - 1)) || !layout.mappedSize || (layout.mappedSize & (pageSize - 1)) ||
+        layout.mappedSize > SIZE_MAX || !cache.size || cache.size > UINTPTR_MAX - cache.address)
+        return fail(error, "Invalid image size, cache range or VM page alignment");
+    // TXM does not grant executable mappings in the host shared region to these app-signed images.
+    // PAGEZERO also prevents allocations below 4 GiB; do not replace it or permit a negative image slide.
+    uintptr_t first = std::max<uintptr_t>(0x100000000ULL, layout.preferredAddress);
+    uintptr_t limit = std::min<uintptr_t>(0x180000000ULL, cache.address);
+    if (first > UINTPTR_MAX - (pageSize - 1)) return fail(error, "Image preferred address overflows page alignment");
+    first = (first + pageSize - 1) & ~(pageSize - 1);
+    limit &= ~(pageSize - 1);
+    if (first >= limit || layout.mappedSize > limit - first)
+        return fail(error, "Image does not fit below the simulator cache in the executable address range");
+    begin = first;
+    end = limit;
+    return true;
+}
+
+bool reserveImage(const Layout &layout, const CacheReservation &cache, vm_address_t &base, std::string &error) {
+    base = 0;
+    if (!cache.size) {
+        kern_return_t result = vm_allocate(mach_task_self(), &base, static_cast<vm_size_t>(layout.mappedSize), VM_FLAGS_ANYWHERE);
+        if (result == KERN_SUCCESS) return true;
+        error = std::string("vm_allocate(image): ") + mach_error_string(result);
+        return false;
+    }
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    uintptr_t begin = 0, end = 0;
+    if (!lowImageRange(layout, cache, pageSize, begin, end, error)) return false;
+    // The kernel's minimum map address includes the native executable's ASLR slide. vm_region_64 does not expose that PAGEZERO prefix.
+    const mach_header *nativeMain = _dyld_get_image_header(0);
+    if (!nativeMain) return fail(error, "Cannot locate the native main image for the low allocation bound");
+    uintptr_t nativeAddress = reinterpret_cast<uintptr_t>(nativeMain);
+    if (nativeAddress & (pageSize - 1)) return fail(error, "Native main image address is not VM page aligned");
+    begin = std::max(begin, nativeAddress);
+    if (begin >= end) return fail(error, "Native main image leaves no low executable address range below the simulator cache");
+    uintptr_t candidate = begin;
+    unsigned collisions = 0;
+    while (layout.mappedSize <= end - candidate) {
+        vm_address_t occupied = candidate;
+        vm_size_t occupiedSize = 0;
+        vm_region_basic_info_data_64_t info = {};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t result = vm_region_64(mach_task_self(), &occupied, &occupiedSize, VM_REGION_BASIC_INFO_64,
+                                           reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (MACH_PORT_VALID(object)) mach_port_deallocate(mach_task_self(), object);
+        if (result != KERN_SUCCESS && result != KERN_INVALID_ADDRESS) {
+            error = std::string("vm_region_64(image reservation): ") + mach_error_string(result);
+            return false;
+        }
+        uintptr_t gapEnd = end;
+        if (result == KERN_SUCCESS) {
+            if (count < VM_REGION_BASIC_INFO_COUNT_64 || !occupiedSize || occupiedSize > UINTPTR_MAX - occupied ||
+                (occupied & (pageSize - 1)) || (occupiedSize & (pageSize - 1)) || occupied + occupiedSize <= candidate)
+                return fail(error, "Invalid VM region while finding an image reservation");
+            gapEnd = std::min<uintptr_t>(end, occupied);
+            if (occupied <= candidate || layout.mappedSize > gapEnd - candidate) {
+                uintptr_t next = occupied + occupiedSize;
+                if (next >= end) break;
+                candidate = next;
+                continue;
+            }
+        }
+        vm_address_t reservation = candidate;
+        // FIXED without OVERWRITE fails on occupied pages, even if the VM map changed after the region query.
+        result = vm_allocate(mach_task_self(), &reservation, static_cast<vm_size_t>(layout.mappedSize), VM_FLAGS_FIXED);
+        if (result == KERN_SUCCESS) { base = reservation; return true; }
+        if (result != KERN_NO_SPACE) {
+            error = std::string("vm_allocate(low image reservation): ") + mach_error_string(result);
+            return false;
+        }
+        if (++collisions == 32) return fail(error, "Low image reservation changed repeatedly while allocating");
+        candidate += pageSize;
+    }
+    char detail[256];
+    snprintf(detail, sizeof(detail), "No free low image range of 0x%llx bytes in 0x%llx-0x%llx below the simulator cache",
+             static_cast<unsigned long long>(layout.mappedSize), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+    return fail(error, detail);
+}
+
 struct GuardedMainStack {
     void *mapping = MAP_FAILED;
     size_t mappingSize = 0, size = 0;
@@ -199,7 +295,15 @@ bool prepareMainStack(const CacheReservation &cache, uintptr_t &top, size_t &siz
 }
 
 // Inspect only already loaded, trusted Mach-O headers. __PAGEZERO reserves address space but contains no surviving code/data.
-bool imageOutsideCache(const mach_header *header, const CacheReservation &cache, std::string &error) {
+bool cacheOverlapFailure(const char *kind, uintptr_t address, size_t size, const CacheReservation &cache, std::string &error) {
+    char detail[320];
+    snprintf(detail, sizeof(detail), "Simulator cache 0x%llx-0x%llx overlaps %s at 0x%llx (size 0x%llx)",
+             static_cast<unsigned long long>(cache.address), static_cast<unsigned long long>(cache.address + cache.size), kind,
+             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+    return fail(error, detail);
+}
+
+bool imageOutsideCache(const mach_header *header, const CacheReservation &cache, std::string &error, const char *kind = "resident image") {
     if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 16 * 1024 * 1024)
         return fail(error, "Cannot validate the resident image against the simulator cache");
     const uint8_t *commands = reinterpret_cast<const uint8_t *>(header) + sizeof(mach_header_64);
@@ -226,9 +330,11 @@ bool imageOutsideCache(const mach_header *header, const CacheReservation &cache,
         if (command.cmd == LC_SEGMENT_64) {
             auto segment = read<segment_command_64>(commands + offset);
             if (segment.vmsize && strncmp(segment.segname, "__PAGEZERO", sizeof(segment.segname))) {
-                if (segment.vmaddr > UINTPTR_MAX - slide ||
-                    rangesOverlap(segment.vmaddr + slide, segment.vmsize, cache.address, cache.size))
-                    return fail(error, "Simulator cache overlaps a resident executable image");
+                if (segment.vmaddr > UINTPTR_MAX - slide) { error = std::string(kind) + " segment address overflows"; return false; }
+                if (rangesOverlap(segment.vmaddr + slide, segment.vmsize, cache.address, cache.size)) {
+                    std::string part = std::string(kind) + " " + std::string(segment.segname, strnlen(segment.segname, sizeof(segment.segname)));
+                    return cacheOverlapFailure(part.c_str(), segment.vmaddr + slide, segment.vmsize, cache, error);
+                }
             }
         }
         offset += command.cmdsize;
@@ -521,7 +627,7 @@ bool parseLayout(const FileMapping &file, Layout &layout, std::string &error, ui
     return true;
 }
 
-bool mapImage(const char *path, LSBMappedImage &image, std::string &error, uint32_t expectedType) {
+bool mapImage(const char *path, LSBMappedImage &image, std::string &error, uint32_t expectedType, const CacheReservation &cache) {
     FileMapping file;
     file.fd = open(path, O_RDONLY | O_CLOEXEC);
     if (file.fd == -1) return systemFailure(error, "open(image)");
@@ -543,9 +649,10 @@ bool mapImage(const char *path, LSBMappedImage &image, std::string &error, uint3
     if (signature.fs_file_start < 0 || uint64_t(signature.fs_file_start) < layout.signature.dataoff)
         return fail(error, "Code signature does not cover the image up to LC_CODE_SIGNATURE.dataoff");
 
+    // Layout owns its commands; retaining this whole-file view can consume the last contiguous low gap for a large executable.
+    if (!file.releaseBytes()) return systemFailure(error, "munmap(image parse view)");
     vm_address_t base = 0;
-    kern_return_t result = vm_allocate(mach_task_self(), &base, static_cast<vm_size_t>(layout.mappedSize), VM_FLAGS_ANYWHERE);
-    if (result != KERN_SUCCESS) { error = std::string("vm_allocate(image): ") + mach_error_string(result); return false; }
+    if (!reserveImage(layout, cache, base, error)) return false;
     image.header = reinterpret_cast<const mach_header *>(base);
     image.mappedSize = static_cast<size_t>(layout.mappedSize);
     // Keep unused gaps inaccessible; file mappings replace only pages inside this reservation.
@@ -583,16 +690,20 @@ bool mapImage(const char *path, LSBMappedImage &image, std::string &error, uint3
     return true;
 }
 
-bool mapFile(const char *path, LSBMappedImage *image, char *error, size_t errorSize, uint32_t expectedType) {
+bool mapFile(const char *path, LSBMappedImage *image, char *error, size_t errorSize, uint32_t expectedType, const char *rootPath = nullptr) {
     if (!path || !image) {
         if (error && errorSize) snprintf(error, errorSize, "A path and output image are required");
         return false;
     }
     *image = {};
     std::string message;
-    bool success = mapImage(path, *image, message, expectedType);
+    CacheReservation cache;
+    bool success = (!rootPath || readRuntimeCacheReservation(rootPath, cache, message)) && mapImage(path, *image, message, expectedType, cache);
     if (!success) LSBUnloadImage(image);
-    if (error && errorSize) snprintf(error, errorSize, "%s", message.c_str());
+    if (error && errorSize) {
+        if (success) error[0] = '\0';
+        else snprintf(error, errorSize, "%s: %s", expectedType == MH_DYLINKER ? "dyld_sim" : "Simulator executable", message.c_str());
+    }
     return success;
 }
 
@@ -604,6 +715,14 @@ bool LSBMapDyldSim(const char *path, LSBMappedImage *image, char *error, size_t 
 
 bool LSBMapSimExecutable(const char *path, LSBMappedImage *image, char *error, size_t errorSize) {
     return mapFile(path, image, error, errorSize, MH_EXECUTE);
+}
+
+bool LSBMapDyldSimForRuntime(const char *path, const char *rootPath, LSBMappedImage *image, char *error, size_t errorSize) {
+    return mapFile(path, image, error, errorSize, MH_DYLINKER, rootPath ? rootPath : "");
+}
+
+bool LSBMapSimExecutableForRuntime(const char *path, const char *rootPath, LSBMappedImage *image, char *error, size_t errorSize) {
+    return mapFile(path, image, error, errorSize, MH_EXECUTE, rootPath ? rootPath : "");
 }
 
 void LSBUnloadImage(LSBMappedImage *image) {
@@ -628,19 +747,23 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     CacheReservation cache;
     GuardedMainStack relocatedStack;
     Dl_info resident = {};
-    std::string cachePath = std::string(rootPath) + "/System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64";
-    if (!readCacheReservation(cachePath.c_str(), cache, stackError)) {
+    if (!readRuntimeCacheReservation(rootPath, cache, stackError)) {
         fprintf(stderr, "Cannot prepare simulator cache reservation: %s\n", stackError.c_str());
         return 1;
     }
     if (cache.size) {
         bool safe = dladdr(reinterpret_cast<const void *>(&LSBEnterDyldSim), &resident) && resident.dli_fbase;
-        safe = safe && !rangesOverlap(reinterpret_cast<uintptr_t>(&startupStorage), sizeof(startupStorage), cache.address, cache.size) &&
-               !rangesOverlap(reinterpret_cast<uintptr_t>(&launch), sizeof(launch), cache.address, cache.size) &&
-               !rangesOverlap(reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache.address, cache.size);
-        if (!safe || !imageOutsideCache(static_cast<const mach_header *>(resident.dli_fbase), cache, stackError) ||
-            !imageOutsideCache(executable, cache, stackError)) {
-            fprintf(stderr, "Cannot use simulator cache: %s\n", stackError.empty() ? "reservation overlaps loader storage or images" : stackError.c_str());
+        if (!safe) fail(stackError, "Cannot locate the native loader image");
+        if (safe) safe = imageOutsideCache(static_cast<const mach_header *>(resident.dli_fbase), cache, stackError, "native loader image");
+        if (safe && rangesOverlap(reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache.address, cache.size))
+            safe = cacheOverlapFailure("mapped dyld_sim", reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache, stackError);
+        if (safe) safe = imageOutsideCache(executable, cache, stackError, "simulator executable");
+        if (safe && rangesOverlap(reinterpret_cast<uintptr_t>(&startupStorage), sizeof(startupStorage), cache.address, cache.size))
+            safe = cacheOverlapFailure("native startup storage", reinterpret_cast<uintptr_t>(&startupStorage), sizeof(startupStorage), cache, stackError);
+        if (safe && rangesOverlap(reinterpret_cast<uintptr_t>(&launch), sizeof(launch), cache.address, cache.size))
+            safe = cacheOverlapFailure("native launch storage", reinterpret_cast<uintptr_t>(&launch), sizeof(launch), cache, stackError);
+        if (!safe) {
+            fprintf(stderr, "Cannot use simulator cache: %s\n", stackError.c_str());
             return 1;
         }
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #import <Foundation/Foundation.h>
+#include "IndigoHIDTypes.h"
 #include <mach/mach.h>
 #include <stdint.h>
 
@@ -21,6 +22,8 @@ typedef NS_ENUM(unsigned, LSBIndigoTouchPhase) {
 // Up to 16 simultaneous identifiers are tracked; only successful sends change their state. Returns errno values.
 // EBUSY means an earlier cancel is waiting for the guest to drain its event queue; do not record a new UIKit touch then.
 - (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y;
+// Supply an origin only on begin. It is latched until end/cancel; later phases use the no-edge method above.
+- (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y edge:(LSBIndigoTouchEdge)edge;
 // EAGAIN schedules nonblocking retries until delivery or disconnection, so a disappearing view can discard its local touch records.
 - (int)cancelTouches;
 - (void)close;

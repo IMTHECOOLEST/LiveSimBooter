@@ -11,6 +11,9 @@ NS_ASSUME_NONNULL_BEGIN
 // Each server should have one presentation view; this view forwards only its own UIKit touches.
 @interface LSBSimulatorDisplayView : UIView
 @property (nonatomic, strong, nullable) LSBIndigoHIDServer *indigoServer;
+// Default YES. Disable while this tab is absent: frame updates still accumulate without waiting for an onscreen drawable.
+// Reenabling displays the latest owned frame and does not restart the guest or reset its framebuffer.
+@property (nonatomic, getter=isPresentationEnabled) BOOL presentationEnabled;
 // Discard the composition baseline and retire its presentation layer. The next frame must be complete.
 - (void)resetPresentation;
 // Enqueue a GPU copy without blocking UIKit. The caller must prevent producer writes until completion, called once on main.

@@ -56,7 +56,13 @@ _Static_assert(sizeof(IndigoCreateDigitizer) == 32 + sizeof(IndigoPayload) && of
                offsetof(IndigoCreateDigitizer, target) == 64 && offsetof(IndigoCreateDigitizer, builtIn) == 68 &&
                offsetof(IndigoCreateDigitizer, displayUID) == 69, "Indigo create-digitizer command layout");
 
-typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool active; } Touch;
+typedef struct { uint64_t identifier; uint32_t identity; double x, y; LSBIndigoTouchEdge edge; bool active; } Touch;
+
+static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
+    // SimulatorKit's IndigoHIDMessageForMouseNSEvent retains these origin bits on down, move, and up.
+    static const uint32_t masks[] = {0, 0x02040000, 0x08040000, 0x01040000, 0x04040000};
+    return masks[edge];
+}
 
 @interface LSBIndigoHIDServer () {
     dispatch_queue_t _queue;
@@ -224,22 +230,32 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
     unsigned mask = phase == LSBIndigoTouchMoved ? DigitizerPosition : DigitizerRange | DigitizerTouch;
     if (cancelAll || phase == LSBIndigoTouchCancelled) mask |= DigitizerCancel;
     BOOL active = NO;
+    unsigned parentContact = changed;
     for (unsigned i = 0; i < TouchCapacity; ++i) {
         if (!touches[i].active && i != changed) continue;
+        if (parentContact == TouchCapacity) parentContact = i;
         BOOL down = touches[i].active && !cancelAll;
         active |= down;
         message.payloads[message.count++] = (IndigoPayload){.type = IndigoDigitizer, .timestamp = timestamp,
-            .index = i + 1, .identity = touches[i].identity, .mask = i == changed || cancelAll ? mask : 0,
+            .index = i + 1, .identity = touches[i].identity, .mask = (i == changed || cancelAll ? mask : 0) | digitizerEdgeMask(touches[i].edge),
             .x = touches[i].x, .y = touches[i].y, .pressure = down ? 1 : 0, .range = down, .touch = down,
             .target = IndigoBuiltinTouch, .transducerType = 2, .parentIndex = 0};
     }
+    // Like the stock mouse builder, the parent carries this sample's position and edge. Each sibling keeps its own origin.
+    const Touch *contact = parentContact < TouchCapacity ? &touches[parentContact] : NULL;
     message.payloads[0] = (IndigoPayload){.type = IndigoDigitizer, .timestamp = timestamp, .index = 0x00400002,
-        .mask = mask, .range = active, .touch = active, .target = IndigoBuiltinTouch, .collection = 1, .transducerType = 3, .parentIndex = -1};
+        .mask = mask | (contact ? digitizerEdgeMask(contact->edge) : 0), .x = contact ? contact->x : 0, .y = contact ? contact->y : 0,
+        .range = active, .touch = active, .target = IndigoBuiltinTouch, .collection = 1, .transducerType = 3, .parentIndex = -1};
     return [self sendMessage:&message.header size:(mach_msg_size_t)(offsetof(IndigoTouches, payloads) + message.count * sizeof(IndigoPayload))];
 }
 
 - (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y {
-    if (phase > LSBIndigoTouchCancelled || !isfinite(x) || !isfinite(y)) return EINVAL;
+    return [self sendTouch:identifier phase:phase x:x y:y edge:LSBIndigoTouchEdgeNone];
+}
+
+- (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y edge:(LSBIndigoTouchEdge)edge {
+    if (phase > LSBIndigoTouchCancelled || (unsigned)edge > LSBIndigoTouchEdgeRight || !isfinite(x) || !isfinite(y) ||
+        (phase != LSBIndigoTouchBegan && edge != LSBIndigoTouchEdgeNone)) return EINVAL;
     __block int result = 0;
     [self serialized:^{
         if (self->_closed) { result = EBADF; return; }
@@ -262,7 +278,7 @@ typedef struct { uint64_t identifier; uint32_t identity; double x, y; bool activ
                 collision = NO;
                 for (unsigned i = 0; i < TouchCapacity; ++i) if (next[i].active && next[i].identity == identity) collision = YES;
             } while (collision);
-            next[found] = (Touch){.identifier = identifier, .identity = identity, .active = true};
+            next[found] = (Touch){.identifier = identifier, .identity = identity, .edge = edge, .active = true};
         } else if (found == TouchCapacity) { result = ENOENT; return; }
         next[found].x = fmin(1, fmax(0, x));
         next[found].y = fmin(1, fmax(0, y));

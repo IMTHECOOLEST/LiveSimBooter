@@ -9,6 +9,7 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]);
 @class NSString;
 extern NSString *const LSBHostIndigoDidChangeNotification;
 extern NSString *const LSBHostFramebufferDidChangeNotification;
+extern NSString *const LSBHostTerminalDidChangeNotification;
 int LSBHostUsesSimulatorDisplay(void);
 // Main-thread access. The display view forwards only its own touches to this simulator-local endpoint.
 LSBIndigoHIDServer *LSBHostIndigoHIDServer(void);

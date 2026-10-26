@@ -297,7 +297,8 @@ static void testUIFrameworkCallerIdentity(void) {
     const struct mach_header *header = (const struct mach_header *)&image;
     const struct { const char *name, *install; char *configured; } frameworks[] = {
         {"UIKitCore", uiKitCoreInstallPath, nativeUIKitCorePath},
-        {"FrontBoardServices", frontBoardServicesInstallPath, nativeFrontBoardServicesPath}
+        {"FrontBoardServices", frontBoardServicesInstallPath, nativeFrontBoardServicesPath},
+        {"BackBoardServices", backBoardServicesInstallPath, nativeBackBoardServicesPath}
     };
     const char *root = "/private/var/mobile/Group/RuntimeRoot";
     for (unsigned framework = 0; framework < sizeof(frameworks) / sizeof(*frameworks); ++framework) {
@@ -343,7 +344,7 @@ static void testUIFrameworkCallerIdentity(void) {
     }
     assert(!unsetenv("DYLD_ROOT_PATH"));
     initializeIdentity();
-    assert(!nativeUIKitCorePath[0] && !nativeFrontBoardServicesPath[0] && LSBGetPID() == 123);
+    assert(!nativeUIKitCorePath[0] && !nativeFrontBoardServicesPath[0] && !nativeBackBoardServicesPath[0] && LSBGetPID() == 123);
 }
 
 int main(void) {

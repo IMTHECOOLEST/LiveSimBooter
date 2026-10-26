@@ -9,7 +9,7 @@
 #include <time.h>
 
 static const size_t LSBMetalMaximumDimension = 16384;
-typedef struct { int error; CGSize pixelSize; BOOL hasFrame; } LSBMetalResult;
+typedef struct { int error; CGSize pixelSize; BOOL hasFrame; uint64_t presentedEpoch; } LSBMetalResult;
 
 static int LSBMetalSurfaceLayout(IOSurfaceRef surface, CGRect rect, size_t *width, size_t *height, BOOL *fullFrame) {
     if (!surface) return EINVAL;
@@ -42,13 +42,16 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
     id<MTLCommandQueue> _queue;
     dispatch_queue_t _worker;
     atomic_uint_fast64_t _generation;
+    atomic_uint_fast64_t _presentationEpoch;
+    atomic_bool _presentationEnabled;
     // Only the serial render worker accesses GPU baseline and timing state.
     id<MTLTexture> _baseline;
     uint64_t _timingStart, _timingFrames, _timingDrawableNS, _timingGPUNS, _timingMaxDrawableNS, _timingMaxGPUNS;
     unsigned _slowLogs;
     // Only main accesses published metadata and enqueue bounds.
     CGSize _pixelSize;
-    BOOL _hasFrame, _presenting, _readingBack;
+    BOOL _hasFrame, _presenting, _readingBack, _refreshing, _refreshRequested;
+    uint64_t _presentedEpoch;
 }
 @end
 
@@ -66,6 +69,8 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
     if (!_queue) { if (error) *error = ENOMEM; return nil; }
     _worker = dispatch_queue_create("com.kdt.LiveSimBooter.framebuffer-metal", DISPATCH_QUEUE_SERIAL_WITH_AUTORELEASE_POOL);
     atomic_init(&_generation, 1);
+    atomic_init(&_presentationEpoch, 1);
+    atomic_init(&_presentationEnabled, true);
     _queue.label = @"LiveSimBooter framebuffer copies";
     _layer = layer;
     [CATransaction begin];
@@ -93,6 +98,26 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
     [CATransaction commit];
 }
 
+- (BOOL)isPresentationEnabled { return atomic_load_explicit(&_presentationEnabled, memory_order_acquire); }
+
+- (BOOL)canPresentEpoch:(uint64_t)epoch {
+    return self.isPresentationEnabled && epoch == atomic_load_explicit(&_presentationEpoch, memory_order_acquire);
+}
+
+- (void)updatePresentationHidden {
+    [self setPresentationHidden:!_hasFrame || ![self canPresentEpoch:_presentedEpoch]];
+}
+
+- (void)setPresentationEnabled:(BOOL)enabled {
+    NSAssert(NSThread.isMainThread, @"Metal display must be used on the main thread");
+    if (!NSThread.isMainThread || self.isPresentationEnabled == enabled) return;
+    atomic_fetch_add_explicit(&_presentationEpoch, 1, memory_order_acq_rel);
+    atomic_store_explicit(&_presentationEnabled, enabled, memory_order_release);
+    [self setPresentationHidden:YES];
+    if (enabled) [self refreshPresentation];
+    else _refreshRequested = NO;
+}
+
 - (void)reset {
     NSAssert(NSThread.isMainThread, @"Metal display must be used on the main thread");
     if (!NSThread.isMainThread) return;
@@ -100,6 +125,8 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
     [self setPresentationHidden:YES];
     _pixelSize = CGSizeZero;
     _hasFrame = NO;
+    _presentedEpoch = 0;
+    _refreshRequested = NO;
     dispatch_async(_worker, ^{
         self->_baseline = nil;
         self->_timingStart = self->_timingFrames = self->_timingDrawableNS = self->_timingGPUNS = 0;
@@ -112,7 +139,7 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
 }
 
 - (LSBMetalResult)workerResult:(int)error {
-    return (LSBMetalResult){error, _baseline ? CGSizeMake(_baseline.width, _baseline.height) : CGSizeZero, _baseline != nil};
+    return (LSBMetalResult){error, _baseline ? CGSizeMake(_baseline.width, _baseline.height) : CGSizeZero, _baseline != nil, 0};
 }
 
 - (void)recordDrawableNS:(uint64_t)drawableNS gpuNS:(uint64_t)gpuNS started:(uint64_t)started {
@@ -158,28 +185,35 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
             baseline.label = @"LiveSimBooter complete framebuffer baseline";
         }
 
+        uint64_t epoch = atomic_load_explicit(&_presentationEpoch, memory_order_acquire);
         uint64_t drawableStart = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        __attribute__((objc_precise_lifetime)) id<CAMetalDrawable> drawable = [_layer nextDrawable];
+        BOOL requestedDrawable = [self canPresentEpoch:epoch];
+        __attribute__((objc_precise_lifetime)) id<CAMetalDrawable> drawable = requestedDrawable ? [_layer nextDrawable] : nil;
         uint64_t drawableNS = clock_gettime_nsec_np(CLOCK_MONOTONIC) - drawableStart;
         if (![self isCurrentGeneration:generation]) return [self workerResult:ECANCELED];
-        if (!drawable) return [self workerResult:EAGAIN];
-        id<MTLTexture> destination = drawable.texture;
-        if (destination.width != width || destination.height != height || destination.pixelFormat != MTLPixelFormatBGRA8Unorm) {
-            return [self workerResult:EINVAL];
+        BOOL presenting = requestedDrawable && [self canPresentEpoch:epoch];
+        id<MTLTexture> destination = presenting ? drawable.texture : nil;
+        if (presenting) {
+            if (!drawable) return [self workerResult:EAGAIN];
+            if (destination.width != width || destination.height != height || destination.pixelFormat != MTLPixelFormatBGRA8Unorm)
+                return [self workerResult:EINVAL];
         }
         id<MTLCommandBuffer> command = [_queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
         if (!command || !blit) return [self workerResult:ENOMEM];
-        command.label = @"LiveSimBooter copy and present framebuffer";
+        command.label = presenting ? @"LiveSimBooter copy and present framebuffer" : @"LiveSimBooter retain hidden framebuffer";
         MTLOrigin origin = MTLOriginMake((NSUInteger)dirtyRect.origin.x, (NSUInteger)dirtyRect.origin.y, 0);
         MTLSize changed = MTLSizeMake((NSUInteger)dirtyRect.size.width, (NSUInteger)dirtyRect.size.height, 1);
         [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:changed
                    toTexture:baseline destinationSlice:0 destinationLevel:0 destinationOrigin:origin];
-        [blit copyFromTexture:baseline sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
-                   toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        if (presenting) {
+            [blit copyFromTexture:baseline sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+                       toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        }
         [blit endEncoding];
         if (![self isCurrentGeneration:generation]) return [self workerResult:ECANCELED];
-        [command presentDrawable:drawable];
+        presenting = presenting && [self canPresentEpoch:epoch];
+        if (presenting) [command presentDrawable:drawable];
         uint64_t gpuStart = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         [command commit];
         [command waitUntilCompleted];
@@ -192,8 +226,62 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
         }
         _baseline = baseline;
         [self recordDrawableNS:drawableNS gpuNS:gpuNS started:drawableStart];
-        return [self workerResult:0];
+        LSBMetalResult result = [self workerResult:0];
+        result.presentedEpoch = presenting ? epoch : 0;
+        return result;
     }
+}
+
+// The serial worker owns the baseline, so presentation-only reads cannot race with dirty updates or reset.
+- (LSBMetalResult)presentBaselineOnWorker:(uint64_t)generation epoch:(uint64_t)epoch {
+    @autoreleasepool {
+        if (![self isCurrentGeneration:generation] || ![self canPresentEpoch:epoch]) return [self workerResult:ECANCELED];
+        if (!_baseline) return [self workerResult:ENODATA];
+        __attribute__((objc_precise_lifetime)) id<CAMetalDrawable> drawable = [_layer nextDrawable];
+        if (![self isCurrentGeneration:generation] || ![self canPresentEpoch:epoch]) return [self workerResult:ECANCELED];
+        if (!drawable) return [self workerResult:EAGAIN];
+        id<MTLTexture> destination = drawable.texture;
+        if (destination.width != _baseline.width || destination.height != _baseline.height || destination.pixelFormat != MTLPixelFormatBGRA8Unorm)
+            return [self workerResult:EINVAL];
+        id<MTLCommandBuffer> command = [_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!command || !blit) return [self workerResult:ENOMEM];
+        command.label = @"LiveSimBooter present retained framebuffer";
+        [blit copyFromTexture:_baseline sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(_baseline.width, _baseline.height, 1)
+                   toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        if (![self isCurrentGeneration:generation] || ![self canPresentEpoch:epoch]) return [self workerResult:ECANCELED];
+        [command presentDrawable:drawable];
+        [command commit];
+        [command waitUntilCompleted];
+        if (![self isCurrentGeneration:generation] || ![self canPresentEpoch:epoch]) return [self workerResult:ECANCELED];
+        // This command only reads the baseline: an unavailable drawable or failed display copy must not discard accumulated dirty pixels.
+        if (command.status != MTLCommandBufferStatusCompleted) return [self workerResult:EIO];
+        LSBMetalResult result = [self workerResult:0];
+        result.presentedEpoch = epoch;
+        return result;
+    }
+}
+
+- (void)refreshPresentation {
+    if (!self.isPresentationEnabled) return;
+    if (_refreshing) { _refreshRequested = YES; return; }
+    _refreshing = YES;
+    _refreshRequested = NO;
+    uint64_t generation = atomic_load_explicit(&_generation, memory_order_acquire);
+    uint64_t epoch = atomic_load_explicit(&_presentationEpoch, memory_order_acquire);
+    dispatch_async(_worker, ^{
+        LSBMetalResult result = [self presentBaselineOnWorker:generation epoch:epoch];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_refreshing = NO;
+            if ([self isCurrentGeneration:generation] && [self canPresentEpoch:epoch]) {
+                if (!result.error) self->_presentedEpoch = result.presentedEpoch;
+                [self updatePresentationHidden];
+            }
+            if (self->_refreshRequested) [self refreshPresentation];
+        });
+    });
 }
 
 - (int)beginSurface:(IOSurfaceRef)surface dirtyRect:(CGRect)dirtyRect oldSize:(CGSize *)oldSize generation:(uint64_t *)generation {
@@ -224,7 +312,8 @@ static void LSBMetalReleaseReadback(void *info, const void *bytes, size_t length
     }
     _hasFrame = result.hasFrame;
     _pixelSize = result.pixelSize;
-    [self setPresentationHidden:!_hasFrame];
+    if (result.presentedEpoch) _presentedEpoch = result.presentedEpoch;
+    [self updatePresentationHidden];
     return result.error;
 }
 

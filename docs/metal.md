@@ -297,11 +297,30 @@ pending/error state and waits for its specific route. All registrations consume 
 an uncertain timeout is not retried. Initial xpcproxy jobs can run first so launchd can service these RPCs. A registration
 worker retains its endpoint send rights until completion; a delayed successful reply cannot clear a helper-death error.
 
-`ProcessSupport/LaunchdEndpoint.c` names its internal adapter `LSB_launch_sim_register_endpoint` to distinguish its changed
-signature from Apple's original `launch_sim_register_endpoint`. The original **23A343**
-`usr/lib/system/host/liblaunch_sim.dylib` delegates to `launch_mig_bridge_register`, using MIG request **701** and reply
-**801**. The local reconstruction preserves that wire protocol while accepting an already resolved launchd service port,
-validating the reply's complete audit token, and imposing a bounded deadline. It does not load the host liblaunch_sim API.
+`ProcessSupport/LaunchdEndpoint.c` shares `LSB_launch_sim_endpoint_transaction` between registration and removal. Its source
+is **23A343** `usr/lib/system/host/liblaunch_sim.dylib`: `launch_sim_register_endpoint` delegates to
+`launch_mig_bridge_register` (**701/801**), and `launch_sim_unregister_endpoint` uses `launch_mig_bridge_unregister`
+(**709/809**). The adapter preserves those wire layouts, accepts an already resolved service port, authenticates the entire
+reply audit token, and bounds send plus receive. It does not load the host liblaunch_sim API. Bridge errors encoded as
+`errno | 0xc000` are decoded alongside the older bootstrap errors.
+
+After a running SpringBoard or its dedicated helper exits, the next exact SpringBoard launch provisions a fresh private
+helper and control page. Its READY triggers removal of **only** `com.apple.metal.simulator.SpringBoard`, followed by
+registration of the new endpoint; the replacement guest waits for completion. The original bridge handler at
+launchd `+0x245f4` rejects an existing name with `0xc011`; removal at `+0x24720` accepts the bridge-created endpoint's
+`0x40` flag. An authenticated `ESRCH` removal result means the old name is already absent and permits registration.
+Both transactions share 30 seconds. Denial, timeout, or a failed new helper stops this attempt; the broker does not
+automatically retry an unknown mutation or failed startup. Each successfully running replacement can later repeat this
+cycle. Backboardd, the public Metal helper, IOSurface and framebuffer ownership remain unchanged.
+
+Focused broker and real Mach-message tests cover owner/helper exits, fresh authorization, removal ordering, absent names,
+failure and timeout propagation, stale helper callbacks, and preservation of the other services. On the phone, killing
+SpringBoard **10645** created helper **10668**: removal returned **49155** (`0xc003`, already absent), registration returned
+**0**, and replacement SpringBoard **10669** completed all three authenticated Metal connections. Simulator launchd **10625**
+remained alive. This verifies transport recovery, not a successful SpringBoard restart: the replacement then trapped in
+ExtensionFoundation `_EXHostConfiguration.rbsProcessIdentity.getter` at **+0x5c81c**, after
+`rbsProcessIdentityWithHost:` returned nil during a LockedContentServices extension-monitor update. Subsequent launchd
+retries repeated that separate crash. Evidence: `tmp/terminal-launchd-tests/console-110.log` and `SpringBoard-restart.ips`.
 
 The C LiveProcess entry obtains the role only from validated broker bootstrap metadata. Guest paths, environment variables
 and spawn requests cannot request native mode. Role 2 retains the native cache and loads the backend only from

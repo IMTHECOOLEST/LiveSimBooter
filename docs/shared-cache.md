@@ -1,5 +1,87 @@
 # Signed simulator shared cache
 
+## Low image allocation and the 0x110000000 rebuild
+
+The 2026-10-26 full-cache Fish trial exposed a remaining address-space limit. One native LiveProcess started at
+`0x106c18000`; its low image allocator could not find a contiguous `0xa8c000`-byte range before the cache at `0x108000000`.
+The native image, other surviving allocations, dyld_sim and Fish must share that small remaining window. Retrying an
+unconstrained allocation could place executable code inside the future cache reservation rather than solve the limit.
+
+[`DyldSimLoader.cpp`](../LiveSimBooter/DyldSimLoader.cpp) now provides root-aware mapping APIs used by LiveProcess for both
+dyld_sim and the guest executable. They read the cache reservation before mapping either image and release the temporary
+whole-file parse view before reserving image memory. The layout keeps owned copies of its segment commands; the file
+descriptor remains open for signature registration and segment mapping.
+
+With a cache present, the allocator scans occupied VM regions between the native main-image/preferred-image lower bound
+and `min(cache base, 0x180000000)`. It requests fixed reservations **without `VM_FLAGS_OVERWRITE`**, skips insufficient gaps,
+and bounds retries if another mapping wins a race. Segment `MAP_FIXED` operations replace only pages inside the reservation
+it owns. No fitting gap is an explicit failure; executable images are not moved into the high shared-region interval.
+The original mapping APIs and roots without a cache retain the loose-library behavior. Handoff checks remain and now name
+native-loader, dyld_sim, guest-executable or static-storage collisions, including addresses.
+
+The apparent gap below a PIE native executable is not available memory. Apple's
+[`mach_loader.c`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/mach_loader.c) extends PAGEZERO by ASLR
+and requires at least 4 GiB of hard PAGEZERO for a 64-bit ARM64 process. A 64 KiB PAGEZERO would therefore fail validation.
+[`vm_map_raise_min_offset`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/vm/vm_map.c) refuses to lower that
+minimum, and [`task_set_info`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/task.c) exposes no
+TASK_VM_INFO setter. The native-header lower bound also avoids treating this unreported prefix as a free VM gap.
+
+The focused loader suite passed 1,164 checks, plus its short/large terminal handoff fixtures. Tests cover bounds and
+overflow, occupied and undersized gaps, raced allocations, retry exhaustion, source-map release and source-FD cleanup.
+A real kernel allocation test verifies that even a deliberately stale free-gap query cannot overwrite existing bytes.
+Both changed production sources passed iPhoneOS syntax checks. Evidence:
+[`loader-low-reservation-tests.log`](../tmp/app-launch-fix/workspace-shm/loader-low-reservation-tests.log).
+
+### Offline cache and signing validation
+
+An isolated rebuild moves the same **1,353-image 23A343 closure** up by `0x08000000`, to **`0x110000000`**. This leaves
+256 MiB above the 4 GiB floor instead of 128 MiB. The build reused immutable staged originals through hardlinks and took
+9.68 seconds. The original builder and prior signed `0x108000000` cache remain preserved.
+
+| Mapping | Start | End | Initial / maximum protection |
+| --- | --- | --- | --- |
+| TEXT | `0x110000000` | `0x16c594000` | `r-x` / `r-x` |
+| DATA_CONST | `0x16c594000` | `0x176018000` | `r--` / `rw-` |
+| TPRO_CONST | `0x178018000` | `0x17801c000` | `r--` / `rw-` |
+| DATA | `0x17801c000` | `0x17c6c8000` | `rw-` / `rw-` |
+| Read-only metadata | `0x17e6c8000` | `0x1824fc000` | `r--` / `r--` |
+| LINKEDIT | `0x1824fc000` | `0x18e190000` | `r--` / `r--` |
+
+The reservation ends at `0x18e194000`. Every executable and potentially writable mapping stays below `0x180000000`;
+only read-only metadata and LINKEDIT cross it. All expected images, export tries and function-start tables remain present.
+Comparison with the old cache verified 5,366 segments, 41,237 sections, 803,819 cache pointer slots, 672 unchanged
+non-cache pointer slots and 821,761 section symbols, in addition to mapping and image records.
+
+The builder uses the same four changes documented below, except file offset `0x5ea60` now contains `0xb2640108`
+(`orr x8, x8, #0x10000000`). The locally-built and optimize-for-size settings are unchanged. **The deployed dyld_sim stays
+unchanged:** its existing three cache instructions read the mapping base and cleanup span from the header. All eleven
+platform compatibility instructions remain intact; a new hardcoded dyld_sim base is unnecessary.
+
+The existing cache signer completed CMS verification, `codesign` verification and all **125,028** contiguous 16 KiB page
+hashes. The signed file is **2,064,482,304 bytes**, SHA-256
+`ad3b1eb360f5f1883d8eb49efec351116084e26b1009b73b521e91c2acbebd09`, CDHash
+`2bb599f972ee3c49db0417a94a6aea83877a216d`. It retains CodeDirectory v`0x20400`, zero scatter/exec-segment flags, no
+entitlements, and the existing app identity/identifier/team. Only signature capacity differs from the unsigned payload.
+
+Reproduction and evidence are in [`full-cache-110-strip/NOTES.md`](../tmp/springboard-stage/full-cache-110-strip/NOTES.md),
+[`validation.json`](../tmp/springboard-stage/full-cache-110-strip/validation.json),
+[`rebase-comparison.json`](../tmp/springboard-stage/full-cache-110-strip/rebase-comparison.json) and
+[`sign-result.json`](../tmp/springboard-stage/full-cache-110-strip/sign-result.json).
+The redundant unsigned cache was removed after those checks
+([cleanup receipt](../tmp/springboard-stage/full-cache-110-strip/unsigned-cache-cleanup.json)); the signed replacement,
+original rollback cache, input tree, scripts and manifests are retained.
+
+### Device boot with the rebuilt cache
+
+The signed cache was then activated on the iPhone. Native host PID 10621 started simulator launchd 10625, SpringBoard
+10645 and backboardd 10646. The launchd-owned Fish job reached its prompt promptly as native PID 10656, without the
+previous image preparation failure. The loader reported cache reservation `0x110000000–0x18e194000`.
+
+Evidence is [`console-110.log`](../tmp/terminal-launchd-tests/console-110.log). The bounded
+[amfid/TXM capture](../tmp/terminal-launchd-tests/cache-110-amfid-txm.log) contained no identified rejection for this trial.
+This confirms boot and Fish initialization with the new cache. The mapping table above remains an offline inspection of
+the signed cache layout; this trial did not independently measure every live VM region or its protection under LLDB.
+
 ## Verified result
 
 The completed 2026-10-24 test used a matching iOS 26 build **23A343** `dyld_sim`, `df`, and library set on the test iPhone.

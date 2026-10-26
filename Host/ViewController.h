@@ -5,5 +5,5 @@
 // Main-thread access for the native surface presenter.
 LSBSimulatorDisplayView *LSBHostSimulatorDisplay(void);
 
-@interface LSBHostViewController : UIViewController
+@interface LSBHostViewController : UITabBarController
 @end

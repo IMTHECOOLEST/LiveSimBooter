@@ -5,14 +5,22 @@ Unmodified Fish 4.9.3 source, built for iOS Simulator, runs noninteractive exter
 access-check and wait-option compatibility. Two df children and the shell exited 0 in the completed device test.
 This baseline does not establish that all Fish execution paths avoid fork, or provide full job control or a kernel PTY.
 
-The current app's default launch now selects interactive Fish with the [fake terminal](fake-pty.md), a native keyboard and
-display, and a pure-C terminal shim. It keeps the same pristine Fish executable and disables job control before presenting
-the prompt. The integrated worker shim and terminal have reached the prompt on iPhone, accepted editing keys, spawned `df`
-with exit 0 and original-platform Bash with exit 37, interrupted a looping child, and exited 0 on Ctrl-D. A builtin command
-substitution also produced 42. The [terminal results and limits](fake-pty.md#device-checks-and-diagnostics) contain the LLDB
-evidence and input/signal ordering limitation; the completed results below remain the earlier noninteractive baseline.
+The native host now has an **IOSurface** tab and a **Fish** tab. The shell is configured as a simulator-launchd job through
+`/usr/libexec/terminal-fish`; the host UI does not spawn Fish directly. The helper receives its terminal through the broker,
+then replaces itself with pristine Fish using `POSIX_SPAWN_SETEXEC`, retaining the launchd job's logical identity. It disables
+job control and uses the existing [fake terminal](fake-pty.md) and native keyboard. Switching tabs keeps the runtime and
+terminal session alive. The 2026-10-26 device trial reached a Fish prompt through xpcproxy → terminal-fish → Fish, with
+logical job PID 10516 retained across native PIDs 10516, 10517 and 10518. Fish spawned `df` (native PID 10554), printed
+`DF_STATUS=0`, and the broker recorded wait status `0x0`. Evidence:
+[`console-path.log`](../tmp/terminal-launchd-tests/console-path.log). The later cache-base trial is recorded below.
 
-To run from the broker's initial RuntimeRoot working directory:
+The earlier integrated terminal reached a prompt on iPhone, accepted editing keys, spawned `df` with exit 0 and
+original-platform Bash with exit 37, interrupted a looping child, and exited 0 on Ctrl-D. A builtin command substitution
+also produced 42. Those results used the earlier terminal/cache configuration; they do not verify the new tab path.
+The [terminal results and limits](fake-pty.md#device-checks-and-diagnostics) contain its LLDB evidence and input/signal
+ordering limitation. The completed noninteractive results below also remain historical baselines.
+
+The earlier explicit command-mode launch used the broker's initial RuntimeRoot working directory:
 
 ```sh
 xcrun devicectl device process launch --device 00008130-00021D122680011C --terminate-existing --console \
@@ -20,6 +28,28 @@ xcrun devicectl device process launch --device 00008130-00021D122680011C --termi
 ```
 
 Keep the native host in the foreground. `./bin/df` is relative to RuntimeRoot; the runtime does not provide a general `chroot`.
+
+## Full-cache allocation boundary
+
+After the 1,353-image SpringBoard cache was introduced at `0x108000000`, Fish could fail before executing any guest code:
+`Simulator cache overlaps a resident executable image`. The loader had reserved image memory anywhere while retaining a
+second whole-file parse mapping. The [root-aware allocator](shared-cache.md#low-image-allocation-and-the-0x110000000-rebuild)
+now releases that temporary view, reserves a free low gap without overwrite, and reports the exact exhausted window.
+
+The next trial found no contiguous `0xa8c000` bytes between native image `0x106c18000` and cache `0x108000000`. The apparent
+space below the native image is protected PAGEZERO extended by ASLR; ordinary VM allocation cannot reclaim it. This is an
+address-space preparation failure, not a Fish assertion or a fork/PTY failure.
+
+The same cache closure has therefore been rebuilt and signed at `0x110000000`, leaving twice the low-address room.
+Offline validation confirms that all code and writable mappings remain below `0x180000000`; only read-only metadata and
+LINKEDIT extend above it. The existing dyld_sim is unchanged because it reads the cache base from the header.
+Build, rebasing and signing checks passed, as documented in the [cache results](shared-cache.md#offline-cache-and-signing-validation).
+After activation on the iPhone, host PID 10621 booted simulator launchd 10625, SpringBoard 10645 and backboardd 10646.
+Launchd-owned Fish reached its prompt promptly as native PID 10656, without the previous image preparation failure.
+The loader reported reservation `0x110000000–0x18e194000`; the bounded amfid/TXM capture contained no identified rejection.
+Evidence: [`console-110.log`](../tmp/terminal-launchd-tests/console-110.log) and
+[amfid/TXM capture](../tmp/terminal-launchd-tests/cache-110-amfid-txm.log). This verifies startup with the new cache;
+the `df` exit-status test above belongs to the preceding trial, and live mapping extents/protections were not remeasured.
 
 ## Converted Homebrew baseline
 

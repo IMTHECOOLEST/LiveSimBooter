@@ -15,6 +15,9 @@
 
 // Private libproc SPI used by launchd's EXEC handler. The BSD prefix is the public proc_bsdinfo layout.
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int bufferSize);
+// launchd uses these libdispatch SPIs instead of the public cancellation setters.
+extern void dispatch_source_set_mandatory_cancel_handler(dispatch_source_t source, dispatch_block_t handler);
+extern void dispatch_source_set_mandatory_cancel_handler_f(dispatch_source_t source, dispatch_function_t handler);
 enum { ProcBSDBasicUniqueID = 18, ProcBSDBasicUniqueIDSize = 192, ProcBSDPIDOffset = 12, ProcBSDParentPIDOffset = 16 };
 
 typedef struct ManagedSource {
@@ -36,6 +39,16 @@ static ManagedSource *findSource(dispatch_source_t source) {
     for (ManagedSource *entry = managedSources; entry; entry = entry->next) if (entry->source == source) return entry;
     return NULL;
 }
+
+#ifdef LSB_PROCESS_EVENTS_TEST_INSPECTION
+size_t LSBProcessEventsTestSourceCount(void) {
+    pthread_mutex_lock(&sourceLock);
+    size_t count = 0;
+    for (ManagedSource *entry = managedSources; entry; entry = entry->next) ++count;
+    pthread_mutex_unlock(&sourceLock);
+    return count;
+}
+#endif
 
 static bool detachFinishedSource(ManagedSource *entry) {
     if (entry->externalReferences || !entry->timerFinished || !entry->sourceFinished) return false;
@@ -187,6 +200,24 @@ void LSBDispatchSourceSetCancelHandlerF(dispatch_source_t source, dispatch_funct
     else dispatch_source_set_cancel_handler_f(source, handler);
 }
 
+void LSBDispatchSourceSetMandatoryCancelHandler(dispatch_source_t source, dispatch_block_t handler) {
+    pthread_mutex_lock(&sourceLock);
+    ManagedSource *entry = findSource(source);
+    pthread_mutex_unlock(&sourceLock);
+    // The native mandatory setter replaces the same cancellation slot as the public setter. Keep our lifetime barrier
+    // around it too, or launchd can free a source while its stale metadata later matches an unrelated reused allocation.
+    if (entry) dispatch_source_set_mandatory_cancel_handler(source, ^{ finishSource(entry, handler, NULL); });
+    else dispatch_source_set_mandatory_cancel_handler(source, handler);
+}
+
+void LSBDispatchSourceSetMandatoryCancelHandlerF(dispatch_source_t source, dispatch_function_t handler) {
+    pthread_mutex_lock(&sourceLock);
+    ManagedSource *entry = findSource(source);
+    pthread_mutex_unlock(&sourceLock);
+    if (entry) dispatch_source_set_mandatory_cancel_handler(source, ^{ finishSource(entry, NULL, handler); });
+    else dispatch_source_set_mandatory_cancel_handler_f(source, handler);
+}
+
 void LSBDispatchRetain(dispatch_object_t object) {
     dispatch_retain(object);
     pthread_mutex_lock(&sourceLock);
@@ -259,6 +290,8 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct { const
     {(const void *)&LSBDispatchSourceCancel, (const void *)&dispatch_source_cancel},
     {(const void *)&LSBDispatchSourceSetCancelHandler, (const void *)&dispatch_source_set_cancel_handler},
     {(const void *)&LSBDispatchSourceSetCancelHandlerF, (const void *)&dispatch_source_set_cancel_handler_f},
+    {(const void *)&LSBDispatchSourceSetMandatoryCancelHandler, (const void *)&dispatch_source_set_mandatory_cancel_handler},
+    {(const void *)&LSBDispatchSourceSetMandatoryCancelHandlerF, (const void *)&dispatch_source_set_mandatory_cancel_handler_f},
     {(const void *)&LSBDispatchRetain, (const void *)&dispatch_retain}, {(const void *)&LSBDispatchRelease, (const void *)&dispatch_release},
     {(const void *)&LSBProcPIDInfo, (const void *)&proc_pidinfo}
 };

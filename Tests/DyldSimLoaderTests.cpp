@@ -21,6 +21,9 @@ static unsigned randomCalls = 0;
 static unsigned stackReservations = 0, stackReleases = 0;
 static void *reservedStack = MAP_FAILED;
 static bool rejectStackProtection = false, stackUsedFixedMapping = false;
+static bool sourceViewLive = false, allocatedWithParseView = false, reservationUsedOverwrite = false;
+static std::function<kern_return_t(vm_address_t *, vm_size_t, int)> allocationHook;
+static std::function<kern_return_t(vm_address_t *, vm_size_t *, mach_msg_type_number_t *, mach_port_t *)> regionHook;
 static constexpr uintptr_t freshPtrMungeToken = 0xa739c450e16b28df;
 
 static void testArc4RandomBuf(void *buffer, size_t size) {
@@ -50,14 +53,26 @@ static void *testMmap(void *address, size_t size, int protection, int flags, int
         stackUsedFixedMapping |= flags & MAP_FIXED;
         reservedStack = result;
     }
-    if (!(flags & (MAP_FIXED | MAP_ANON))) { sourceFD = fd; sourceMapping = result; }
+    if (!(flags & (MAP_FIXED | MAP_ANON))) { sourceFD = fd; sourceMapping = result; sourceViewLive = result != MAP_FAILED; }
     return result;
 }
 
 static int testMunmap(void *address, size_t size) {
     if (address == reservedStack && address != MAP_FAILED) ++stackReleases;
-    if (address == sourceMapping) ++fileUnmaps;
-    return ::munmap(address, size);
+    int result = ::munmap(address, size);
+    if (address == sourceMapping) { ++fileUnmaps; if (!result) sourceViewLive = false; }
+    return result;
+}
+
+static kern_return_t testAllocate(vm_map_t task, vm_address_t *address, vm_size_t size, int flags) {
+    allocatedWithParseView |= sourceViewLive;
+    reservationUsedOverwrite |= flags & VM_FLAGS_OVERWRITE;
+    return allocationHook ? allocationHook(address, size, flags) : ::vm_allocate(task, address, size, flags);
+}
+
+static kern_return_t testRegion(vm_map_t task, vm_address_t *address, vm_size_t *size, vm_region_flavor_t flavor,
+                               vm_region_info_t info, mach_msg_type_number_t *count, mach_port_t *object) {
+    return regionHook ? regionHook(address, size, count, object) : ::vm_region_64(task, address, size, flavor, info, count, object);
 }
 
 static int testMprotect(void *address, size_t size, int protection) {
@@ -75,10 +90,14 @@ static kern_return_t testDeallocate(vm_map_t task, vm_address_t address, vm_size
 #define munmap testMunmap
 #define mprotect testMprotect
 #define vm_deallocate testDeallocate
+#define vm_allocate testAllocate
+#define vm_region_64 testRegion
 #define arc4random_buf testArc4RandomBuf
 #include "../LiveSimBooter/DyldSimLoader.cpp"
 #undef arc4random_buf
 #undef vm_deallocate
+#undef vm_allocate
+#undef vm_region_64
 #undef munmap
 #undef mprotect
 #undef mmap
@@ -170,6 +189,13 @@ static void cacheReservationTests() {
     auto nativeHeader = static_cast<const mach_header *>(resident.dli_fbase);
     check(imageOutsideCache(nativeHeader, {0x1000, 0x1000}, error), "resident image validation excludes inaccessible PAGEZERO reservation");
     check(!imageOutsideCache(nativeHeader, {reinterpret_cast<uintptr_t>(resident.dli_fbase), 4096}, error), "cache overlapping resident code is rejected");
+    check(!imageOutsideCache(nativeHeader, {reinterpret_cast<uintptr_t>(resident.dli_fbase), 4096}, error, "native loader image") &&
+          error.find("native loader image __TEXT at 0x") != std::string::npos, "native collision identifies the image, segment and actual address");
+    check(!imageOutsideCache(nativeHeader, {reinterpret_cast<uintptr_t>(resident.dli_fbase), 4096}, error, "simulator executable") &&
+          error.find("simulator executable __TEXT at 0x") != std::string::npos, "executable collision is distinct from a native loader collision");
+    cacheOverlapFailure("mapped dyld_sim", 0x108001000, 0x4000, {0x108000000, 0x8000}, error);
+    check(error.find("0x108000000-0x108008000 overlaps mapped dyld_sim at 0x108001000 (size 0x4000)") != std::string::npos,
+          "dyld_sim collision includes both ranges");
     check(storageInResidentImage(&startupStorage, resident.dli_fbase, error), "app-local startup storage belongs to the validated image");
     check(!storageInResidentImage(nullptr, resident.dli_fbase, error), "missing surviving storage is rejected");
     check(!storageInResidentImage(&resident, resident.dli_fbase, error), "native stack storage cannot masquerade as app-local static storage");
@@ -195,6 +221,138 @@ static void cacheReservationTests() {
         }
         check(!debuggerMetadataOutsideCache(invalid, page, {0x108000000, 0x7e194000}, error), "invalid native debugger metadata fails before detachment");
     }
+}
+
+static void lowImageReservationTests() {
+    constexpr uintptr_t lowFloor = 0x100000000ULL;
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    Layout layout;
+    layout.preferredAddress = lowFloor;
+    layout.mappedSize = 2 * pageSize;
+    CacheReservation cache = {0x108000000ULL, 0x7e194000ULL};
+    uintptr_t begin = 0, end = 0;
+    std::string error;
+    check(lowImageRange(layout, cache, pageSize, begin, end, error) && begin == lowFloor && end == cache.address,
+          "full runtime cache reserves images only in the remaining low 128 MiB");
+    check(lowImageRange(layout, {0x200000000ULL, pageSize}, pageSize, begin, end, error) && end == 0x180000000ULL,
+          "a higher cache never permits image code in the host executable shared region");
+    for (unsigned mutation = 0; mutation < 8; ++mutation) {
+        Layout bad;
+        bad.preferredAddress = layout.preferredAddress;
+        bad.mappedSize = layout.mappedSize;
+        CacheReservation badCache = cache;
+        size_t alignment = pageSize;
+        switch (mutation) {
+            case 0: alignment = 3; break;
+            case 1: bad.mappedSize = 0; break;
+            case 2: ++bad.mappedSize; break;
+            case 3: badCache.size = UINTPTR_MAX; break;
+            case 4: bad.preferredAddress = UINTPTR_MAX; break;
+            case 5: badCache.address = lowFloor + pageSize; break;
+            case 6: bad.preferredAddress = cache.address; break;
+            case 7: badCache.size = 0; break;
+        }
+        begin = end = 1;
+        check(!lowImageRange(bad, badCache, alignment, begin, end, error) && !begin && !end,
+              "invalid or overflowing low image ranges fail with cleared output");
+    }
+
+    // Model a VM change between query and allocation. The second query observes the new occupied page.
+    const uintptr_t first = reinterpret_cast<uintptr_t>(_dyld_get_image_header(0));
+    layout.preferredAddress = first;
+    bool raced = false;
+    unsigned allocations = 0, queries = 0;
+    regionHook = [&](vm_address_t *address, vm_size_t *size, mach_msg_type_number_t *, mach_port_t *object) {
+        ++queries;
+        *object = MACH_PORT_NULL;
+        if (*address < first + 2 * pageSize) { *address = first; *size = 2 * pageSize; }
+        else if (raced && *address < first + 3 * pageSize) { *address = first + 2 * pageSize; *size = pageSize; }
+        else { *address = first + 5 * pageSize; *size = pageSize; }
+        return KERN_SUCCESS;
+    };
+    allocationHook = [&](vm_address_t *address, vm_size_t size, int flags) {
+        ++allocations;
+        check(size == layout.mappedSize && flags == VM_FLAGS_FIXED, "constrained allocation uses fixed reservation without overwrite");
+        if (!raced) { check(*address == first + 2 * pageSize, "first free gap is used"); raced = true; return KERN_NO_SPACE; }
+        check(*address == first + 3 * pageSize, "collision retry advances to a still-free complete gap");
+        return KERN_SUCCESS;
+    };
+    vm_address_t base = 99;
+    check(reserveImage(layout, cache, base, error) && base == first + 3 * pageSize && allocations == 2 && queries == 3,
+          "allocation race is retried safely after another VM query");
+
+    queries = allocations = 0;
+    regionHook = [&](vm_address_t *address, vm_size_t *size, mach_msg_type_number_t *, mach_port_t *) {
+        ++queries;
+        if (*address >= first + 2 * pageSize) return KERN_INVALID_ADDRESS;
+        *address = first + pageSize;
+        *size = pageSize;
+        return KERN_SUCCESS;
+    };
+    allocationHook = [&](vm_address_t *address, vm_size_t, int flags) {
+        ++allocations;
+        check(*address == first + 2 * pageSize && flags == VM_FLAGS_FIXED, "skip a gap smaller than the complete image span");
+        return KERN_SUCCESS;
+    };
+    check(reserveImage(layout, cache, base, error) && allocations == 1 && queries == 2, "insufficient gaps are skipped without probing occupied pages");
+    allocations = 0;
+    regionHook = [&](vm_address_t *address, vm_size_t *size, mach_msg_type_number_t *, mach_port_t *object) {
+        *object = MACH_PORT_NULL;
+        *address = first;
+        *size = cache.address - first;
+        return KERN_SUCCESS;
+    };
+    check(!reserveImage(layout, cache, base, error) && !base && !allocations && error.find("No free low image range") != std::string::npos,
+          "occupied low window fails before attempting any replacement");
+
+    regionHook = [](vm_address_t *, vm_size_t *, mach_msg_type_number_t *, mach_port_t *) { return KERN_INVALID_ADDRESS; };
+    allocationHook = [&](vm_address_t *, vm_size_t, int flags) { ++allocations; check(flags == VM_FLAGS_FIXED, "empty-map retry remains fixed"); return KERN_NO_SPACE; };
+    check(!reserveImage(layout, cache, base, error) && !base && allocations == 32 && error.find("changed repeatedly") != std::string::npos,
+          "persistent allocation races have a bounded retry count");
+    allocations = 0;
+    allocationHook = [&](vm_address_t *address, vm_size_t, int) { ++allocations; check(*address == first, "end-of-map gap starts at lower bound"); return KERN_SUCCESS; };
+    check(reserveImage(layout, cache, base, error) && base == first && allocations == 1, "end of the VM map is a usable empty gap");
+    allocationHook = [](vm_address_t *, vm_size_t, int) { return KERN_PROTECTION_FAILURE; };
+    check(!reserveImage(layout, cache, base, error) && !base && error.find("vm_allocate(low image reservation)") != std::string::npos,
+          "non-collision allocation errors fail without retrying elsewhere");
+    regionHook = [](vm_address_t *, vm_size_t *, mach_msg_type_number_t *, mach_port_t *) { return KERN_FAILURE; };
+    check(!reserveImage(layout, cache, base, error) && !base && error.find("vm_region_64") != std::string::npos,
+          "region query failure is not mistaken for a free range");
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        regionHook = [&, mutation](vm_address_t *address, vm_size_t *size, mach_msg_type_number_t *count, mach_port_t *) {
+            *size = pageSize;
+            if (mutation == 0) *size = 0;
+            if (mutation == 1) { *address = UINTPTR_MAX - pageSize + 1; *size = 2 * pageSize; }
+            if (mutation == 2) *count = 0;
+            if (mutation == 3) { *address = first - pageSize; }
+            return KERN_SUCCESS;
+        };
+        check(!reserveImage(layout, cache, base, error) && !base && error.find("Invalid VM region") != std::string::npos,
+              "malformed or stale region boundaries fail instead of wrapping or looping");
+    }
+    regionHook = {};
+    allocationHook = {};
+
+    // Exercise the kernel contract with real pages. A second reservation cannot erase an existing low image.
+    cache = {0x180000000ULL, pageSize};
+    check(reserveImage(layout, cache, base, error), error.c_str());
+    auto *bytes = reinterpret_cast<unsigned char *>(base);
+    bytes[0] = 0x39;
+    bytes[layout.mappedSize - 1] = 0xa7;
+    Layout occupied;
+    occupied.preferredAddress = base;
+    occupied.mappedSize = layout.mappedSize;
+    vm_address_t other = 99;
+    check(!reserveImage(occupied, {base + layout.mappedSize, pageSize}, other, error) && !other,
+          "a window containing only an existing image cannot be allocated");
+    check(bytes[0] == 0x39 && bytes[layout.mappedSize - 1] == 0xa7, "failed reservation leaves the existing image bytes intact");
+    regionHook = [](vm_address_t *, vm_size_t *, mach_msg_type_number_t *, mach_port_t *) { return KERN_INVALID_ADDRESS; };
+    check(!reserveImage(occupied, {base + layout.mappedSize, pageSize}, other, error) && !other,
+          "kernel rejects an occupied reservation even when the preceding query incorrectly reported an empty gap");
+    check(bytes[0] == 0x39 && bytes[layout.mappedSize - 1] == 0xa7, "a real fixed allocation collision cannot overwrite existing bytes");
+    regionHook = {};
+    check(::vm_deallocate(mach_task_self(), base, layout.mappedSize) == KERN_SUCCESS, "release real low reservation fixture");
+    check(!reservationUsedOverwrite, "no image reservation requests VM_FLAGS_OVERWRITE");
 }
 
 static void expectGuard(void *address) {
@@ -611,6 +769,68 @@ static void executableMapping(const Bytes &bytes, uint64_t sliceOffset) {
     check(!image.header && !image.mappedSize && !image.slide && !image.entry && deallocations == 1, "executable unload releases and clears image");
 }
 
+static void runtimeImageMappingTests() {
+    char directory[] = "/tmp/LiveSimBooter-runtime-XXXXXX";
+    check(mkdtemp(directory), "create runtime mapping fixture");
+    std::string root = directory;
+    std::vector<std::string> directories = {root + "/System", root + "/System/Library", root + "/System/Library/Caches",
+                                            root + "/System/Library/Caches/com.apple.dyld"};
+    for (const auto &path : directories) check(!mkdir(path.c_str(), 0700), "create cache fixture parent");
+    std::string cachePath = directories.back() + "/dyld_sim_shared_cache_arm64";
+    auto header = cacheHeader();
+    header.sharedRegionStart = 0x108000000ULL;
+    header.sharedRegionSize = 2 * page;
+    auto writeCache = [&] {
+        int fd = open(cachePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        check(fd >= 0 && write(fd, &header, sizeof(header)) == sizeof(header) && !ftruncate(fd, sizeof(header) + 32), "write runtime cache header");
+        close(fd);
+    };
+    writeCache();
+    std::string imagePath = root + "/image";
+    for (bool isExecutable : {false, true}) {
+        auto bytes = isExecutable ? executable() : thin();
+        int fd = open(imagePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        check(fd >= 0 && write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()), "write runtime image fixture");
+        close(fd);
+        sourceMapping = MAP_FAILED; sourceFD = -1; signatureCalls = deallocations = fileUnmaps = 0;
+        LSBMappedImage image = {};
+        char error[512];
+        auto map = [&](const char *runtime) {
+            return isExecutable ? LSBMapSimExecutableForRuntime(imagePath.c_str(), runtime, &image, error, sizeof(error)) :
+                                  LSBMapDyldSimForRuntime(imagePath.c_str(), runtime, &image, error, sizeof(error));
+        };
+        check(map(root.c_str()), error);
+        uintptr_t address = reinterpret_cast<uintptr_t>(image.header);
+        check(address >= 0x100000000ULL && image.mappedSize <= header.sharedRegionStart - address,
+              "runtime-aware entry maps the entire image below the cache");
+        check(fileUnmaps == 1 && !sourceViewLive && !allocatedWithParseView, "source parse view is released exactly once before image allocation");
+        check(sourceFD >= 0 && ::fcntl(sourceFD, F_GETFD) == -1 && errno == EBADF, "runtime mapping closes its source descriptor");
+        LSBUnloadImage(&image);
+        check(deallocations == 1, "runtime mapped image owns exactly one reservation");
+        check(!map(nullptr) && !image.header && strstr(error, "absolute RuntimeRoot"), "runtime-aware API rejects a missing root without mapping");
+        check(strstr(error, isExecutable ? "Simulator executable:" : "dyld_sim:"), "mapping errors identify the failing image kind");
+    }
+
+    // An image that cannot fit fails after parsing without retaining either the source map or an image reservation.
+    header.sharedRegionStart = 0x100000000ULL + page;
+    writeCache();
+    LSBMappedImage image = {};
+    char error[512];
+    sourceMapping = MAP_FAILED; sourceFD = -1; signatureCalls = deallocations = fileUnmaps = 0;
+    check(!LSBMapSimExecutableForRuntime(imagePath.c_str(), root.c_str(), &image, error, sizeof(error)) && strstr(error, "does not fit"),
+          "insufficient executable window reports an explicit allocation bound failure");
+    check(!image.header && !image.mappedSize && fileUnmaps == 1 && !sourceViewLive && deallocations == 0,
+          "low reservation failure clears image output and releases only the source view");
+    check(sourceFD >= 0 && ::fcntl(sourceFD, F_GETFD) == -1 && errno == EBADF, "low reservation failure closes the image descriptor");
+    check(!unlink(cachePath.c_str()), "remove cache fixture");
+    check(LSBMapSimExecutableForRuntime(imagePath.c_str(), root.c_str(), &image, error, sizeof(error)),
+          "runtime without a cache retains loose-library image mapping");
+    LSBUnloadImage(&image);
+    unlink(imagePath.c_str());
+    for (auto path = directories.rbegin(); path != directories.rend(); ++path) check(!rmdir(path->c_str()), "remove cache fixture directory");
+    check(!rmdir(root.c_str()), "remove runtime fixture");
+}
+
 static SimSyscallHelpers fakeHelpers = {};
 static std::function<void(unsigned)> preparationAllocationHook;
 void LSBPrepareHostPolicy() { if (preparationAllocationHook) preparationAllocationHook(0); }
@@ -922,6 +1142,8 @@ int main() {
     executableMapping(universal(true, true, dylibVariant(executable())), page);
     mainStackBoundsTest();
     cacheReservationTests();
+    lowImageReservationTests();
+    runtimeImageMappingTests();
     guardedMainStackTests();
     startupStorageBoundsTest();
     offMainEntryTest();

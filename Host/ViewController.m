@@ -11,15 +11,33 @@
 static __weak LSBSimulatorDisplayView *hostDisplay;
 LSBSimulatorDisplayView *LSBHostSimulatorDisplay(void) { return hostDisplay; }
 
-@interface LSBHostViewController ()
+static void showStatus(UIViewController *controller, NSString *text) {
+    UILabel *label = [UILabel new];
+    label.text = text;
+    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    label.adjustsFontForContentSizeCategory = YES;
+    label.numberOfLines = 0;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [controller.view addSubview:label];
+    UILayoutGuide *safe = controller.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:24],
+        [label.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
+        [label.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor]
+    ]];
+}
+
+@interface LSBSurfaceViewController : UIViewController
+@property int startupError;
 @property (nonatomic, strong) id indigoObserver;
 @property (nonatomic, strong) id framebufferObserver;
-@property (nonatomic, weak) LSBSimulatorDisplayView *simulatorDisplay;
+@property (nonatomic, strong) LSBSimulatorDisplayView *simulatorDisplay;
 @property (nonatomic, strong) LSBFramebufferServer *framebuffer;
 @property uint64_t displayGeneration;
 @end
 
-@implementation LSBHostViewController
+@implementation LSBSurfaceViewController
 - (void)dealloc {
     if (_indigoObserver) [NSNotificationCenter.defaultCenter removeObserver:_indigoObserver];
     if (_framebufferObserver) [NSNotificationCenter.defaultCenter removeObserver:_framebufferObserver];
@@ -27,117 +45,191 @@ LSBSimulatorDisplayView *LSBHostSimulatorDisplay(void) { return hostDisplay; }
 }
 - (void)bindFramebuffer {
     LSBFramebufferServer *server = LSBHostFramebufferServer();
-    [self.simulatorDisplay resetPresentation];
     if (_framebuffer == server) return;
+    [self.simulatorDisplay resetPresentation];
     _framebuffer.frameHandler = nil;
     _framebuffer = server;
     uint64_t generation = ++_displayGeneration;
     if (!server) return;
-    __weak LSBHostViewController *weakSelf = self;
+    __weak LSBSurfaceViewController *weakSelf = self;
     __weak LSBFramebufferServer *weakServer = server;
     server.frameHandler = ^(IOSurfaceRef surface, CGRect dirtyRect, void (^completion)(int)) {
-        LSBHostViewController *controller = weakSelf;
+        LSBSurfaceViewController *controller = weakSelf;
         if (!controller || controller.framebuffer != weakServer || controller.displayGeneration != generation) { completion(ECANCELED); return; }
         LSBSimulatorDisplayView *display = controller.simulatorDisplay;
+        // Hidden presentation still consumes dirty updates into its owned baseline without requesting a drawable.
         if (display) [display presentSurface:surface dirtyRect:dirtyRect completion:completion];
         else completion(ENODEV);
     };
 }
-- (void)viewDidAppear:(BOOL)animated {
-    [super viewDidAppear:animated];
-    for (UIView *view in self.view.subviews) if ([view isKindOfClass:LSBTerminalView.class]) [view becomeFirstResponder];
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    self.simulatorDisplay.presentationEnabled = YES;
+    self.simulatorDisplay.userInteractionEnabled = YES;
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    self.simulatorDisplay.userInteractionEnabled = NO; // Cancels active contacts before another tab can receive touches.
+    self.simulatorDisplay.presentationEnabled = NO;
+    [super viewWillDisappear:animated];
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    int startupError = LSBStartInitialGuest();
     self.view.backgroundColor = UIColor.systemBackgroundColor;
-    if (!startupError && LSBHostUsesSimulatorDisplay()) {
-        LSBSimulatorDisplayView *display = [[LSBSimulatorDisplayView alloc] initWithFrame:CGRectZero];
-        display.translatesAutoresizingMaskIntoConstraints = NO;
-        display.indigoServer = LSBHostIndigoHIDServer();
-        [self.view addSubview:display];
-        hostDisplay = display;
-        self.simulatorDisplay = display;
-        [self bindFramebuffer];
-        __weak LSBSimulatorDisplayView *weakDisplay = display;
-        self.indigoObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostIndigoDidChangeNotification object:nil
-            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
-                (void)notification;
-                weakDisplay.indigoServer = LSBHostIndigoHIDServer();
-            }];
-        __weak LSBHostViewController *weakSelf = self;
-        self.framebufferObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostFramebufferDidChangeNotification object:nil
-            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
-                (void)notification;
-                [weakSelf bindFramebuffer];
-            }];
-        UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
-        // Keep the actual touch view at the guest screen's aspect, with a little space inside the native safe area.
-        NSLayoutConstraint *preferredWidth = [display.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.94];
-        preferredWidth.priority = UILayoutPriorityDefaultHigh;
-        [NSLayoutConstraint activateConstraints:@[
-            [display.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
-            [display.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
-            [display.widthAnchor constraintEqualToAnchor:display.heightAnchor multiplier:1290.0 / 2796.0],
-            [display.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor multiplier:0.94],
-            [display.heightAnchor constraintLessThanOrEqualToAnchor:safe.heightAnchor multiplier:0.94],
-            preferredWidth
-        ]];
+    if (self.startupError) {
+        showStatus(self, [NSString stringWithFormat:@"Could not start runtime: %s", strerror(self.startupError)]);
         return;
     }
-    LSBTerminalSession *session = LSBHostTerminal();
-    if (!startupError && session) {
-        LSBTerminalView *terminal = [[LSBTerminalView alloc] initWithFrame:CGRectZero];
-        terminal.translatesAutoresizingMaskIntoConstraints = NO;
-        [self.view addSubview:terminal];
-        UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
-        [NSLayoutConstraint activateConstraints:@[
-            [terminal.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
-            [terminal.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-            [terminal.topAnchor constraintEqualToAnchor:safe.topAnchor],
-            [terminal.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor]
-        ]];
-        __weak LSBTerminalView *weakTerminal = terminal;
-        session.outputHandler = ^(NSData *data) { [weakTerminal appendOutput:data]; };
-        terminal.inputHandler = ^(NSData *data) {
-            int error = [session sendInput:data];
-            if (error) fprintf(stderr, "[terminal] input: %s\n", strerror(error));
-        };
-        terminal.resizeHandler = ^(unsigned short rows, unsigned short columns) { [session resizeRows:rows columns:columns]; };
-        [terminal becomeFirstResponder];
-        return;
-    }
-    UILabel *title = [UILabel new];
-    title.text = @"LiveSimBooter";
-    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleLargeTitle];
-    title.adjustsFontForContentSizeCategory = YES;
-    title.numberOfLines = 0;
-
-    UILabel *status = [UILabel new];
-    status.text = startupError ? [NSString stringWithFormat:@"Could not start runtime: %s", strerror(startupError)] : @"Runtime host ready";
-    status.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    status.adjustsFontForContentSizeCategory = YES;
-    status.numberOfLines = 0;
-
-    UILabel *instruction = [UILabel new];
-    instruction.text = @"Keep this app open while your runtime programs run.";
-    instruction.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
-    instruction.textColor = UIColor.secondaryLabelColor;
-    instruction.adjustsFontForContentSizeCategory = YES;
-    instruction.numberOfLines = 0;
-
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[title, status, instruction]];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 16;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:stack];
+    if (!LSBHostUsesSimulatorDisplay()) { showStatus(self, @"This runtime has no simulator display."); return; }
+    LSBSimulatorDisplayView *display = [[LSBSimulatorDisplayView alloc] initWithFrame:CGRectZero];
+    display.translatesAutoresizingMaskIntoConstraints = NO;
+    display.indigoServer = LSBHostIndigoHIDServer();
+    display.presentationEnabled = NO;
+    display.userInteractionEnabled = NO;
+    [self.view addSubview:display];
+    hostDisplay = display;
+    self.simulatorDisplay = display;
+    [self bindFramebuffer];
+    __weak LSBSimulatorDisplayView *weakDisplay = display;
+    self.indigoObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostIndigoDidChangeNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+            (void)notification;
+            weakDisplay.indigoServer = LSBHostIndigoHIDServer();
+        }];
+    __weak LSBSurfaceViewController *weakSelf = self;
+    self.framebufferObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostFramebufferDidChangeNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf bindFramebuffer]; }];
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    NSLayoutConstraint *preferredWidth = [display.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.94];
+    preferredWidth.priority = UILayoutPriorityDefaultHigh;
     [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:24],
-        [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
-        [stack.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
-        [stack.topAnchor constraintGreaterThanOrEqualToAnchor:safe.topAnchor constant:24],
-        [stack.bottomAnchor constraintLessThanOrEqualToAnchor:safe.bottomAnchor constant:-24]
+        [display.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
+        [display.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
+        [display.widthAnchor constraintEqualToAnchor:display.heightAnchor multiplier:1290.0 / 2796.0],
+        [display.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor multiplier:0.94],
+        [display.heightAnchor constraintLessThanOrEqualToAnchor:safe.heightAnchor multiplier:0.94],
+        preferredWidth
     ]];
+}
+@end
+
+@interface LSBFishViewController : UIViewController
+@property int startupError;
+@property BOOL visible;
+@property BOOL receivedTerminalOutput;
+@property (nonatomic, strong) id terminalObserver;
+@property (nonatomic, strong) id closeObserver;
+@property (nonatomic, strong) LSBTerminalView *terminal;
+@property (nonatomic, strong) LSBTerminalSession *session;
+@end
+
+@implementation LSBFishViewController
+- (void)dealloc {
+    if (_terminalObserver) [NSNotificationCenter.defaultCenter removeObserver:_terminalObserver];
+    if (_closeObserver) [NSNotificationCenter.defaultCenter removeObserver:_closeObserver];
+    _session.outputHandler = nil;
+}
+- (void)bindTerminal {
+    LSBTerminalSession *session = LSBHostTerminal();
+    if (_session == session) {
+        if (session.closed) [self terminalClosed];
+        return;
+    }
+    _session.outputHandler = nil;
+    _session = session;
+    self.receivedTerminalOutput = NO;
+    self.terminal.inputHandler = nil;
+    self.terminal.resizeHandler = nil;
+    self.terminal.statusText = session ? @"Terminal attached." : @"Waiting for launchd to start Fish…";
+    if (!session) return;
+    __weak LSBFishViewController *weakSelf = self;
+    self.terminal.inputHandler = ^(NSData *data) {
+        LSBFishViewController *controller = weakSelf;
+        // Hidden tabs cannot receive UIKit input, but the terminal parser must still answer device/cursor queries from Fish.
+        if (!controller || controller.session != session || session.closed) return;
+        int error = [session sendInput:data];
+        if (error) fprintf(stderr, "[terminal] input: %s\n", strerror(error));
+    };
+    self.terminal.resizeHandler = ^(unsigned short rows, unsigned short columns) { [session resizeRows:rows columns:columns]; };
+    __weak LSBTerminalSession *weakSession = session;
+    session.outputHandler = ^(NSData *data) {
+        LSBFishViewController *controller = weakSelf;
+        if (!controller || controller.session != weakSession) return;
+        if (data.length) controller.receivedTerminalOutput = YES;
+        [controller.terminal appendOutput:data];
+    };
+    [self.terminal setNeedsLayout];
+    if (session.closed) [self terminalClosed];
+    else if (self.visible) [self.terminal becomeFirstResponder];
+}
+- (void)terminalClosed {
+    self.terminal.inputHandler = nil;
+    self.terminal.resizeHandler = nil;
+    [self.terminal resignFirstResponder];
+    self.terminal.statusText = self.receivedTerminalOutput ? @"Terminal closed." : @"Terminal closed without output.";
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    if (self.startupError) {
+        self.view.backgroundColor = UIColor.systemBackgroundColor;
+        showStatus(self, [NSString stringWithFormat:@"Could not start runtime: %s", strerror(self.startupError)]);
+        return;
+    }
+    LSBTerminalView *terminal = [[LSBTerminalView alloc] initWithFrame:CGRectZero];
+    terminal.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:terminal];
+    self.terminal = terminal;
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    NSLayoutConstraint *preferredBottom = [terminal.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor];
+    preferredBottom.priority = UILayoutPriorityDefaultHigh;
+    [NSLayoutConstraint activateConstraints:@[
+        [terminal.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+        [terminal.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+        [terminal.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [terminal.bottomAnchor constraintLessThanOrEqualToAnchor:safe.bottomAnchor],
+        [terminal.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor],
+        preferredBottom
+    ]];
+    terminal.statusText = @"Waiting for launchd to start Fish…";
+    [self bindTerminal];
+    __weak LSBFishViewController *weakSelf = self;
+    self.terminalObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostTerminalDidChangeNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf bindTerminal]; }];
+    self.closeObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBTerminalSessionDidCloseNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+            LSBFishViewController *controller = weakSelf;
+            if (controller && notification.object == controller.session) [controller terminalClosed];
+        }];
+}
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    self.visible = YES;
+    // A tab/scene can become visible after attachment and EOF; recover the current session even if a notification was missed.
+    [self bindTerminal];
+    if (self.session && !self.session.closed) [self.terminal becomeFirstResponder];
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    self.visible = NO;
+    [self.view endEditing:YES];
+    [super viewWillDisappear:animated];
+}
+@end
+
+@implementation LSBHostViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // The scene keeps both controllers and their runtime connections. Tab selection never starts or stops a process.
+    int startupError = LSBStartInitialGuest();
+    LSBSurfaceViewController *surface = [LSBSurfaceViewController new];
+    surface.startupError = startupError;
+    surface.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"IOSurface" image:[UIImage systemImageNamed:@"iphone"] tag:0];
+    LSBFishViewController *fish = [LSBFishViewController new];
+    fish.startupError = startupError;
+    fish.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Fish" image:[UIImage systemImageNamed:@"terminal"] tag:1];
+    self.viewControllers = @[surface, fish];
+    self.selectedIndex = 0;
+    // Install both consumers before asynchronous check-in/output, without focusing the hidden terminal.
+    [surface loadViewIfNeeded];
+    [fish loadViewIfNeeded];
 }
 @end

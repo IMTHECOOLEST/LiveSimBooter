@@ -62,6 +62,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property uint64_t springBoardMetalServiceIdentifier, publicMetalServiceIdentifier;
 @property BOOL springBoardMetalSelected;
 @property BOOL springBoardMetalPending;
+@property BOOL springBoardMetalRestartAllowed;
 @property int springBoardMetalError;
 @property LSBNativeMetalControl *nativeMetalControl;
 @property mach_port_t nativeServicePort;
@@ -114,6 +115,7 @@ static uint64_t nextIdentifier = 1;
 static BOOL launchLaneFailed;
 static unsigned finishingDepth;
 static LSBTerminalSession *hostTerminal;
+static BOOL initialTerminalPending;
 static BOOL enableIndigo;
 static BOOL enableSpringBoardMetal;
 // Allow every launchd child to overlap its exec replacement, plus launchd and the backboardd, SpringBoard and public Metal helpers.
@@ -128,8 +130,13 @@ static unsigned guestProxySigningErrorLogs;
 static BOOL retiredIdentitiesFull;
 NSString *const LSBHostIndigoDidChangeNotification = @"LSBHostIndigoDidChange";
 NSString *const LSBHostFramebufferDidChangeNotification = @"LSBHostFramebufferDidChange";
+NSString *const LSBHostTerminalDidChangeNotification = @"LSBHostTerminalDidChange";
 static void startNextJob(void);
 static int signalJob(LSBJob *child, int signalNumber);
+static int signalTerminal(pid_t foreground, int signalNumber);
+static BOOL launchdOwnsChildIdentity(LSBJob *job);
+static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, int *result);
+static void registerReplacementSpringBoardMetal(LSBJob *active, LSBJob *helper);
 
 LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
 int LSBHostUsesSimulatorDisplay(void) { return enableIndigo; }
@@ -176,16 +183,23 @@ static int openGuestExecutable(const LSBSpawnPlan *plan, int *descriptor, char g
     const char *path = plan->strings + plan->path;
     // Relative executable resolution depends on ordered child-only CHDIR/FCHDIR actions. Never guess an image in the host cwd.
     if (path[0] != '/') return ENOTSUP;
+    char root[PATH_MAX], candidate[PATH_MAX], canonical[PATH_MAX], descriptorPath[PATH_MAX], descriptorCanonical[PATH_MAX];
+    int rootError = realpath(runtimeRoot.fileSystemRepresentation, root) ? 0 : errno;
+    const char *rootSeparator = !rootError && containedPath(path, root) ? path + strlen(root) : NULL;
+    if (!rootError && !rootSeparator && !strncmp(root, "/private/var/", 13) && containedPath(path, root + 8))
+        rootSeparator = path + strlen(root + 8);
     // Reject lexical traversal without Foundation's platform-dependent /private path standardization.
     for (const char *part = path + 1; *part;) {
         const char *end = strchr(part, '/');
         size_t length = end ? (size_t)(end - part) : strlen(part);
+        // Simulator launchd joins its root plus "/" with the absolute xpcproxy path. Permit exactly that duplicate boundary,
+        // then still resolve and validate the opened descriptor below; empty components elsewhere remain invalid.
+        if (!length && rootSeparator && part == rootSeparator + 1 && part[1] && part[1] != '/') { ++part; continue; }
         if (!length || (length == 1 && part[0] == '.') || (length == 2 && part[0] == '.' && part[1] == '.')) return EINVAL;
         if (end && !end[1]) return EINVAL;
         part += length + (end != NULL);
     }
-    char root[PATH_MAX], candidate[PATH_MAX], canonical[PATH_MAX], descriptorPath[PATH_MAX], descriptorCanonical[PATH_MAX];
-    if (!realpath(runtimeRoot.fileSystemRepresentation, root)) return errno;
+    if (rootError) return rootError;
     BOOL physical = realpath(path, canonical) && containedPath(canonical, root);
     if (!physical) {
         // An explicit physical path cannot escape through a symlink and be reinterpreted as a guest path.
@@ -610,6 +624,7 @@ static void finishJob(LSBJob *job, int error) {
             if (stopError && stopError != ESRCH) fprintf(stderr, "[Metal] helper termination failed: %s\n", strerror(stopError));
         }
         uint64_t authorized = job.nativeMetalAuthorizedIdentifier;
+        LSBJob *owner = findJob(authorized);
         job.nativeMetalAuthorizedIdentifier = 0;
         if (MACH_PORT_VALID(job.nativeServicePort)) {
             mach_port_deallocate(mach_task_self(), job.nativeServicePort);
@@ -620,11 +635,13 @@ static void finishJob(LSBJob *job, int error) {
             dependent.servicesError = error ? error : EPIPE;
             if (dependent.phase != JobRunning) finishJob(dependent, dependent.servicesError);
         } else if (dependent.springBoardMetalServiceIdentifier == job.identifier) {
-            // Keep the backboard endpoint/session usable. A lost SpringBoard process-reference namespace requires a new session.
+            // A replacement SpringBoard needs a fresh private process-reference namespace, not the retired owner's helper.
+            // Permit one new helper when launchd next requests SpringBoard. Failed startup/registration never causes a retry loop.
+            dependent.springBoardMetalRestartAllowed = owner.phase == JobRunning && dependent.phase == JobRunning &&
+                !dependent.finishing && !dependent.servicesError;
             dependent.springBoardMetalError = error ? error : EPIPE;
             dependent.springBoardMetalPending = NO;
         }
-        LSBJob *owner = findJob(authorized);
         if (owner && !owner.finishing) {
             int stopError = signalJob(owner, SIGKILL);
             if (stopError && stopError != ESRCH) fprintf(stderr, "[Metal] owner termination failed: %s\n", strerror(stopError));
@@ -637,7 +654,6 @@ static void finishJob(LSBJob *job, int error) {
             helper.identifier != job.publicMetalServiceIdentifier &&
             helper.nativeMetalAuthorizedIdentifier != job.identifier) continue;
         int revokeError = LSBNativeMetalControlPublish(helper.nativeMetalControl, NULL);
-        if (helper.nativeMetalAuthorizedIdentifier == job.identifier) helper.nativeMetalAuthorizedIdentifier = 0;
         if (revokeError) fprintf(stderr, "[Metal] authorization revoke failed: %s\n", strerror(revokeError));
         finishJob(helper, ECANCELED);
     }
@@ -782,6 +798,20 @@ static void startNextJob(void) {
         BOOL needsServices = old || isBackboardProgram(job.request) || springBoard;
         if (needsServices && parent.servicesPending) continue;
         if (needsServices && parent.servicesError) { finishJob(job, parent.servicesError); return; }
+        if (springBoard && parent.springBoardMetalRestartAllowed) {
+            parent.springBoardMetalRestartAllowed = NO;
+            // enqueueJob can advance the launch lane synchronously. Install the dependency first and rescan the changed job list.
+            ++finishingDepth;
+            int error = 0;
+            LSBJob *helper = enqueueNativeMetalHelper(NO, &error);
+            parent.springBoardMetalServiceIdentifier = helper.identifier;
+            parent.springBoardMetalError = error;
+            parent.springBoardMetalPending = helper != nil;
+            --finishingDepth;
+            fprintf(stderr, "[Metal] SpringBoard replacement helper request=%llu error=%d\n", helper.identifier, error);
+            startNextJob();
+            return;
+        }
         if (springBoard && parent.springBoardMetalPending) continue;
         if (springBoard && parent.springBoardMetalError) { finishJob(job, parent.springBoardMetalError); return; }
         startingJob = job;
@@ -798,6 +828,49 @@ static void startNextJob(void) {
         });
         return;
     }
+}
+
+static BOOL isTerminalHelper(const LSBReceivedMessage *message) {
+    const char *path = message->plan.strings + message->plan.path;
+    static const char helper[] = "/usr/libexec/terminal-fish";
+    if (!strcmp(path, helper)) return YES;
+    NSString *physical = [runtimeRoot stringByAppendingString:@"/usr/libexec/terminal-fish"];
+    if (!strcmp(path, physical.fileSystemRepresentation)) return YES;
+    const char *canonical = physical.fileSystemRepresentation;
+    if (!strncmp(canonical, "/private/var/", 13) && !strcmp(path, canonical + 8)) return YES;
+    NSString *joined = [runtimeRoot stringByAppendingString:@"//usr/libexec/terminal-fish"];
+    canonical = joined.fileSystemRepresentation;
+    return !strcmp(path, canonical) || (!strncmp(canonical, "/private/var/", 13) && !strcmp(path, canonical + 8));
+}
+
+static int prepareLaunchdTerminal(LSBReceivedMessage *message, LSBJob *sender, BOOL replacing, LSBTerminalSession **terminal) {
+    *terminal = nil;
+    if (!isTerminalHelper(message)) return 0;
+    audit_token_t audit = sender.audit;
+    if (!enableIndigo || !sender || sender.phase != JobRunning || sender.finishing || sender.retiredForExec ||
+        sender.executionRole != LSB_EXECUTION_SIMULATOR || memcmp(&audit, &message->audit, sizeof(audit))) return EACCES;
+    LSBJob *owner = replacing ? findJob(sender.parentIdentifier) : sender;
+    LSBPeerProcessIdentity identity = sender.peerIdentity;
+    if (replacing && (sender.peerIdentityError || strcmp(identity.executablePath, "/usr/libexec/xpcproxy_sim"))) return EACCES;
+    if (!owner || owner.phase != JobRunning || owner.finishing || owner.retiredForExec || owner.parentIdentifier ||
+        !launchdOwnsChildIdentity(owner)) return EACCES;
+    for (LSBJob *job in jobs) if (job.terminalSession) return EBUSY;
+    int error = 0;
+    LSBTerminalSession *created = [[LSBTerminalSession alloc] initWithDirectory:runtimeRoot.stringByDeletingLastPathComponent error:&error];
+    if (!error && !created) error = ENOMEM;
+    if (!error) error = [created attachToMessageReplacingStandardIO:message];
+    if (error) [created close];
+    else *terminal = created;
+    return error;
+}
+
+static void publishTerminal(LSBTerminalSession *terminal) {
+    [hostTerminal close];
+    hostTerminal = terminal;
+    terminal.signalHandler = ^int(pid_t foreground, int number) { return signalTerminal(foreground, number); };
+    // The UI attaches its output callback synchronously before the socket reader can consume the first prompt.
+    [NSNotificationCenter.defaultCenter postNotificationName:LSBHostTerminalDidChangeNotification object:nil];
+    [terminal start];
 }
 
 static LSBJob *enqueueJob(LSBReceivedMessage *message, LSBJob *parent, uint32_t executionRole) {
@@ -822,14 +895,23 @@ static LSBJob *enqueueJob(LSBReceivedMessage *message, LSBJob *parent, uint32_t 
         job.parentIdentifier = parent.identifier;
         job.parentTicket = ticket;
     }
+    LSBTerminalSession *terminal = nil;
+    error = prepareLaunchdTerminal(message, parent, NO, &terminal);
+    if (error) {
+        if (parent) LSBChildStatusAbandon(parent.childStatus, job.parentTicket);
+        replyError(message, error); return nil;
+    }
     job.identifier = nextIdentifier++;
-    job.terminalSession = parent ? parent.terminalSession : hostTerminal != nil;
+    job.terminalSession = terminal || (parent ? parent.terminalSession : initialTerminalPending && !message->object &&
+        executionRole == LSB_EXECUTION_SIMULATOR && strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim"));
+    if (!parent && job.terminalSession) initialTerminalPending = NO;
     if (!parent && !strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim")) {
         for (unsigned i = 0; i < message->plan.envc; ++i)
             if (!strcmp(message->plan.strings + message->plan.envp[i], "LSB_SIMULATOR_LAUNCHD=1")) job.simulatorLaunchd = YES;
     }
     job.request = message;
     [jobs addObject:job];
+    if (terminal) publishTerminal(terminal);
     startNextJob();
     return findJob(job.identifier);
 }
@@ -850,13 +932,17 @@ static void enqueueExec(LSBReceivedMessage *message, LSBJob *old) {
     LSBJob *job = [LSBJob new];
     int error = inheritChildStatus(job, old);
     if (error) { replyError(message, error); return; }
+    LSBTerminalSession *terminal = nil;
+    error = prepareLaunchdTerminal(message, old, YES, &terminal);
+    if (error) { replyError(message, error); return; }
     job.identifier = nextIdentifier++;
     job.guestPID = old.guestPID;
-    job.terminalSession = old.terminalSession;
+    job.terminalSession = terminal || old.terminalSession;
     job.replacesIdentifier = old.identifier;
     old.replacementIdentifier = job.identifier;
     job.request = message;
     [jobs addObject:job];
+    if (terminal) publishTerminal(terminal);
     fprintf(stderr, "[broker] exec guest=%d old-native=%d replacement-request=%llu\n", old.guestPID, old.pid, job.identifier);
     startNextJob();
 }
@@ -924,6 +1010,60 @@ static int registerDisplayEndpoint(mach_port_t service, const audit_token_t *aud
     if (remaining <= 0) return ETIMEDOUT;
     uint32_t milliseconds = (uint32_t)((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
     return LSBLaunchdRegisterEndpointWithTimeout(service, audit, name, endpoint, milliseconds, status);
+}
+
+static int unregisterDisplayEndpoint(mach_port_t service, const audit_token_t *audit, const char *name,
+                                     int64_t deadline, kern_return_t *status) {
+    *status = -1;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return errno;
+    int64_t remaining = deadline - (int64_t)now.tv_sec * NSEC_PER_SEC - now.tv_nsec;
+    if (remaining <= 0) return ETIMEDOUT;
+    uint32_t milliseconds = (uint32_t)((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
+    return LSBLaunchdUnregisterEndpointWithTimeout(service, audit, name, milliseconds, status);
+}
+
+static void registerReplacementSpringBoardMetal(LSBJob *active, LSBJob *helper) {
+    mach_port_t service = LSBLaunchdHandshakeServicePort(active.launchdHandshake), endpoint = helper.nativeServicePort;
+    int error = 0;
+    if (!MACH_PORT_VALID(service) || !MACH_PORT_VALID(endpoint)) error = EPIPE;
+    else if (mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, 1)) error = EPIPE;
+    else if (mach_port_mod_refs(mach_task_self(), endpoint, MACH_PORT_RIGHT_SEND, 1)) {
+        mach_port_deallocate(mach_task_self(), service);
+        error = EPIPE;
+    }
+    if (error) {
+        active.springBoardMetalPending = NO;
+        active.springBoardMetalError = error;
+        return;
+    }
+    uint64_t identifier = active.identifier, helperIdentifier = helper.identifier;
+    audit_token_t expected = active.audit;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        struct timespec now = {0};
+        int registrationError = clock_gettime(CLOCK_MONOTONIC, &now) ? errno : 0;
+        int64_t deadline = ((int64_t)now.tv_sec + DisplayRegistrationTimeoutSeconds) * NSEC_PER_SEC + now.tv_nsec;
+        kern_return_t status = -1, removalStatus = -1;
+        // Bridge registration rejects an existing name. Retire only this session's previous private endpoint before replacing it.
+        // ESRCH is a confirmed absence (for example after dead-name cleanup); an unknown/denied removal must not proceed.
+        if (!registrationError) registrationError = unregisterDisplayEndpoint(service, &expected, "com.apple.metal.simulator.SpringBoard",
+                                                                              deadline, &removalStatus);
+        if (registrationError == ESRCH) registrationError = 0;
+        if (!registrationError) registrationError = registerDisplayEndpoint(service, &expected, "com.apple.metal.simulator.SpringBoard",
+                                                                            endpoint, deadline, &status);
+        mach_port_deallocate(mach_task_self(), endpoint);
+        mach_port_deallocate(mach_task_self(), service);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LSBJob *current = findJob(identifier), *currentHelper = findJob(helperIdentifier);
+            if (!current || current.finishing || current.springBoardMetalServiceIdentifier != helperIdentifier) return;
+            current.springBoardMetalPending = NO;
+            if (!current.springBoardMetalError)
+                current.springBoardMetalError = !currentHelper || currentHelper.phase != JobRunning ? EPIPE : registrationError;
+            fprintf(stderr, "[Metal] SpringBoard replacement registration request=%llu error=%d unregister=%d bootstrap=%d\n",
+                    helperIdentifier, current.springBoardMetalError, removalStatus, status);
+            startNextJob();
+        });
+    });
 }
 
 static void registerDisplayServices(LSBJob *active, mach_port_t service) {
@@ -1034,7 +1174,7 @@ static void registerDisplayServices(LSBJob *active, mach_port_t service) {
         if (!MACH_PORT_VALID(springBoardMetal)) dispatch_async(dispatch_get_main_queue(), finishBaseline);
         if (springBoardHelperIdentifier) dispatch_async(dispatch_get_main_queue(), ^{
             LSBJob *current = findJob(identifier);
-            if (!current) return;
+            if (!current || current.finishing || current.springBoardMetalServiceIdentifier != springBoardHelperIdentifier) return;
             current.springBoardMetalPending = NO;
             LSBJob *currentHelper = findJob(springBoardHelperIdentifier);
             if (!current.springBoardMetalError)
@@ -1412,6 +1552,10 @@ static void handleMessage(LSBReceivedMessage *message) {
             }
             fprintf(stderr, "[broker] spawn ready guest=%d native=%d request=%llu\n", sender.guestPID, pid, sender.identifier);
             startingJob = nil;
+            if (nativeService) for (LSBJob *owner in jobs) {
+                if (owner.phase == JobRunning && owner.springBoardMetalServiceIdentifier == sender.identifier &&
+                    owner.springBoardMetalPending && !owner.springBoardMetalError) registerReplacementSpringBoardMetal(owner, sender);
+            }
             startNextJob();
             return;
         }
@@ -1452,6 +1596,7 @@ static int initialExecutionRole(int argc, const char *argv[], uint32_t *role) {
 }
 
 static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[], const char *envp[]) {
+    initialTerminalPending = NO;
     LSBSpawnPlan *plan = &message->plan;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
     uint32_t executionRole;
@@ -1466,10 +1611,12 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
         enableIndigo = YES;
         return argc == 2 ? LSBPrepareLaunchdBackboardPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     }
-    if (argc > 1 && !strcmp(argv[1], "--launchd-services")) {
+    if (argc == 1 || (argc > 1 && !strcmp(argv[1], "--launchd-services"))) {
+        // Icon launches boot the graphical session. Its fixed launchd-owned terminal job supplies the Fish tab.
         const char *defaults[] = {"com.apple.notifyd", "com.apple.lsd", "com.apple.runningboardd", "com.apple.containermanagerd",
                                   "com.apple.fontservicesd", "com.apple.containermanagerd.system", "com.apple.distnoted.xpc.daemon",
-                                  "com.apple.configd_sim", NULL};
+                                  "com.apple.configd_sim", "com.apple.sleepd", "com.apple.SpringBoard",
+                                  "com.apple.iconservices.iconservicesagent", NULL};
         enableIndigo = YES;
         const char *const *labels = argc > 2 ? argv + 2 : defaults;
         int error = LSBPrepareLaunchdServicesPlan(message, runtimeRoot.fileSystemRepresentation, envp, labels);
@@ -1482,7 +1629,7 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     const char *defaultArgs[] = {"/bin/fish", "-i", "-N", "-P", "-C",
         "status job-control none; set -g fish_use_posix_spawn 1; set -g fish_greeting; function fish_prompt; printf 'fish> '; end", NULL};
     const char *nativeArgs[] = { "/__LiveSimBooterNativeMetalProbe", NULL };
-    BOOL terminal = argc == 1 || (argc > 1 && !strcmp(argv[1], "--terminal"));
+    BOOL terminal = argc > 1 && !strcmp(argv[1], "--terminal");
     int firstArgument = terminal && argc > 1 ? 2 : 1;
     const char *const *arguments = nativeProbe ? nativeArgs : argc > firstArgument ? argv + firstArgument : defaultArgs;
     int count = nativeProbe ? 1 : argc > firstArgument ? argc - firstArgument : 6;
@@ -1515,6 +1662,7 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
         if (!error) hostTerminal = [[LSBTerminalSession alloc] initWithDirectory:runtimeRoot.stringByDeletingLastPathComponent error:&error];
         if (!error) error = [hostTerminal attachToMessage:message];
         if (error) { [hostTerminal close]; hostTerminal = nil; }
+        else initialTerminalPending = YES;
     }
     for (int number = 0; !terminal && !error && number < 3; ++number) {
         int flags = fcntl(number, F_GETFD);
@@ -1605,6 +1753,7 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
         if (status) { disposeMessage(initial); fprintf(stderr, "[broker] bootstrap_check_in: %d\n", status); return EIO; }
         jobs = [NSMutableArray new];
         hostTerminal.signalHandler = ^int(pid_t foreground, int number) { return signalTerminal(foreground, number); };
+        if (hostTerminal) [NSNotificationCenter.defaultCenter postNotificationName:LSBHostTerminalDidChangeNotification object:nil];
         [hostTerminal start];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             unsigned receiveFailures = 0;

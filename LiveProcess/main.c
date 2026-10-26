@@ -154,8 +154,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     length = snprintf(capabilitiesEnvironment, sizeof(capabilitiesEnvironment),
                       "SIMULATOR_CAPABILITIES=%s/Library/Developer/CoreSimulator/DeviceType/capabilities.plist", launch.runtimeRoot);
     if (!error && (length < 0 || (size_t)length >= sizeof(capabilitiesEnvironment))) error = ENAMETOOLONG;
-    if (!error && !LSBMapDyldSim(dyldPath, &loader, detail, sizeof(detail))) error = ENOEXEC;
-    if (!error && !LSBMapSimExecutable(executablePath, &executable, detail, sizeof(detail))) error = ENOEXEC;
+    if (!error && !LSBMapDyldSimForRuntime(dyldPath, launch.runtimeRoot, &loader, detail, sizeof(detail))) error = ENOEXEC;
+    if (!error && !LSBMapSimExecutableForRuntime(executablePath, launch.runtimeRoot, &executable, detail, sizeof(detail))) error = ENOEXEC;
     // Keep only a kernel send right across detachment; simulator libxpc cannot look up services without simulator launchd.
     if (!error) error = LSBTransportCopyBrokerPort(&brokerPort);
     if (!error) {

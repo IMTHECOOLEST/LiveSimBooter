@@ -361,6 +361,56 @@ static void testCallbacksAfterFinalRelease(void) {
     dispatch_release(context.completed);
 }
 
+static void signalCancellation(void *context) { dispatch_semaphore_signal(context); }
+
+static void testMandatoryCancellationLifetime(void) {
+    waitForNoSources();
+    LSBChildStatusInitialize(&ledger);
+    LSBChildTicket ticket = running(90700);
+    assert(!LSBChildStatusPublishExit(&ledger, ticket, 0));
+    ReleaseCallbacks context = {.pid = 90700, .completed = dispatch_semaphore_create(0)};
+    ReleaseCallbacks *callbackContext = &context;
+    for (unsigned round = 0; round < 64; ++round) {
+        dispatch_suspend(queue);
+        context.source = LSBDispatchSourceCreate(DISPATCH_SOURCE_TYPE_PROC, context.pid, processMask, queue);
+        assert(context.source);
+        if (round & 1) {
+            LSBDispatchSourceSetMandatoryCancelHandler(context.source, ^{ releaseCancellation(callbackContext); });
+        } else {
+            dispatch_set_context(context.source, NULL);
+            LSBDispatchSourceSetMandatoryCancelHandlerF(context.source, releaseCancellation);
+            dispatch_set_context(context.source, &context);
+        }
+        dispatch_activate(context.source);
+        LSBDispatchSourceCancel(context.source);
+        waitForTimer(context.source);
+        LSBDispatchRelease(context.source);
+        pthread_mutex_lock(&sourceLock);
+        ManagedSource *entry = findSource(context.source);
+        assert(entry && entry->timerFinished && !entry->sourceFinished && entry->externalReferences == 0);
+        pthread_mutex_unlock(&sourceLock);
+        dispatch_resume(queue);
+        waitFor(context.completed);
+        waitForNoSources(); // The device failure left this entry alive after native source disposal and allocator reuse.
+        assert(atomic_load(&context.cancellations) == round + 1);
+    }
+    dispatch_release(context.completed);
+
+    // Unmanaged sources retain native mandatory cancellation behavior and callback context.
+    for (unsigned useBlock = 0; useBlock < 2; ++useBlock) {
+        dispatch_source_t native = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, queue);
+        dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+        dispatch_set_context(native, completed);
+        if (useBlock) LSBDispatchSourceSetMandatoryCancelHandler(native, ^{ dispatch_semaphore_signal(completed); });
+        else LSBDispatchSourceSetMandatoryCancelHandlerF(native, signalCancellation);
+        dispatch_activate(native);
+        LSBDispatchSourceCancel(native);
+        waitFor(completed);
+        LSBDispatchRelease(native);
+        dispatch_release(completed);
+    }
+}
+
 static void testSelfProcPIDTranslation(void) {
     unsigned char bytes[192];
     procResult = 56;
@@ -420,6 +470,7 @@ int main(void) {
     testExitSurvivesReapingAndDiscard();
     testConcurrentLifetimeAndPassthrough();
     testCallbacksAfterFinalRelease();
+    testMandatoryCancellationLifetime();
     testSelfProcPIDTranslation();
     testProcPIDTranslation();
     dispatch_release(queue);

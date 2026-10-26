@@ -14,6 +14,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static pid_t guestGroup = 789123;
+pid_t LSBGuestProcessGroup(void) { if (guestGroup < 0) errno = EIO; return guestGroup; }
+
 typedef struct {
     unsigned char input[16384], output[16384];
     size_t inputLength, outputLength;
@@ -91,7 +94,12 @@ int main(void) {
     assert(!LSBPTYNameR(duplicate, name, sizeof(name)) && !strcmp(name, "/dev/lsbtty"));
     assert(LSBPTYNameR(duplicate, name, 2) == ERANGE);
     assert(!strcmp(LSBPTYName(duplicate), name));
-    assert(LSBPTYGetForeground(duplicate) == getpgrp());
+    assert(guestGroup != getpgrp());
+    guestGroup = -1;
+    assert(LSBPTYGetForeground(duplicate) == -1 && errno == EIO);
+    guestGroup = 789123;
+    errno = E2BIG;
+    assert(LSBPTYGetForeground(duplicate) == guestGroup && errno == E2BIG);
     assert(!LSBPTYSetForeground(duplicate, 1234));
     assert(LSBPTYGetForeground(duplicate) == 1234);
     assert(LSBPTYSetForeground(duplicate, -1) == -1 && errno == EINVAL);

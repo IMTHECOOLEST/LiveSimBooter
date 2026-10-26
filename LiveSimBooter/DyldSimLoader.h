@@ -19,6 +19,10 @@ typedef struct {
 
 bool LSBMapDyldSim(const char *path, LSBMappedImage *image, char *error, size_t errorSize);
 bool LSBMapSimExecutable(const char *path, LSBMappedImage *image, char *error, size_t errorSize);
+// With a cache present, reserve images below its declared range and below the host executable shared region.
+// The original APIs retain their unconstrained, loose-library mapping behavior.
+bool LSBMapDyldSimForRuntime(const char *path, const char *rootPath, LSBMappedImage *image, char *error, size_t errorSize);
+bool LSBMapSimExecutableForRuntime(const char *path, const char *rootPath, LSBMappedImage *image, char *error, size_t errorSize);
 // Only unload before entering dyld_sim; it retains pointers into both mapped images.
 void LSBUnloadImage(LSBMappedImage *image);
 

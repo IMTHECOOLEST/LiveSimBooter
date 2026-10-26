@@ -27,11 +27,11 @@ extern "C" {
 int csops(pid_t pid, unsigned int operation, void *buffer, size_t size);
 int csops_audittoken(pid_t pid, unsigned int operation, void *buffer, size_t size, audit_token_t *token);
 
-// Guest-only opt-in: try the exact original request, then adapt EPERM for the seven listed read operations.
-// STATUS reports signed/valid after a successful kernel self query. XML/DER reads request the exact managed peer's immutable
+// Guest-only opt-in: XML/DER reads always request the exact managed peer's immutable
 // original DER snapshot (or XML derived from it) from the authenticated native broker. Positive PIDs must match the audit token;
 // pid zero and NULL-token queries are accepted only for the actual kernel self identity. Retired or unmanaged peers fail closed.
-// CDHash uses the signed guest image's actual CodeDirectory hash, preventing cross-guest signature-cache collisions.
+// Other listed reads try the exact original request, then adapt only EPERM. STATUS reports signed/valid after a successful kernel
+// self query. CDHash uses the signed guest image's actual CodeDirectory hash, preventing cross-guest signature-cache collisions.
 // Identity/team/category reads use the current extension's real signature. This changes only guest reports, never native kernel policy.
 // No PID or audit token is rewritten, no mutation operation is retried, and csops itself is not interposed.
 int LSBCSopsAuditToken(pid_t pid, unsigned int operation, void *buffer, size_t size, audit_token_t *token);

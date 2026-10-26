@@ -1,8 +1,10 @@
 # Development notes
 
 These notes describe the runtime experiments and the multiprocess implementation added on 2026-10-25.
-The current implementation includes arm64 runtime handoff, brokered `posix_spawn`, a native terminal host, isolated simulator
-launchd and initial backboardd services. Guest offscreen GPU triangle rendering, stock backboardd spinner and touch-marker
+The current implementation includes arm64 runtime handoff, brokered `posix_spawn`, isolated simulator launchd, SpringBoard and
+a visible Contacts window. The native host now provides persistent IOSurface and Fish tabs; launchd owns the new Fish helper
+path, whose device validation is pending. Ordinary app touches are confirmed working; Home and lock-screen behavior remain
+under investigation. Guest offscreen GPU triangle rendering, stock backboardd spinner and touch-marker
 rendering, and native Metal dirty-rectangle presentation are verified. The latest phone run settles near 60 presentations
 per second after fixing drawable-pool stalls. Apple-logo/progress rendering and complete simulator boot remain unverified.
 
@@ -21,7 +23,7 @@ per second after fixing drawable-pool stalls. Apple-logo/progress rendering and 
 - [Native Metal backend](../NativeMetal/README.md): host-selected roles, pinned metadata adaptation, signing and fixed-path packaging.
 - [Bash](bash.md): noninteractive builtin baseline, terminal-access probes, and remaining fork/exec design requirements.
 - [Fish](fish.md): unmodified-source shell results, executable-access compatibility, and interactive startup.
-- [Fake terminal](fake-pty.md): socket transport, pure-C guest terminal controls, native keyboard/display, and current limits.
+- [Fake terminal](fake-pty.md): launchd-owned Fish tab, socket transport, guest terminal controls, native keyboard/display, and validation limits.
 - [Creation mask](creation-mask.md): tracked `umask` state for spawning after guest worker threads start on Darwin 25.
 - [iOS platform compatibility](ios-platform.md): the pinned dyld_sim patch for unchanged device-platform binaries and dependencies.
 - [Shared cache](shared-cache.md): signing format, TXM findings, the relocated iOS 26 cache, and reproduction commands.

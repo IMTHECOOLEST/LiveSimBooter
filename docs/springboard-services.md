@@ -78,8 +78,8 @@ CoreSimulator's Mac-side management rather than a guest UI dependency.
 
 ## Current selected-job mode
 
-`--launchd-services` retains the existing backboardd and simulator cfprefsd jobs and selects these additional defaults in
-`Host/Broker.m`:
+A normal no-argument app launch and bare `--launchd-services` boot the graphical session. Both retain the fixed backboardd,
+simulator cfprefsd and `com.kdt.LiveSimBooter.terminal-fish` jobs, and select these additional defaults in `Host/Broker.m`:
 
 | Job label | Matching 23A343 program | Main service declarations |
 | --- | --- | --- |
@@ -91,8 +91,11 @@ CoreSimulator's Mac-side management rather than a guest UI dependency.
 | `com.apple.containermanagerd.system` | `/usr/libexec/containermanagerd_system` with stock privileged-runmode arguments | `com.apple.containermanagerd.system` |
 | `com.apple.distnoted.xpc.daemon` | `/usr/sbin/distnoted daemon` | `com.apple.distributed_notifications@0v3`, `com.apple.distributed_notifications@1v3` |
 | `com.apple.configd_sim` | `/usr/libexec/configd_sim -d` | `com.apple.SystemConfiguration.{NetworkInformation_sim,DNSConfiguration_sim,configd_sim}` |
+| `com.apple.sleepd` | `/System/Library/PrivateFrameworks/SleepDaemon.framework/sleepd` | `com.apple.sleepd.sleepserver` and the stock sleep wake endpoint |
+| `com.apple.SpringBoard` | `/System/Library/CoreServices/SpringBoard.app/SpringBoard` | Stock SpringBoard, keyboard, status bar and Control Center service declarations |
+| `com.apple.iconservices.iconservicesagent` | `/System/Library/CoreServices/iconservicesagent` | `com.apple.iconservices` |
 
-Explicit native-host command-line labels replace those eight defaults; backboardd and cfprefsd remain included. For example,
+Explicit native-host command-line labels replace those eleven defaults; the three fixed jobs remain included. For example,
 `--launchd-services com.apple.notifyd` selects only notifyd as the additional job. Labels do not come from guest environment
 variables. The mode writes its generated jobs under the owned `SimulatorData/Library/LiveSimBooter-CoreDaemons-<selection-hash>` directory, with
 per-label output in `SimulatorData/Library/Logs/<label>.log`. Sorted selections have stable directory names; narrowing or
@@ -250,11 +253,11 @@ This did not terminate the seven selected daemons or framebuffer updates.
 
 ## LaunchServices identity compatibility and verified reply
 
-`Guest/CodeSigningCompatibility.c` now adapts the denied guest `csops_audittoken` reads when
-`LSB_SIMULATE_CODE_SIGNING=1`; the host enables this only in the selected-service simulator environment. It first issues
-the exact original syscall. Successful calls, errors other than `EPERM`, and mutation or unknown operations pass through
-without a fallback. The read allowlist contains STATUS, CDHASH, XML entitlements, IDENTITY, TEAMID, DER entitlements and
-VALIDATION_CATEGORY. Neither the requested PID nor its audit token is rewritten, and `csops` itself is not interposed.
+`Guest/CodeSigningCompatibility.c` adapts guest `csops_audittoken` reads when `LSB_SIMULATE_CODE_SIGNING=1`; the host enables
+this only in the selected-service simulator environment. XML and DER entitlement reads use the authenticated guest snapshot
+first, as described below. STATUS, CDHASH, IDENTITY, TEAMID and VALIDATION_CATEGORY first issue the exact original syscall
+and adapt only `EPERM`; their successful native calls and other errors pass through. Mutation and unknown operations remain
+native. Neither the requested PID nor its audit token is rewritten, and `csops` itself is not interposed.
 
 The initial fallback for denied identity/CDHash/team/category reads queried `csops(0, ...)`, using the current extension's real signature. The later per-executable CDHash change is described at the end of this note. This models the shared signed LiveProcess executable identity; it does not recover each mapped guest binary's
 distinct signing identity or independently authenticate the requested peer. STATUS first requires a successful kernel
@@ -497,9 +500,20 @@ helpers are excluded. Replies use immutable snapshots, so a later file replaceme
 Missing or malformed DER is cached as an error. Relative executable paths currently return `ENOTSUP` for entitlement
 queries because their resolution can depend on ordered child CHDIR/FCHDIR actions; the launch itself is unaffected.
 
-The guest uses this lookup only for opted-in `csops_audittoken` entitlement reads denied with `EPERM`. Successful native
-queries, direct `csops` calls, and other errors keep their existing behavior. The separate narrow SpringBoardUI self-query
-adapter therefore remains in place. This is a peer-query compatibility layer, not complete emulation of every SecTask path.
+With the opt-in enabled, XML/DER operations 7 and 16 now use this lookup before issuing any native `csops_audittoken` query.
+Native self reads describe LiveProcess, and the matching Security framework caches `EINVAL` or empty success as an empty
+entitlement dictionary. Waiting for native `EPERM` can therefore hide an existing guest entitlement. Missing snapshots,
+unknown or stale identities, and transport errors fail with their original errors; they never fall back to the extension's
+native profile. Exact full-audit validation and bounded kernel copies still govern every reply. With the opt-in disabled,
+both operations forward unchanged. All other signing operations retain their earlier behavior.
+
+This change follows Spotlight's SpringBoardUI `+load` assertion: the stock guard first asks for
+`com.apple.springboard-ui.client`, which is true in Spotlight's original DER (184 keys, 13,874 bytes). BaseBoard obtains
+the genuine task audit token and calls Security directly. The new contract fixes the entitlement source rather than
+authorizing an executable name or bypassing the framework assertion. Focused tests cover Security's eight-byte size probe,
+full XML parsing, native success/`EINVAL`/`ERANGE` cases, invalid destinations, missing DER, stale identities and opt-out;
+they pass, as does simulator syntax validation. Spotlight's on-device result is still pending. The existing narrow
+SpringBoard-only self-query adapter remains in place; this is not complete emulation of every SecTask path.
 
 Host caching removes repeated file reads and conversion but adds synchronous IPC and reply copying. A warm local cache
 would avoid those costs; a warm filesystem read may also beat IPC. Performance must distinguish this stock simulator file
@@ -1087,7 +1101,7 @@ The attribute snapshots are in [the LLDB request log](../tmp/app-launch-fix/lldb
 The shared ledger is now **ABI 4**, with **64 slots** and a **2,080-byte** structure inside the unchanged **4 KiB** mapping.
 Old ABI/capacity combinations are rejected before slot access. Host, LiveProcess and guest shim must be deployed together;
 changing a header does not expand a running process's already initialized ledger. The initial service-selection limit
-remains **14 selected jobs plus backboardd and cfprefsd**. The broker's physical-job limit is **132**: 64 children with room
+remains **14 selected jobs**, now plus the fixed backboardd, cfprefsd and terminal helper jobs. The broker's physical-job limit is **132**: 64 children with room
 for simultaneous exec replacements, simulator launchd, and three native Metal helpers. Unreaped statuses and observations
 that pin a slot still consume capacity. This increase supplies headroom; it does not remove resource limits.
 
@@ -1174,3 +1188,30 @@ tests passed, and its simulator build succeeded; logs are under `tmp/app-launch-
 These local results verify the implemented compatibility boundaries. Subsequent fixes to FrontBoard reconnection, UIKit
 resources/device capabilities and cache-only framework loading now open a visible Contacts window on the iPhone; see
 [the app launch results](launchd.md#cache-only-framework-weak-linking).
+
+## Native tabs and input progress (2026-10-26)
+
+The native foreground window now retains an IOSurface tab and a Fish tab. Icon launch selects the graphical defaults above;
+the generated terminal helper belongs to simulator launchd and replaces itself with Fish through SETEXEC. The broker attaches
+the fake terminal only to that authenticated helper lineage, preserving logical PID and wait ownership through replacement.
+Tab selection changes presentation and keyboard focus, without creating another guest or stopping the existing one. See
+[the terminal architecture](fake-pty.md#launchd-owned-fish-and-tabs) for FD attachment, session lifetime, build/staging and tests.
+The explicit `--terminal` option remains a direct-shell diagnostic; it is no longer the icon-launch default.
+
+Ordinary Contacts input exposed a separate process-identity mismatch. Pinned BackBoardServices uses `getpid` when registering
+its HID client, constructing dispatch targets, and comparing delivery-policy observations. The IOHID connection is validated
+against a genuine native task audit token; a retired logical xpcproxy PID therefore cannot identify that client. The exact
+BackBoardServices install path and canonical RuntimeRoot image now receive native self PID through the existing caller-scoped
+adapter. Ordinary guest callers retain their stable logical PID. Tests retain malformed-path, unrelated-image and unload/reload
+boundaries; the pinned call chain is recorded in
+[the routing analysis](../tmp/app-launch-fix/gesture-research/ordinary-touch-routing.md).
+
+After the parent-coordinate and BKS identity fixes, the user confirmed ordinary touches work. A device screenshot also shows
+Control Center opening: [Control Center result](../tmp/app-launch-fix/gesture-research/control-after-bks.png).
+Home and lock-screen behavior remain under investigation; the current reproduction reaches a simulator launchd `SIGTRAP`.
+Those observations do not establish complete gesture or lock-screen support.
+
+The [full local suite](../tmp/terminal-launchd-tests/full-suite.log) passed and the native build succeeded. The subsequent
+[icon-launch defaults regression](../tmp/terminal-launchd-tests/broker-icon-default.log) passed as well. The new Fish tab's
+launchd-owned path still needs device verification; earlier direct-terminal Fish results are recorded separately in
+[the fake-terminal notes](fake-pty.md#device-checks-and-diagnostics).

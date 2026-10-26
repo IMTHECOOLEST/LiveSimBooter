@@ -280,7 +280,8 @@
 #ifndef LSB_TERMINAL_SCREEN_TESTING
 @implementation LSBTerminalView {
     UITextView *_display;
-    UIView *_accessory;
+    UILabel *_status;
+    UIView *_controls;
     LSBTerminalScreen *_screen;
     UIFont *_font;
     CGFloat _cellWidth, _cellHeight;
@@ -307,15 +308,25 @@
         _display.textContainer.lineBreakMode = NSLineBreakByClipping;
         _display.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:_display];
+        _status = [UILabel new];
+        _status.textColor = UIColor.lightGrayColor;
+        _status.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+        _status.adjustsFontForContentSizeCategory = YES;
+        _status.numberOfLines = 2;
+        [self addSubview:_status];
         [self addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(focusTerminal:)]];
-        [self buildAccessory];
+        [self buildControls];
     }
     return self;
 }
 
-- (void)buildAccessory {
-    UIInputView *accessory = [[UIInputView alloc] initWithFrame:CGRectMake(0, 0, 400, 44) inputViewStyle:UIInputViewStyleKeyboard];
-    UIStackView *stack = [[UIStackView alloc] initWithFrame:accessory.bounds];
+- (void)buildControls {
+    // Keep shortcuts inside the terminal's safe-area/keyboard constraints. A system inputAccessoryView can sit under a floating tab bar.
+    UIView *controls = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 400, 44)];
+    controls.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1];
+    controls.userInteractionEnabled = NO;
+    controls.alpha = 0.5;
+    UIStackView *stack = [[UIStackView alloc] initWithFrame:controls.bounds];
     stack.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     stack.distribution = UIStackViewDistributionFillEqually;
     NSArray *labels = @[@"Esc", @"Tab", @"^C", @"^D", @"←", @"↓", @"↑", @"→", @"↵"];
@@ -324,16 +335,16 @@
         [button setTitle:labels[index] forState:UIControlStateNormal];
         button.titleLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightMedium];
         button.tag = (NSInteger)index;
-        [button addTarget:self action:@selector(accessoryPressed:) forControlEvents:UIControlEventTouchUpInside];
+        [button addTarget:self action:@selector(controlPressed:) forControlEvents:UIControlEventTouchUpInside];
         [stack addArrangedSubview:button];
     }
-    [accessory addSubview:stack];
-    _accessory = accessory;
+    [controls addSubview:stack];
+    [self addSubview:controls];
+    _controls = controls;
 }
 
-- (BOOL)canBecomeFirstResponder { return YES; }
+- (BOOL)canBecomeFirstResponder { return self.inputHandler != nil; }
 - (BOOL)hasText { return YES; }
-- (UIView *)inputAccessoryView { return _accessory; }
 - (UIKeyboardType)keyboardType { return UIKeyboardTypeASCIICapable; }
 - (UIKeyboardAppearance)keyboardAppearance { return UIKeyboardAppearanceDark; }
 - (UITextAutocorrectionType)autocorrectionType { return UITextAutocorrectionTypeNo; }
@@ -351,7 +362,7 @@
 - (void)insertText:(NSString *)text { [self sendString:[text stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"]]; }
 - (void)deleteBackward { [self sendString:@"\177"]; }
 
-- (void)accessoryPressed:(UIButton *)button {
+- (void)controlPressed:(UIButton *)button {
     NSArray *sequences = @[@"\033", @"\t", @"\003", @"\004", @"\033[D", @"\033[B", @"\033[A", @"\033[C", @"\r"];
     if ((NSUInteger)button.tag < sequences.count) [self sendString:sequences[(NSUInteger)button.tag]];
 }
@@ -403,11 +414,37 @@
     [self render];
 }
 
+- (void)setInputHandler:(void (^)(NSData *data))inputHandler {
+    _inputHandler = [inputHandler copy];
+    _controls.userInteractionEnabled = _inputHandler != nil;
+    _controls.alpha = _inputHandler ? 1 : 0.5;
+    if (!_inputHandler) [self resignFirstResponder];
+}
+
+- (void)setStatusText:(NSString *)statusText {
+    if ([_statusText isEqualToString:statusText]) return;
+    _statusText = [statusText copy];
+    _status.text = statusText;
+    _status.hidden = !statusText.length;
+    [self setNeedsLayout];
+}
+
+- (void)setResizeHandler:(void (^)(unsigned short rows, unsigned short columns))resizeHandler {
+    _resizeHandler = [resizeHandler copy];
+    // A new launchd terminal can attach after this view was laid out. Publish the existing geometry without needing a size change.
+    if (_resizeHandler) _resizeHandler((unsigned short)_screen.rows, (unsigned short)_screen.columns);
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
-    _display.frame = self.bounds;
+    CGFloat statusHeight = self.statusText.length ? ceil([_status sizeThatFits:CGSizeMake(MAX(0, self.bounds.size.width - 16), CGFLOAT_MAX)].height) + 16 : 0;
+    statusHeight = MIN(statusHeight, self.bounds.size.height);
+    _status.frame = CGRectMake(8, 8, MAX(0, self.bounds.size.width - 16), MAX(0, statusHeight - 16));
+    CGFloat controlsHeight = MIN(44, MAX(0, self.bounds.size.height - statusHeight));
+    _controls.frame = CGRectMake(0, self.bounds.size.height - controlsHeight, self.bounds.size.width, controlsHeight);
+    _display.frame = CGRectMake(0, statusHeight, self.bounds.size.width, MAX(0, self.bounds.size.height - statusHeight - controlsHeight));
     NSUInteger columns = MAX(1, (NSInteger)((self.bounds.size.width - 16) / _cellWidth));
-    NSUInteger rows = MAX(1, (NSInteger)((self.bounds.size.height - 16) / _cellHeight));
+    NSUInteger rows = MAX(1, (NSInteger)((_display.bounds.size.height - 16) / _cellHeight));
     columns = MIN(columns, 400); rows = MIN(rows, 200);
     if (rows != _screen.rows || columns != _screen.columns) {
         [_screen resizeRows:rows columns:columns];

@@ -12,8 +12,8 @@
 #include <unistd.h>
 
 // Keep the initial service selection bounded independently of slots needed later for apps, helpers and adopted children.
-// Backboardd and cfprefsd are always direct launchd children alongside the selected services.
-enum { BaselineLaunchdChildren = 2, MaximumSelectedServices = 14 };
+// Backboardd, cfprefsd and the terminal helper are direct launchd children alongside the selected services.
+enum { BaselineLaunchdChildren = 3, MaximumSelectedServices = 14 };
 _Static_assert(BaselineLaunchdChildren + MaximumSelectedServices < LSB_CHILD_STATUS_CAPACITY, "leave child-ledger slots for dynamic jobs");
 
 static int openDirectory(int parent, const char *name) {
@@ -152,7 +152,8 @@ static BOOL validGuestProgram(NSString *path) {
 static int addServiceJobs(NSString *root, const char *const labels[], NSMutableDictionary<NSString *, NSData *> *jobs,
                          NSMutableArray<NSString *> *logs) {
     if (!labels) return EINVAL;
-    NSMutableSet<NSString *> *seen = [NSMutableSet setWithArray:@[@"com.apple.backboardd", @"com.apple.cfprefsd.xpc.daemon"]];
+    NSMutableSet<NSString *> *seen = [NSMutableSet setWithArray:
+        @[@"com.apple.backboardd", @"com.apple.cfprefsd.xpc.daemon", @"com.kdt.LiveSimBooter.terminal-fish"]];
     for (unsigned index = 0; labels[index]; ++index) {
         if (index == MaximumSelectedServices) return E2BIG;
         const char *labelBytes = labels[index];
@@ -404,6 +405,16 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
                     format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
                 if (!preferencesPlist) return EINVAL;
                 jobPlists[preferencesName] = preferencesPlist;
+                // Launchd owns the job and its stable logical PID across xpcproxy -> helper -> Fish SETEXEC transitions.
+                // The broker attaches the terminal only to this exact helper after authenticating the launchd lineage.
+                NSDictionary *terminalJob = @{
+                    @"Label": @"com.kdt.LiveSimBooter.terminal-fish", @"ProgramArguments": @[@"/usr/libexec/terminal-fish"],
+                    @"WorkingDirectory": @"/private/var/mobile/", @"RunAtLoad": @YES, @"KeepAlive": @NO, @"EnableTransactions": @NO
+                };
+                NSData *terminalPlist = [NSPropertyListSerialization dataWithPropertyList:terminalJob
+                    format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+                if (!terminalPlist) return EINVAL;
+                jobPlists[@"com.kdt.LiveSimBooter.terminal-fish.plist"] = terminalPlist;
             }
         }
         if (services) {

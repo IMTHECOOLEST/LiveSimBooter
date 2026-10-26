@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "IndigoHIDTypes.h"
 
 static inline CGRect LSBDisplayViewport(CGRect bounds, CGSize pixels) {
     if (!isfinite(bounds.origin.x) || !isfinite(bounds.origin.y) || !isfinite(bounds.size.width) || !isfinite(bounds.size.height) ||
@@ -27,6 +28,24 @@ static inline bool LSBDisplayNormalize(CGRect viewport, CGPoint point, bool begi
     if (!isfinite(x) || !isfinite(y) || (beginning && (x < 0 || x > 1 || y < 0 || y > 1))) return false;
     *normalized = CGPointMake(fmax(0, fmin(1, x)), fmax(0, fmin(1, y)));
     return true;
+}
+
+// Unlike Simulator's outside-image mouse inset, this band accepts only touches inside our displayed image.
+// Use host points for touch targets, capped at 5% of the shorter image dimension when zoomed out.
+static inline LSBIndigoTouchEdge LSBDisplayBeginningEdge(CGRect viewport, CGPoint point) {
+    CGPoint normalized;
+    if (!LSBDisplayNormalize(viewport, point, true, &normalized)) return LSBIndigoTouchEdgeNone;
+    CGFloat band = fmin(12, fmin(viewport.size.width, viewport.size.height) * 0.05);
+    CGFloat x = point.x - viewport.origin.x, y = point.y - viewport.origin.y;
+    CGFloat distance = y;
+    LSBIndigoTouchEdge edge = LSBIndigoTouchEdgeTop;
+    CGFloat bottom = viewport.size.height - y;
+    if (bottom < distance) { distance = bottom; edge = LSBIndigoTouchEdgeBottom; }
+    CGFloat right = viewport.size.width - x;
+    if (x < distance) { distance = x; edge = LSBIndigoTouchEdgeLeft; }
+    if (right < distance) { distance = right; edge = LSBIndigoTouchEdgeRight; }
+    // Strict comparisons above give vertical edges priority at corner ties.
+    return distance <= band ? edge : LSBIndigoTouchEdgeNone;
 }
 
 static inline int LSBDisplayBGRALayout(size_t width, size_t height, size_t stride, size_t allocation, size_t *rowBytes, size_t *copyBytes) {

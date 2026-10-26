@@ -75,16 +75,17 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -fblocks -DL
     Tests/ProcessEventsTests.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -o "$test_directory/ProcessEvents"
 "$test_directory/ProcessEvents"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -fblocks -dynamiclib -DLSB_CHILD_WAIT_TESTING \
+    -DLSB_PROCESS_EVENTS_TEST_INSPECTION \
     Guest/ProcessEvents.c Guest/ProcessIdentity.c Guest/ChildWait.c ProcessSupport/ChildStatus.c \
     -install_name "$test_directory/libProcessEvents.dylib" -o "$test_directory/libProcessEvents.dylib"
-xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -fblocks \
     Tests/ProcessEventsInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessEventsInterpose"
 DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessEventsInterpose"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ProcessIdentityInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessIdentityInterpose"
 LSB_GUEST_PID=2147483000 DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessIdentityInterpose"
 identity_runtime="$(cd "$test_directory" && pwd -P)/IdentityRuntimeRoot"
-for identity_name in BaseBoard RunningBoardServices FrontBoard UIKitCore FrontBoardServices; do
+for identity_name in BaseBoard RunningBoardServices FrontBoard UIKitCore FrontBoardServices BackBoardServices; do
     identity_framework="$identity_runtime/System/Library/PrivateFrameworks/$identity_name.framework"
     identity_unrelated="$identity_runtime/Plugins/$identity_name"
     mkdir -p "$identity_framework" "$identity_runtime/Plugins"
@@ -287,6 +288,9 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -
     Tests/TerminalSessionTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/TerminalSession"
 "$test_directory/TerminalSession"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/TerminalFishTests.c -o "$test_directory/TerminalFish"
+"$test_directory/TerminalFish"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/TerminalScreenTests.m -framework Foundation -o "$test_directory/TerminalScreen"
 "$test_directory/TerminalScreen"

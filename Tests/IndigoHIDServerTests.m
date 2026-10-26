@@ -86,9 +86,108 @@ static void digitizerBackpressure(void) {
     assert(!mach_port_mod_refs(mach_task_self(), events, MACH_PORT_RIGHT_RECEIVE, -1));
 }
 
+static void assertContact(const uint8_t *bytes, unsigned index, uint32_t mask, double x, double y, BOOL down) {
+    const uint8_t *payload = bytes + 32 + index * 148;
+    assert(uintAt(payload, 24) == mask && doubleAt(payload, 28) == x && doubleAt(payload, 36) == y);
+    assert(uintAt(payload, 68) == (unsigned)down && uintAt(payload, 72) == (unsigned)down);
+}
+
+static void edgeGestures(void) {
+    int error;
+    LSBIndigoHIDServer *server = [[LSBIndigoHIDServer alloc] initWithError:&error];
+    assert(server && !error);
+    mach_port_t events = receivePort();
+    audit_token_t audit = ownAudit();
+    [server authorizeClientWithAuditToken:&audit];
+    registerClient(server.registrationPort, events, 0);
+    awaitRegistration(server);
+    receiveDigitizer(events);
+    uint8_t bytes[4096];
+    // Captured from the installed SimulatorKit mouse factory, including the origin bits on its final up.
+    const uint32_t masks[] = {0, 0x02040000, 0x08040000, 0x01040000, 0x04040000};
+    assert([server sendTouch:1 phase:LSBIndigoTouchBegan x:0.5 y:1 edge:(LSBIndigoTouchEdge)5] == EINVAL);
+    assert([server sendTouch:1 phase:LSBIndigoTouchBegan x:0.5 y:1 edge:(LSBIndigoTouchEdge)-1] == EINVAL);
+    for (unsigned edge = 0; edge <= 4; ++edge) {
+        assert(![server sendTouch:1 phase:LSBIndigoTouchBegan x:0.5 y:1 edge:(LSBIndigoTouchEdge)edge]);
+        receiveTouches(events, bytes, 2);
+        assertContact(bytes, 0, masks[edge] | 3, 0.5, 1, YES);
+        assertContact(bytes, 1, masks[edge] | 3, 0.5, 1, YES);
+        uint32_t identity = uintAt(bytes, 32 + 148 + 20);
+        assert([server sendTouch:1 phase:LSBIndigoTouchMoved x:0.5 y:0.5 edge:LSBIndigoTouchEdgeTop] == EINVAL);
+        assert(![server sendTouch:1 phase:LSBIndigoTouchMoved x:0.5 y:0.5]);
+        receiveTouches(events, bytes, 2);
+        assertContact(bytes, 0, masks[edge] | 4, 0.5, 0.5, YES);
+        assertContact(bytes, 1, masks[edge] | 4, 0.5, 0.5, YES);
+        assert(uintAt(bytes, 32 + 148 + 20) == identity);
+        assert(![server sendTouch:1 phase:LSBIndigoTouchEnded x:0.5 y:0.5]);
+        receiveTouches(events, bytes, 2);
+        assertContact(bytes, 0, masks[edge] | 3, 0.5, 0.5, NO);
+        assertContact(bytes, 1, masks[edge] | 3, 0.5, 0.5, NO);
+    }
+    assert(![server sendTouch:10 phase:LSBIndigoTouchBegan x:0.5 y:1 edge:LSBIndigoTouchEdgeBottom]);
+    receiveTouches(events, bytes, 2);
+    assert(![server sendTouch:20 phase:LSBIndigoTouchBegan x:1 y:0.5 edge:LSBIndigoTouchEdgeRight]);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 0x04040003, 1, 0.5, YES);
+    assertContact(bytes, 1, 0x01040000, 0.5, 1, YES); // An unchanged sibling retains its own origin, without phase changes.
+    assertContact(bytes, 2, 0x04040003, 1, 0.5, YES);
+    assert(![server sendTouch:10 phase:LSBIndigoTouchEnded x:0.5 y:0.5]);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 0x01040003, 0.5, 0.5, YES); // The other finger keeps the collection active.
+    assertContact(bytes, 1, 0x01040003, 0.5, 0.5, NO);
+    assertContact(bytes, 2, 0x04040000, 1, 0.5, YES);
+    assert(![server sendTouch:30 phase:LSBIndigoTouchBegan x:0.5 y:0.5]);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 3, 0.5, 0.5, YES); // Slot reuse does not retain the previous bottom origin.
+    assertContact(bytes, 1, 3, 0.5, 0.5, YES);
+    assert(![server sendTouch:30 phase:LSBIndigoTouchMoved x:0.5 y:1]);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 4, 0.5, 1, YES); // Reaching an edge later does not create a system gesture.
+    assertContact(bytes, 1, 4, 0.5, 1, YES);
+    assert(![server cancelTouches]);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 0x83, 0.5, 1, NO);
+    assertContact(bytes, 1, 0x83, 0.5, 1, NO);
+    assertContact(bytes, 2, 0x04040083, 1, 0.5, NO);
+
+    mach_port_limits_t limits = {.mpl_qlimit = 1};
+    assert(!mach_port_set_attributes(mach_task_self(), events, MACH_PORT_LIMITS_INFO, (mach_port_info_t)&limits, MACH_PORT_LIMITS_INFO_COUNT));
+    assert(![server sendTouch:40 phase:LSBIndigoTouchBegan x:0.5 y:1 edge:LSBIndigoTouchEdgeBottom]);
+    assert([server sendTouch:50 phase:LSBIndigoTouchBegan x:0.5 y:0 edge:LSBIndigoTouchEdgeTop] == EAGAIN);
+    receiveTouches(events, bytes, 2);
+    uint32_t identity = uintAt(bytes, 32 + 148 + 20);
+    assert(![server sendTouch:50 phase:LSBIndigoTouchBegan x:1 y:0.5 edge:LSBIndigoTouchEdgeRight]);
+    assert([server sendTouch:40 phase:LSBIndigoTouchMoved x:0.5 y:0.25] == EAGAIN);
+    assert([server cancelTouches] == EAGAIN);
+    receiveTouches(events, bytes, 3);
+    assertContact(bytes, 0, 0x04040003, 1, 0.5, YES); // Failed top begin never latched its origin.
+    receiveTouches(events, bytes, 3); // Cancellation retries preserve the last successfully delivered coordinates and edges.
+    assertContact(bytes, 0, 0x01040083, 0.5, 1, NO);
+    assertContact(bytes, 1, 0x01040083, 0.5, 1, NO);
+    assertContact(bytes, 2, 0x04040083, 1, 0.5, NO);
+    assert(uintAt(bytes, 32 + 148 + 20) == identity);
+    assert(![server sendTouch:40 phase:LSBIndigoTouchBegan x:0.5 y:0 edge:LSBIndigoTouchEdgeTop]);
+    receiveTouches(events, bytes, 2);
+    assert(![server sendTouch:40 phase:LSBIndigoTouchCancelled x:0.5 y:0.25]);
+    receiveTouches(events, bytes, 2);
+    assertContact(bytes, 0, 0x02040083, 0.5, 0.25, NO);
+    assertContact(bytes, 1, 0x02040083, 0.5, 0.25, NO);
+    [server authorizeClientWithAuditToken:NULL];
+    [server authorizeClientWithAuditToken:&audit];
+    registerClient(server.registrationPort, events, 0);
+    awaitRegistration(server);
+    receiveDigitizer(events);
+    assert(![server sendTouch:40 phase:LSBIndigoTouchBegan x:0.5 y:0]);
+    receiveTouches(events, bytes, 2);
+    assertContact(bytes, 0, 3, 0.5, 0, YES);
+    [server close];
+    assert(!mach_port_mod_refs(mach_task_self(), events, MACH_PORT_RIGHT_RECEIVE, -1));
+}
+
 int main(void) {
     alarm(15);
     @autoreleasepool {
+        edgeGestures();
         int error = 42;
         LSBIndigoHIDServer *server = [[LSBIndigoHIDServer alloc] initWithError:&error];
         assert(server && !error && MACH_PORT_VALID(server.registrationPort));

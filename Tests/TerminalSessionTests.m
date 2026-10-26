@@ -5,7 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void pumpUntil(BOOL (^finished)(void)) {
@@ -16,8 +18,108 @@ static void pumpUntil(BOOL (^finished)(void)) {
     assert(finished());
 }
 
+static void replacingStandardIO(void) {
+    char directory[] = "/tmp/LiveSimBooter-terminal-replace.XXXXXX";
+    assert(mkdtemp(directory));
+    int error = 0;
+    LSBTerminalSession *session = [[LSBTerminalSession alloc] initWithDirectory:[NSString stringWithUTF8String:directory] error:&error];
+    assert(session && !error && !session.closed);
+    LSBReceivedMessage *message = calloc(1, sizeof(*message));
+    assert(message);
+    for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
+    LSBSpawnPlan *plan = &message->plan;
+    plan->version = LSB_PLAN_VERSION;
+    plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    assert(!LSBPlanAddString(plan, "/bin/fish", &plan->path));
+    plan->argv[plan->argc++] = plan->path;
+    assert(!LSBPlanAddString(plan, directory, &plan->cwd));
+    assert(!LSBPlanAddString(plan, LSB_FAKE_PTY_ENV "=/wrong/first", &plan->envp[plan->envc++]));
+    assert(!LSBPlanAddString(plan, "UNCHANGED=value", &plan->envp[plan->envc++]));
+    assert(!LSBPlanAddString(plan, LSB_FAKE_PTY_ENV "=/wrong/second", &plan->envp[plan->envc++]));
+    int originalDirectory = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    assert(originalDirectory >= 0);
+    plan->fds[plan->fdCount++] = (LSBInheritedFD){7, FD_CLOEXEC};
+    message->fds[0] = originalDirectory;
+    plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_FCHDIR, .fd = 7};
+    plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_INHERIT, .fd = 7};
+    uint32_t nullPath;
+    assert(!LSBPlanAddString(plan, "/dev/null", &nullPath));
+    plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_OPEN, .fd = 1, .flags = O_WRONLY, .path = nullPath};
+    plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_DUP2, .fd = 1, .target = 2};
+    assert(!LSBValidateSpawnPlan(plan));
+    assert(![session attachToMessageReplacingStandardIO:message]);
+    assert(plan->fdCount == 2 && plan->actionCount == 8 && plan->envc == 2 && message->fds[0] == originalDirectory);
+    assert(!strcmp(plan->strings + plan->envp[0], "UNCHANGED=value"));
+    NSString *expected = [@LSB_FAKE_PTY_ENV "=" stringByAppendingString:session.statePath];
+    assert(!strcmp(plan->strings + plan->envp[1], expected.UTF8String));
+    assert(plan->actions[4].kind == LSB_ACTION_DUP2 && plan->actions[4].fd == 8 && plan->actions[7].kind == LSB_ACTION_CLOSE);
+    assert([session attachToMessageReplacingStandardIO:message] == EINVAL);
+    int stateFD = open(session.statePath.fileSystemRepresentation, O_RDWR);
+    assert(stateFD >= 0);
+    LSBFakePTYState *state = mmap(NULL, LSB_FAKE_PTY_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, stateFD, 0);
+    assert(state != MAP_FAILED);
+    close(stateFD);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        if (LSBApplySpawnPlan(plan, message->fds)) _exit(81);
+        for (int fd = 0; fd < 3; ++fd) if (!LSBFakePTYMatchesFD(state, fd)) _exit(82);
+        if (fcntl(7, F_GETFD) < 0 || fcntl(8, F_GETFD) >= 0) _exit(83);
+        if (write(1, "attached\n", 9) != 9 || write(2, "stderr\n", 7) != 7) _exit(84);
+        const char failure[] = "terminal-fish: Fish replacement failed: Exec format error\n";
+        if (write(2, failure, sizeof(failure) - 1) != (ssize_t)sizeof(failure) - 1) _exit(85);
+        _exit(127);
+    }
+    for (unsigned i = 0; i < plan->fdCount; ++i) close(message->fds[i]);
+    __block NSMutableData *output = [NSMutableData new];
+    __block unsigned closedNotifications = 0;
+    id observer = [NSNotificationCenter.defaultCenter addObserverForName:LSBTerminalSessionDidCloseNotification object:session queue:nil
+        usingBlock:^(NSNotification *notification) { (void)notification; ++closedNotifications; }];
+    [session start];
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 127);
+    pumpUntil(^BOOL { return session.closed; });
+    // A late/hidden UI still receives startup and final output even after the shell's endpoint reached EOF.
+    assert(!output.length && closedNotifications == 1);
+    session.outputHandler = ^(NSData *bytes) { [output appendData:bytes]; };
+    assert([output isEqualToData:[@"attached\r\nstderr\r\nterminal-fish: Fish replacement failed: Exec format error\r\n"
+        dataUsingEncoding:NSUTF8StringEncoding]]);
+    session.outputHandler = nil;
+    session.outputHandler = ^(NSData *bytes) { (void)bytes; assert(false && "Backlog must be delivered exactly once"); };
+    [NSNotificationCenter.defaultCenter removeObserver:observer];
+    munmap(state, LSB_FAKE_PTY_MAP_SIZE);
+    free(message);
+    assert(!rmdir(directory));
+}
+
+static void replacementFailureIsAtomic(void) {
+    char directory[] = "/tmp/LiveSimBooter-terminal-atomic.XXXXXX";
+    assert(mkdtemp(directory));
+    int error = 0;
+    LSBTerminalSession *session = [[LSBTerminalSession alloc] initWithDirectory:[NSString stringWithUTF8String:directory] error:&error];
+    assert(session && !error);
+    LSBReceivedMessage *message = calloc(1, sizeof(*message)), *before = malloc(sizeof(*before));
+    assert(message && before);
+    message->plan.version = LSB_PLAN_VERSION;
+    assert(!LSBPlanAddString(&message->plan, "/bin/fish", &message->plan.path));
+    message->plan.argv[message->plan.argc++] = message->plan.path;
+    assert(!LSBPlanAddString(&message->plan, directory, &message->plan.cwd));
+    message->plan.actionCount = LSB_MAX_ACTIONS - 3;
+    for (unsigned i = 0; i < message->plan.actionCount; ++i) message->plan.actions[i] = (LSBFileAction){.kind = LSB_ACTION_INHERIT, .fd = 0};
+    memcpy(before, message, sizeof(*message));
+    assert([session attachToMessageReplacingStandardIO:message] == E2BIG && !memcmp(before, message, sizeof(*message)));
+    message->plan.actionCount = 0;
+    assert(![session attachToMessageReplacingStandardIO:message]); // Failure did not consume the pending slave.
+    close(message->fds[0]);
+    [session close];
+    free(message); free(before);
+    assert(!rmdir(directory));
+}
+
 int main(void) {
     @autoreleasepool {
+        replacingStandardIO();
+        replacementFailureIsAtomic();
         char directory[] = "/tmp/LiveSimBooter-terminal-session.XXXXXX";
         assert(mkdtemp(directory));
         int error = 0;

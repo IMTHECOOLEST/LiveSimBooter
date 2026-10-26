@@ -1,4 +1,5 @@
 #include "FakePTY.h"
+#include "ProcessSession.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -69,8 +70,9 @@ pid_t LSBPTYGetForeground(int fd) {
     pid_t foreground;
     int error = LSBFakePTYGetForeground(terminal, &foreground);
     if (!error && !foreground) {
-        foreground = getpgrp();
-        error = LSBFakePTYSetForeground(terminal, foreground);
+        // Calls within this interposing dylib do not pass through its getpgrp interposition. Use the guest session explicitly.
+        foreground = LSBGuestProcessGroup();
+        error = foreground < 0 ? errno : LSBFakePTYSetForeground(terminal, foreground);
     }
     if (error) { errno = error; return -1; }
     errno = saved;

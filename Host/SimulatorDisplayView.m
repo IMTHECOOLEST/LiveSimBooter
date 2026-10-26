@@ -62,12 +62,13 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     CGSize _pixelSize;
     CGRect _viewport;
     uint64_t _nextTouchIdentifier, _presentationGeneration;
-    BOOL _applicationActive, _captureFirstFrame, _captureAttempted;
+    BOOL _applicationActive, _captureFirstFrame, _captureAttempted, _presentationEnabled;
 }
 @end
 
 @implementation LSBSimulatorDisplayView
 @synthesize indigoServer = _indigoServer;
+@synthesize presentationEnabled = _presentationEnabled;
 
 - (instancetype)initWithFrame:(CGRect)frame {
     if ((self = [super initWithFrame:frame])) [self initializeDisplay];
@@ -84,6 +85,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     self.opaque = YES;
     self.clipsToBounds = YES;
     self.multipleTouchEnabled = YES;
+    _presentationEnabled = YES;
     _touches = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
                                     valueOptions:NSPointerFunctionsStrongMemory];
     _applicationActive = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
@@ -105,6 +107,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     }
     _displayLayer = layer;
     _renderer = renderer;
+    renderer.presentationEnabled = _presentationEnabled;
     [self.layer addSublayer:layer];
     return 0;
 }
@@ -124,6 +127,14 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     if (_indigoServer == indigoServer) return;
     [self cancelActiveTouches];
     _indigoServer = indigoServer;
+}
+
+- (void)setPresentationEnabled:(BOOL)enabled {
+    NSAssert(NSThread.isMainThread, @"Simulator display must be used on the main thread");
+    if (!NSThread.isMainThread || _presentationEnabled == enabled) return;
+    _presentationEnabled = enabled;
+    if (!enabled) [self cancelActiveTouches];
+    _renderer.presentationEnabled = enabled;
 }
 
 - (void)resetPresentation {
@@ -251,14 +262,17 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)event;
-    if (!_indigoServer || !_renderer.hasFrame || !_applicationActive || !self.window || self.hidden || !self.userInteractionEnabled) return;
+    if (!_indigoServer || !_renderer.hasFrame || !_presentationEnabled || !_applicationActive || !self.window || self.hidden ||
+        !self.userInteractionEnabled) return;
     [self layoutIfNeeded];
     for (UITouch *touch in touches) {
         if (touch.view != self || [_touches objectForKey:touch] || _touches.count == 16) continue;
         CGPoint normalized;
-        if (!LSBDisplayNormalize(_viewport, [touch locationInView:self], true, &normalized)) continue;
+        CGPoint location = [touch locationInView:self];
+        if (!LSBDisplayNormalize(_viewport, location, true, &normalized)) continue;
         uint64_t identifier = [self nextTouchIdentifier];
-        if (![_indigoServer sendTouch:identifier phase:LSBIndigoTouchBegan x:normalized.x y:normalized.y]) {
+        LSBIndigoTouchEdge edge = LSBDisplayBeginningEdge(_viewport, location);
+        if (![_indigoServer sendTouch:identifier phase:LSBIndigoTouchBegan x:normalized.x y:normalized.y edge:edge]) {
             [_touches setObject:@(identifier) forKey:touch];
         }
     }

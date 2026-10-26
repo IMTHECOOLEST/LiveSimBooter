@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+NSString *const LSBTerminalSessionDidCloseNotification = @"LSBTerminalSessionDidClose";
+
 @interface LSBTerminalSession () {
     int _master, _slave, _stateFD, _consoleFD;
     LSBFakePTYState *_state;
@@ -19,6 +21,7 @@
     dispatch_source_t _reader, _writer, _consoleReader;
     dispatch_group_t _masterRegistrations;
     NSMutableData *_pendingInput;
+    NSMutableData *_unclaimedOutput;
     NSString *_inputPath;
     BOOL _started, _closed;
     uint32_t _inputFlush;
@@ -46,6 +49,7 @@ static int terminalSignal(void *context, pid_t group, int number) {
     if (!(self = [super init])) { *error = ENOMEM; return nil; }
     _master = _slave = _stateFD = _consoleFD = -1;
     _pendingInput = [NSMutableData new];
+    _unclaimedOutput = [NSMutableData new];
     _masterRegistrations = dispatch_group_create();
     char path[PATH_MAX];
     int length = snprintf(path, sizeof(path), "%s/.terminal.XXXXXX", directory.fileSystemRepresentation);
@@ -92,6 +96,56 @@ static int terminalSignal(void *context, pid_t group, int number) {
     }
     close(_slave); _slave = -1;
     return 0;
+}
+
+- (BOOL)isClosed { return _closed; }
+
+- (int)attachToMessageReplacingStandardIO:(LSBReceivedMessage *)message {
+    if (_closed || _slave < 0 || !message) return EINVAL;
+    int error = LSBValidateSpawnPlan(&message->plan);
+    if (error) return error;
+    if (message->plan.fdCount == LSB_MAX_FDS || message->plan.actionCount > LSB_MAX_ACTIONS - 4) return E2BIG;
+    // No existing descriptor/action may name the staging slot. All original operations run before the final stdio override.
+    int highest = STDERR_FILENO;
+    for (unsigned i = 0; i < message->plan.fdCount; ++i) highest = MAX(highest, message->plan.fds[i].number);
+    for (unsigned i = 0; i < message->plan.actionCount; ++i) {
+        const LSBFileAction *action = &message->plan.actions[i];
+        if (action->kind != LSB_ACTION_CHDIR) highest = MAX(highest, action->fd);
+        if (action->kind == LSB_ACTION_DUP2) highest = MAX(highest, action->target);
+    }
+    int staging = highest + 1;
+    if (staging >= getdtablesize() - (int)message->plan.fdCount - 1) return EMFILE;
+    LSBSpawnPlan *plan = malloc(sizeof(*plan));
+    if (!plan) return ENOMEM;
+    memcpy(plan, &message->plan, sizeof(*plan));
+    // Replace every inherited spelling; the job cannot select another terminal state file through its environment.
+    unsigned count = 0;
+    for (unsigned i = 0; i < plan->envc; ++i)
+        if (strncmp(plan->strings + plan->envp[i], LSB_FAKE_PTY_ENV "=", sizeof(LSB_FAKE_PTY_ENV))) plan->envp[count++] = plan->envp[i];
+    plan->envc = count;
+    char environment[PATH_MAX + 32];
+    int length = snprintf(environment, sizeof(environment), LSB_FAKE_PTY_ENV "=%s", self.statePath.fileSystemRepresentation);
+    if (length < 0 || (size_t)length >= sizeof(environment)) error = ENAMETOOLONG;
+    if (!error && plan->envc == LSB_MAX_VECTOR) error = E2BIG;
+    if (!error) error = LSBPlanAddString(plan, environment, &plan->envp[plan->envc]);
+    if (!error) {
+        ++plan->envc;
+        plan->fds[plan->fdCount++] = (LSBInheritedFD){staging, FD_CLOEXEC};
+        for (int target = STDIN_FILENO; target <= STDERR_FILENO; ++target)
+            plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_DUP2, .fd = staging, .target = target};
+        plan->actions[plan->actionCount++] = (LSBFileAction){.kind = LSB_ACTION_CLOSE, .fd = staging};
+        error = LSBValidateSpawnPlan(plan);
+    }
+    int duplicate = error ? -1 : fcntl(_slave, F_DUPFD_CLOEXEC, 3);
+    if (!error && duplicate < 0) error = errno;
+    if (!error) {
+        message->fds[message->plan.fdCount] = duplicate;
+        memcpy(&message->plan, plan, sizeof(*plan));
+        close(_slave);
+        _slave = -1;
+    }
+    free(plan);
+    return error;
 }
 
 - (void)start {
@@ -201,10 +255,28 @@ static int terminalSignal(void *context, pid_t group, int number) {
     return 0;
 }
 - (void)emitOutput:(const void *)bytes length:(size_t)length {
-    if (self.outputHandler) self.outputHandler([NSData dataWithBytes:bytes length:length]);
+    if (_outputHandler) _outputHandler([NSData dataWithBytes:bytes length:length]);
+    else {
+        // Preserve startup/EOF output until the UI binds, with a fixed backlog cap for a disconnected or recreated scene.
+        const NSUInteger capacity = 256 * 1024;
+        if (length >= capacity) [_unclaimedOutput setData:[NSData dataWithBytes:(const char *)bytes + length - capacity length:capacity]];
+        else {
+            NSUInteger excess = _unclaimedOutput.length + length > capacity ? _unclaimedOutput.length + length - capacity : 0;
+            if (excess) [_unclaimedOutput replaceBytesInRange:NSMakeRange(0, excess) withBytes:NULL length:0];
+            [_unclaimedOutput appendBytes:bytes length:length];
+        }
+    }
     // Preserve the raw terminal stream in a connected devicectl console for reproducible diagnostics.
     if (length) fwrite(bytes, 1, length, stdout);
     fflush(stdout);
+}
+- (void)setOutputHandler:(void (^)(NSData *data))outputHandler {
+    _outputHandler = [outputHandler copy];
+    if (_outputHandler && _unclaimedOutput.length) {
+        NSData *pending = [_unclaimedOutput copy];
+        [_unclaimedOutput setLength:0];
+        _outputHandler(pending);
+    }
 }
 - (int)sendInput:(NSData *)data {
     if (_closed) return EIO;
@@ -239,6 +311,7 @@ static int terminalSignal(void *context, pid_t group, int number) {
     _state = NULL;
     if (self.statePath) unlink(self.statePath.fileSystemRepresentation);
     if (_inputPath) unlink(_inputPath.fileSystemRepresentation);
+    [NSNotificationCenter.defaultCenter postNotificationName:LSBTerminalSessionDidCloseNotification object:self];
 }
 - (void)dealloc { [self close]; }
 @end
