@@ -72,6 +72,12 @@ static void expect(const char *enabled, const char *root, const char *candidate,
     if (requested) assert(registeredFlags == 2);
 }
 
+static void expectRoles(const char *root, const char *backboardd, const char *springboard, const char *iconservices, int error, bool shouldRequest) {
+    expect("1", root, backboardd, error, shouldRequest);
+    expect("1", root, springboard, error, shouldRequest);
+    expect("1", root, iconservices, error, shouldRequest);
+}
+
 int main(void) {
     char temporary[] = "/tmp/LiveSimBooter-metal-compiler.XXXXXX", canonical[PATH_MAX];
     assert(mkdtemp(temporary) && realpath(temporary, canonical));
@@ -79,6 +85,11 @@ int main(void) {
     join(root, canonical, "RuntimeRoot");
     join(directory, root, "usr/libexec"); makeDirectory(directory);
     join(executable, directory, "backboardd"); makeFile(executable);
+    char springboard[PATH_MAX], springboardDirectory[PATH_MAX];
+    join(springboardDirectory, root, "System/Library/CoreServices/SpringBoard.app"); makeDirectory(springboardDirectory);
+    join(springboard, springboardDirectory, "SpringBoard"); makeFile(springboard);
+    char iconservices[PATH_MAX];
+    join(iconservices, root, "System/Library/CoreServices/iconservicesagent"); makeFile(iconservices);
     join(bundle, root, "System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc"); makeDirectory(bundle);
     join(info, bundle, "Info.plist"); makeFile(info);
     join(compiler, bundle, "MTLCompilerService"); makeFile(compiler);
@@ -100,9 +111,25 @@ int main(void) {
     expect("1", alias, candidate, 0, true);
     assert(!strcmp(registeredPath, bundle));
 
+    expect("1", root, springboard, 0, true);
+    assert(!strcmp(registeredPath, bundle));
+    join(candidate, alias, "System/Library/CoreServices/SpringBoard.app/SpringBoard");
+    expect("1", alias, candidate, 0, true);
+    assert(!strcmp(registeredPath, bundle));
+    join(candidate, springboardDirectory, "SpringBoardOther"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+
+    expect("1", root, iconservices, 0, true);
+    assert(!strcmp(registeredPath, bundle));
+    join(candidate, alias, "System/Library/CoreServices/iconservicesagent");
+    expect("1", alias, candidate, 0, true);
+    assert(!strcmp(registeredPath, bundle));
+    join(candidate, root, "System/Library/CoreServices/iconservicesagent-other"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+
     // Inherited options never register compiler, proxy, launchd, unrelated, or merely prefix-matching executables.
     expect("1", root, compiler, 0, false);
-    const char *otherRoles[] = {"launchd_sim", "xpcproxy_sim", "backboardd-other", "df"};
+    const char *otherRoles[] = {"launchd_sim", "xpcproxy_sim", "backboardd-other", "SpringBoard", "iconservicesagent", "df"};
     for (unsigned i = 0; i < sizeof(otherRoles) / sizeof(*otherRoles); ++i) {
         join(candidate, directory, otherRoles[i]); makeFile(candidate);
         expect("1", root, candidate, 0, false);
@@ -114,29 +141,43 @@ int main(void) {
     assert(!unlink(executable) && !symlink(outsideFile, executable));
     expect("1", root, executable, 0, false);
     assert(!unlink(executable)); makeFile(executable);
+    char outsideSpringBoard[PATH_MAX];
+    join(outsideSpringBoard, outside, "System/Library/CoreServices/SpringBoard.app"); makeDirectory(outsideSpringBoard);
+    join(candidate, outsideSpringBoard, "SpringBoard"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+    assert(!unlink(springboard) && !symlink(candidate, springboard));
+    expect("1", root, springboard, 0, false);
+    assert(!unlink(springboard)); makeFile(springboard);
+
+    char outsideIconServices[PATH_MAX];
+    join(outsideIconServices, outside, "System/Library/CoreServices/iconservicesagent"); makeFile(outsideIconServices);
+    expect("1", root, outsideIconServices, 0, false);
+    assert(!unlink(iconservices) && !symlink(outsideIconServices, iconservices));
+    expect("1", root, iconservices, 0, false);
+    assert(!unlink(iconservices)); makeFile(iconservices);
 
     // A bundle symlink escaping the canonical root is rejected even if its target contains plausible files.
     char moved[PATH_MAX];
     join(moved, outside, "MTLCompilerService.xpc");
     assert(!rename(bundle, moved) && !symlink(moved, bundle));
-    expect("1", root, executable, EPERM, false);
+    expectRoles(root, executable, springboard, iconservices, EPERM, false);
     assert(!unlink(bundle));
-    expect("1", root, executable, ENOENT, false);
+    expectRoles(root, executable, springboard, iconservices, ENOENT, false);
     assert(!rename(moved, bundle));
 
     // Required files are regular, readable and nonempty; a final symlink or special file is not followed or blocked on.
-    assert(!unlink(info)); expect("1", root, executable, ENOENT, false);
-    assert(!symlink(outsideFile, info)); expect("1", root, executable, ELOOP, false);
-    assert(!unlink(info) && !mkdir(info, 0700)); expect("1", root, executable, EINVAL, false);
-    assert(!rmdir(info) && !mkfifo(info, 0600)); expect("1", root, executable, EINVAL, false);
+    assert(!unlink(info)); expectRoles(root, executable, springboard, iconservices, ENOENT, false);
+    assert(!symlink(outsideFile, info)); expectRoles(root, executable, springboard, iconservices, ELOOP, false);
+    assert(!unlink(info) && !mkdir(info, 0700)); expectRoles(root, executable, springboard, iconservices, EINVAL, false);
+    assert(!rmdir(info) && !mkfifo(info, 0600)); expectRoles(root, executable, springboard, iconservices, EINVAL, false);
     assert(!unlink(info)); makeFile(info);
-    assert(!truncate(compiler, 0)); expect("1", root, executable, EINVAL, false);
+    assert(!truncate(compiler, 0)); expectRoles(root, executable, springboard, iconservices, EINVAL, false);
     makeFile(compiler);
-    assert(!unlink(compiler)); expect("1", root, executable, ENOENT, false);
-    assert(!symlink(outsideFile, compiler)); expect("1", root, executable, ELOOP, false);
+    assert(!unlink(compiler)); expectRoles(root, executable, springboard, iconservices, ENOENT, false);
+    assert(!symlink(outsideFile, compiler)); expectRoles(root, executable, springboard, iconservices, ELOOP, false);
     assert(!unlink(compiler)); makeFile(compiler);
-    expect("1", root, executable, 0, true);
-    assert(registrations == 3);
+    expectRoles(root, executable, springboard, iconservices, 0, true);
+    assert(registrations == 9);
     removeTree(canonical);
     puts("MetalCompilerRegistration: opt-in, canonical executable roles, contained bundle, regular files and exact registration passed");
     return 0;

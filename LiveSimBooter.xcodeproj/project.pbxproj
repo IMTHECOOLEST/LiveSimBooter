@@ -76,6 +76,7 @@
 				Broker.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				FramebufferServer.m = "-fobjc-arc";
+				GuestEntitlementsConversion.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
 				IOSurfaceServer.m = "-fobjc-arc";
 				IndigoHIDServer.m = "-fobjc-arc";
@@ -133,6 +134,11 @@
 			path = LiveProcess;
 			sourceTree = "<group>";
 		};
+		E19A5B71308EE50100634F93 /* Guest */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Guest;
+			sourceTree = "<group>";
+		};
 		E19AD54D308A56D200634F93 /* LiveSimBooter */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -177,6 +183,7 @@
 		E19AD542308A56D200634F93 = {
 			isa = PBXGroup;
 			children = (
+				E19A5B71308EE50100634F93 /* Guest */,
 				E19AD584308BA95D00634F93 /* README.md */,
 				E19AD54D308A56D200634F93 /* LiveSimBooter */,
 				A9B7C4100000000000000009 /* Host */,

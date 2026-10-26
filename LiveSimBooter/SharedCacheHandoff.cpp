@@ -25,12 +25,16 @@
 // Modified 2026-10-24: switch to app-owned main-thread storage before cache removal and restore host TLS on failure.
 // Modified 2026-10-24: invoke the prepared simulator main wrapper and preserve its return status without host cleanup.
 // Modified 2026-10-24: transfer debugger notifications and preserve registered image metadata across cache removal.
+// Modified 2026-10-26: support a one-way switch to a guarded stack before dyld_sim replaces the native stack mapping.
+// Modified 2026-10-26: reserve the full simulator cache span so loose images cannot occupy gaps within its bounds.
 // Shared-region removal follows Apple's deallocateExistingSharedCache() at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/SharedCacheRuntime.cpp#L1230-L1243
 #include "SharedCacheHandoff.h"
 #include "DebuggerBridge.h"
+#include "LocalPOSIX.h"
 
 #include <errno.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 
 #if defined(LSB_SHARED_CACHE_HANDOFF_TESTING)
@@ -63,8 +67,44 @@ __attribute__((always_inline, no_stack_protector)) static inline int sharedRegio
 }
 #endif
 
+extern "C" [[noreturn]] __attribute__((noinline, no_stack_protector, visibility("hidden")))
+void LSBRunDyldSimOnPreparedStack(const LSBDyldSimLaunch *launch) {
+    if (launch->cacheSize) {
+        void *address = reinterpret_cast<void *>(launch->cacheAddress);
+        // Private cache mappings replace individual segments with MAP_FIXED and leave these inaccessible gaps owned.
+        // This must follow the stack switch: the native stack may occupy part of the declared cache reservation.
+        void *mapping = lsb::mmap(address, launch->cacheSize, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (mapping == MAP_FAILED || mapping != address) {
+            static constexpr char failed[] = "[dyld_sim] Cache reservation mmap failed; exiting before dyld entry.\n";
+            static constexpr char misplaced[] = "[dyld_sim] Cache reservation returned the wrong address; exiting before dyld entry.\n";
+            // One bounded attempt; stderr failure must not prevent the raw exit or enter host cleanup.
+            if (mapping == MAP_FAILED) (void)lsb::write(2, failed, sizeof(failed) - 1);
+            else (void)lsb::write(2, misplaced, sizeof(misplaced) - 1);
+            exitProcess(126);
+        }
+    }
+    uintptr_t startGlue = 0;
+    LSBDyldSimLaunch::Main main = launch->entry(launch->argc, launch->argv, launch->envp, launch->apple, launch->executable,
+                                              launch->dyld, launch->slide, launch->helpers, &startGlue);
+    if (!main) exitProcess(1);
+    // This loader accepts LC_MAIN executables. A legacy crt1 entry (startGlue == 0) requires a different stack ABI.
+    if (startGlue != 1) exitProcess(126);
+    int status = main(launch->argc, launch->argv, launch->envp, launch->apple);
+    // start_sim normally calls simulator exit(). If it returns, never enter unmapped host libc cleanup.
+    exitProcess(status);
+}
+
+// A new C frame begins after changing SP; no prologue, epilogue, authenticated return or old frame survives this bridge.
+extern "C" [[noreturn]] __attribute__((naked, noinline, no_stack_protector, visibility("hidden")))
+void LSBSwitchToSimulatorStack(const LSBDyldSimLaunch *, uintptr_t) {
+    __asm volatile("mov sp, x1\n\tmov x29, xzr\n\tmov x30, xzr\n\tb _LSBRunDyldSimOnPreparedStack");
+}
+
 __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
-    if (!launch || !launch->thread.hostTSD || !launch->thread.simulatorTSD || lsb::currentTSDBase() != launch->thread.hostTSD) return EINVAL;
+    if (!launch || !launch->thread.hostTSD || !launch->thread.simulatorTSD || (launch->stackTop & 15)) return EINVAL;
+    if ((!launch->cacheAddress != !launch->cacheSize) || (launch->cacheAddress & 4095) || (launch->cacheSize & 4095) ||
+        launch->cacheSize > UINTPTR_MAX - launch->cacheAddress) return EINVAL;
+    if (lsb::currentTSDBase() != launch->thread.hostTSD) return EINVAL;
     uint64_t existingCacheAddress = 0;
     int error = sharedRegionCheck(&existingCacheAddress);
     if (error && error != EINVAL && error != ENOMEM) return error;
@@ -90,14 +130,7 @@ __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(con
 
     if (lsb::finishDebuggerHandoff(hasCache)) exitProcess(126);
 
-    // All instructions in this function live in the executable. No host library may be called after the detach succeeds.
-    uintptr_t startGlue = 0;
-    LSBDyldSimLaunch::Main main = launch->entry(launch->argc, launch->argv, launch->envp, launch->apple, launch->executable,
-                                              launch->dyld, launch->slide, launch->helpers, &startGlue);
-    if (!main) exitProcess(1);
-    // This loader accepts LC_MAIN executables. A legacy crt1 entry (startGlue == 0) requires a different stack ABI.
-    if (startGlue != 1) exitProcess(126);
-    int status = main(launch->argc, launch->argv, launch->envp, launch->apple);
-    // start_sim normally calls simulator exit(). If it returns, never enter unmapped host libc cleanup.
-    exitProcess(status);
+    // The descriptor and all pointed-to startup storage must live outside the stack that cache mappings may replace.
+    if (launch->stackTop) LSBSwitchToSimulatorStack(launch, launch->stackTop);
+    LSBRunDyldSimOnPreparedStack(launch);
 }

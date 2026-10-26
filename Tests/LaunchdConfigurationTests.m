@@ -302,6 +302,81 @@ static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSS
     assert([snapshotDirectory(dataPath) isEqual:prior]);
 }
 
+static void testSpringBoardResources(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    NSString *program = @"/System/Library/CoreServices/SpringBoard.app/SpringBoard";
+    NSArray<NSDictionary *> *cases = @[
+        @{@"Label": @"com.apple.SpringBoard", @"ProgramArguments": @[program], @"expected": @YES},
+        @{@"Label": @"com.apple.SpringBoard", @"Program": program, @"expected": @YES},
+        @{@"Label": @"com.apple.SpringBoard", @"Program": program, @"ProgramArguments": @[@"different-argv0"], @"expected": @YES},
+        @{@"Label": @"com.apple.SpringBoard", @"Program": @"/bin/df", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": @"com.apple.SpringBoard", @"ProgramArguments": @[[program stringByAppendingString:@"Other"]], @"expected": @NO},
+        @{@"Label": @"com.apple.springboard", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": @"com.kdt.other", @"ProgramArguments": @[program], @"expected": @NO}
+    ];
+    for (NSDictionary *test in cases) {
+        NSString *label = test[@"Label"], *filename = [label stringByAppendingString:@".plist"];
+        NSString *path = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
+        NSMutableDictionary *stock = test.mutableCopy;
+        [stock removeObjectForKey:@"expected"];
+        stock[@"EnvironmentVariables"] = @{@"CA_ASSERT_MAIN_THREAD_TRANSACTIONS": @"1", @"LSB_SIMULATE_FRAMEWORK_BUNDLES": @"untrusted",
+                                           @"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS": @"untrusted", @"LSB_REGISTER_EXTENSIONKIT": @"untrusted",
+                                           @"LSB_REGISTER_METAL_COMPILER": @"1"};
+        assert([stock writeToFile:path atomically:YES]);
+        const char *selected[] = {label.UTF8String, NULL};
+        assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+        NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+        NSString *directory = [bootstrap[@"Paths"] firstObject];
+        NSDictionary *environment = readPlist([directory stringByAppendingPathComponent:filename])[@"EnvironmentVariables"];
+        assert([environment[@"CA_ASSERT_MAIN_THREAD_TRANSACTIONS"] isEqual:@"1"]);
+        for (NSString *key in @[@"LSB_SIMULATE_FRAMEWORK_BUNDLES", @"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS",
+                                @"LSB_REGISTER_EXTENSIONKIT", @"LSB_REGISTER_METAL_COMPILER"]) {
+            if ([test[@"expected"] boolValue]) assert([environment[key] isEqual:@"1"]);
+            else assert(!environment[key]);
+            assert(!environmentValue(&message->plan, key.UTF8String));
+            for (NSString *scope in @[@"Self", @"Child"]) assert(!bootstrap[scope][key]);
+        }
+        dispose(message);
+    }
+}
+
+static void testIconServicesGraphics(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    NSString *label = @"com.apple.iconservices.iconservicesagent", *program = @"/System/Library/CoreServices/iconservicesagent";
+    NSArray<NSDictionary *> *cases = @[
+        @{@"Label": label, @"ProgramArguments": @[program], @"expected": @YES},
+        @{@"Label": label, @"Program": program, @"expected": @YES},
+        @{@"Label": label, @"Program": program, @"ProgramArguments": @[@"different-argv0"], @"expected": @YES},
+        @{@"Label": label, @"Program": @"/bin/df", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": label, @"ProgramArguments": @[[program stringByAppendingString:@"Other"]], @"expected": @NO},
+        @{@"Label": @"com.apple.iconservices.IconServicesAgent", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": @"com.kdt.other-iconservice", @"ProgramArguments": @[program], @"expected": @NO}
+    ];
+    for (NSDictionary *test in cases) {
+        NSString *selectedLabel = test[@"Label"], *filename = [selectedLabel stringByAppendingString:@".plist"];
+        NSString *path = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
+        NSMutableDictionary *stock = test.mutableCopy;
+        [stock removeObjectForKey:@"expected"];
+        stock[@"EnvironmentVariables"] = @{@"LSB_REGISTER_METAL_COMPILER": @"untrusted",
+                                           @"LSB_SIMULATE_FRAMEWORK_BUNDLES": @"untrusted"};
+        assert([stock writeToFile:path atomically:YES]);
+        const char *selected[] = {selectedLabel.UTF8String, NULL};
+        assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+        NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+        NSString *directory = [bootstrap[@"Paths"] firstObject];
+        NSDictionary *environment = readPlist([directory stringByAppendingPathComponent:filename])[@"EnvironmentVariables"];
+        BOOL expected = [test[@"expected"] boolValue];
+        for (NSString *key in @[@"LSB_REGISTER_METAL_COMPILER", @"LSB_SIMULATE_FRAMEWORK_BUNDLES"]) {
+            if (expected) assert([environment[key] isEqual:@"1"]);
+            else assert(!environment[key]);
+        }
+        assert(!environment[@"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS"] && !environment[@"LSB_REGISTER_EXTENSIONKIT"]);
+        for (NSString *key in @[@"LSB_REGISTER_METAL_COMPILER", @"LSB_SIMULATE_FRAMEWORK_BUNDLES"]) {
+            assert(!environmentValue(&message->plan, key.UTF8String));
+            for (NSString *scope in @[@"Self", @"Child"]) assert(!bootstrap[scope][key]);
+        }
+        dispose(message);
+    }
+}
+
 static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
     NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
     NSString *notifyPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
@@ -336,6 +411,8 @@ static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSStrin
         assert(!bootstrap[scope][@"LSB_DEBUG_STOP_BEFORE_HANDOFF"]);
         assert([bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"] isEqual:@"1"]);
         assert([bootstrap[scope][@"LSB_SIMULATE_NOTIFICATION_SHM"] isEqual:@"1"]);
+        assert([bootstrap[scope][@"LSB_SIMULATE_CODE_SIGNING"] isEqual:@"1"]);
+        assert([bootstrap[scope][@"LSB_ENABLE_PEER_PROCESS_INSPECTION"] isEqual:@"1"]);
         assert([bootstrap[scope][@"SIMULATOR_MAINSCREEN_WIDTH"] isEqual:@"1290"]);
     }
     NSString *jobPath = [directory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
@@ -405,6 +482,8 @@ static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSStrin
     assert([[NSData dataWithContentsOfFile:oldJobPath] isEqual:oldJob]);
     dispose(message);
     testServiceCapacity(message, root, dataPath, configPath);
+    testSpringBoardResources(message, root, configPath);
+    testIconServicesGraphics(message, root, configPath);
 }
 
 static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {

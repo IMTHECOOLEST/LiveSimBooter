@@ -214,7 +214,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         closeStatus();
         fprintf(stderr, "[LiveProcess] Native worker appeared before handoff: %s\n", strerror(error)); return 1;
     }
-    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 9];
+    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 10];
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
@@ -227,6 +227,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
             continue;
         }
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
+            strncmp(entry, "RB_USE_BINARY_ARCHIVE=", sizeof("RB_USE_BINARY_ARCHIVE=") - 1) &&
             strncmp(entry, "LSB_GUEST_PID=", sizeof("LSB_GUEST_PID=") - 1) &&
             strncmp(entry, "LSB_GUEST_PPID=", sizeof("LSB_GUEST_PPID=") - 1) &&
             strncmp(entry, "LSB_HOST_WORKQUEUE_START=", sizeof("LSB_HOST_WORKQUEUE_START=") - 1) &&
@@ -234,6 +235,9 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
             strncmp(entry, LSB_CHILD_STATUS_ENV "=", sizeof(LSB_CHILD_STATUS_ENV)) &&
             strncmp(entry, LSB_CHILD_WAKE_FD_ENV "=", sizeof(LSB_CHILD_WAKE_FD_ENV))) environment[count++] = entry;
     }
+    // RenderBox binary archives require targetDeviceArchitecture, which stock MTLSimDevice does not implement.
+    // Apply to every guest, including spawned apps with a replacement environment; native Metal helpers return above.
+    environment[count++] = "RB_USE_BINARY_ARCHIVE=0";
     environment[count++] = insertLibrary;
     environment[count++] = brokerEnvironment;
     environment[count++] = statusEnvironment;

@@ -40,11 +40,18 @@ int LSBRegisterMetalCompilerForExecutable(const char *enabled, const char *runti
     struct stat metadata;
     if (stat(root, &metadata)) return errno;
     if (!S_ISDIR(metadata.st_mode)) return ENOTDIR;
-    int error = appendPath(expected, root, "usr/libexec/backboardd");
-    if (error) return error;
     if (!realpath(executablePath, executable)) return errno;
+    const char *roles[] = {"usr/libexec/backboardd", "System/Library/CoreServices/SpringBoard.app/SpringBoard",
+                           "System/Library/CoreServices/iconservicesagent"};
+    bool allowed = false;
+    int error;
+    for (unsigned i = 0; i < sizeof(roles) / sizeof(*roles); ++i) {
+        error = appendPath(expected, root, roles[i]);
+        if (error) return error;
+        if (!strcmp(executable, expected)) { allowed = true; break; }
+    }
     // An inherited option cannot register a domain for launchd, xpcproxy, the compiler, or an unrelated executable.
-    if (strcmp(executable, expected)) return 0;
+    if (!allowed) return 0;
     if (stat(executable, &metadata)) return errno;
     if (!S_ISREG(metadata.st_mode)) return EINVAL;
     error = appendPath(expected, root, "System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc");

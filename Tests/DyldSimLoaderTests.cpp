@@ -7,6 +7,7 @@
 #include <functional>
 #include <libkern/OSByteOrder.h>
 #include <mach-o/fat.h>
+#include <signal.h>
 #include <string>
 #include <sys/wait.h>
 #include <vector>
@@ -17,6 +18,9 @@ static void *sourceMapping = MAP_FAILED;
 static off_t registeredSlice = -1;
 static uintptr_t registeredSignature = 0;
 static unsigned randomCalls = 0;
+static unsigned stackReservations = 0, stackReleases = 0;
+static void *reservedStack = MAP_FAILED;
+static bool rejectStackProtection = false, stackUsedFixedMapping = false;
 static constexpr uintptr_t freshPtrMungeToken = 0xa739c450e16b28df;
 
 static void testArc4RandomBuf(void *buffer, size_t size) {
@@ -41,13 +45,24 @@ static int testFcntl(int, int command, ...) {
 static void *testMmap(void *address, size_t size, int protection, int flags, int fd, off_t offset) {
     if ((flags & MAP_FIXED) && rejectSegmentMapping) { errno = EACCES; return MAP_FAILED; }
     void *result = ::mmap(address, size, protection, flags, fd, offset);
+    if (address == reinterpret_cast<void *>(0x400000000ULL) && protection == PROT_NONE) {
+        ++stackReservations;
+        stackUsedFixedMapping |= flags & MAP_FIXED;
+        reservedStack = result;
+    }
     if (!(flags & (MAP_FIXED | MAP_ANON))) { sourceFD = fd; sourceMapping = result; }
     return result;
 }
 
 static int testMunmap(void *address, size_t size) {
+    if (address == reservedStack && address != MAP_FAILED) ++stackReleases;
     if (address == sourceMapping) ++fileUnmaps;
     return ::munmap(address, size);
+}
+
+static int testMprotect(void *address, size_t size, int protection) {
+    if (rejectStackProtection) { errno = EACCES; return -1; }
+    return ::mprotect(address, size, protection);
 }
 
 static kern_return_t testDeallocate(vm_map_t task, vm_address_t address, vm_size_t size) {
@@ -58,12 +73,14 @@ static kern_return_t testDeallocate(vm_map_t task, vm_address_t address, vm_size
 #define fcntl testFcntl
 #define mmap testMmap
 #define munmap testMunmap
+#define mprotect testMprotect
 #define vm_deallocate testDeallocate
 #define arc4random_buf testArc4RandomBuf
 #include "../LiveSimBooter/DyldSimLoader.cpp"
 #undef arc4random_buf
 #undef vm_deallocate
 #undef munmap
+#undef mprotect
 #undef mmap
 #undef fcntl
 
@@ -96,6 +113,156 @@ static void mainStackBoundsTest() {
     check(!mainStackContains(0, 0x8000, 0), "native stack top must be nonzero");
     check(!mainStackContains(0x18000, SIZE_MAX, 0x17000), "native stack subtraction cannot wrap");
     check(!mainStackContains(0x18000, 0x18000, 0x17000), "native stack cannot extend to the null page");
+}
+
+static CacheReservationHeader cacheHeader() {
+    CacheReservationHeader header = {};
+    memcpy(header.magic, "dyld_v1   arm64", sizeof(header.magic));
+    header.mappingOffset = sizeof(header);
+    header.mappingCount = 1;
+    header.sharedRegionStart = 0x108000000;
+    header.sharedRegionSize = 0xffc08000;
+    return header;
+}
+
+static void cacheReservationTests() {
+    auto header = cacheHeader();
+    CacheReservation cache;
+    std::string error;
+    constexpr size_t fileSize = sizeof(header) + 32;
+    check(parseCacheReservation(header, fileSize, cache, error), "valid arm64 cache reservation is accepted");
+    check(cache.address == header.sharedRegionStart && cache.size == header.sharedRegionSize, "cache reservation keeps its declared span including gaps");
+    for (size_t truncated : {size_t(0), sizeof(header) - 1, fileSize - 1}) {
+        check(!parseCacheReservation(header, truncated, cache, error), "truncated header or mapping table is rejected");
+        check(!cache.address && !cache.size, "failed parsing clears reservation output");
+    }
+    for (unsigned mutation = 0; mutation < 9; ++mutation) {
+        auto bad = header;
+        switch (mutation) {
+            case 0: bad.magic[0] = 'x'; break;
+            case 1: bad.mappingOffset = sizeof(header) - 1; break;
+            case 2: bad.mappingCount = 0; break;
+            case 3: bad.mappingCount = UINT32_MAX; break;
+            case 4: bad.sharedRegionStart = 0; break;
+            case 5: bad.sharedRegionSize = 0; break;
+            case 6: ++bad.sharedRegionStart; break;
+            case 7: ++bad.sharedRegionSize; break;
+            case 8: bad.sharedRegionStart = UINTPTR_MAX - 4095; bad.sharedRegionSize = 4096; break;
+        }
+        check(!parseCacheReservation(bad, fileSize, cache, error), "malformed cache header fails before handoff");
+    }
+    check(rangesOverlap(0x1000, 0x1000, 0x1fff, 1), "range overlap includes final byte");
+    check(!rangesOverlap(0x1000, 0x1000, 0x2000, 0x1000), "adjacent half-open ranges do not overlap");
+    check(!rangesOverlap(0x1000, 0, 0x1000, 0x1000), "absent cache is an empty range");
+    check(rangesOverlap(UINTPTR_MAX - 1, 3, 0x1000, 0x1000), "overflowing image ranges fail closed");
+    char path[] = "/tmp/lsb-cache-header-XXXXXX";
+    int fd = mkstemp(path);
+    check(fd >= 0 && write(fd, &header, sizeof(header)) == sizeof(header), "write cache header fixture");
+    check(ftruncate(fd, fileSize) == 0, "size cache fixture for mapping table");
+    check(readCacheReservation(path, cache, error) && cache.address == header.sharedRegionStart, "read only the cache prefix from a regular file");
+    check(ftruncate(fd, sizeof(header) - 1) == 0 && !readCacheReservation(path, cache, error), "short file fails before prefix read");
+    close(fd);
+    unlink(path);
+    check(readCacheReservation(path, cache, error) && !cache.size, "ENOENT preserves the loose-library launch path");
+    check(!readCacheReservation("/tmp", cache, error), "non-regular cache path is rejected");
+    Dl_info resident = {};
+    check(dladdr(reinterpret_cast<const void *>(&cacheReservationTests), &resident) && resident.dli_fbase, "resolve actual resident loader module");
+    auto nativeHeader = static_cast<const mach_header *>(resident.dli_fbase);
+    check(imageOutsideCache(nativeHeader, {0x1000, 0x1000}, error), "resident image validation excludes inaccessible PAGEZERO reservation");
+    check(!imageOutsideCache(nativeHeader, {reinterpret_cast<uintptr_t>(resident.dli_fbase), 4096}, error), "cache overlapping resident code is rejected");
+    check(storageInResidentImage(&startupStorage, resident.dli_fbase, error), "app-local startup storage belongs to the validated image");
+    check(!storageInResidentImage(nullptr, resident.dli_fbase, error), "missing surviving storage is rejected");
+    check(!storageInResidentImage(&resident, resident.dli_fbase, error), "native stack storage cannot masquerade as app-local static storage");
+    check(!storageInResidentImage(&startupStorage, reinterpret_cast<void *>(0x1234), error), "storage from another image is rejected");
+    task_dyld_info_data_t debugger = {};
+    debugger.all_image_info_format = TASK_DYLD_ALL_IMAGE_INFO_64;
+    debugger.all_image_info_addr = 0x200083ff0;
+    debugger.all_image_info_size = sizeof(dyld_all_image_infos);
+    constexpr size_t metadataPage = 0x4000;
+    check(debuggerMetadataOutsideCache(debugger, metadataPage, {0x108000000, 0x7e194000}, error), "native debugger metadata can survive outside the cache");
+    check(!debuggerMetadataOutsideCache(debugger, metadataPage, {0x200080000, metadataPage}, error), "metadata first-page overlap is rejected");
+    check(!debuggerMetadataOutsideCache(debugger, metadataPage, {0x200084000, metadataPage}, error), "metadata final-page overlap is rejected");
+    check(debuggerMetadataOutsideCache(debugger, metadataPage, {0x20007c000, metadataPage}, error), "adjacent reservation preserves metadata pages");
+    for (unsigned mutation = 0; mutation < 5; ++mutation) {
+        auto invalid = debugger;
+        size_t page = metadataPage;
+        switch (mutation) {
+            case 0: invalid.all_image_info_format = TASK_DYLD_ALL_IMAGE_INFO_32; break;
+            case 1: invalid.all_image_info_size = 1; break;
+            case 2: invalid.all_image_info_addr = UINTPTR_MAX - 7; break;
+            case 3: invalid.all_image_info_addr = 0; break;
+            case 4: page = 3; break;
+        }
+        check(!debuggerMetadataOutsideCache(invalid, page, {0x108000000, 0x7e194000}, error), "invalid native debugger metadata fails before detachment");
+    }
+}
+
+static void expectGuard(void *address) {
+    pid_t child = fork();
+    check(child >= 0, "fork guard-page probe");
+    if (!child) {
+        signal(SIGBUS, [](int) { _exit(73); });
+        signal(SIGSEGV, [](int) { _exit(73); });
+        *static_cast<volatile unsigned char *>(address) = 1;
+        _exit(1);
+    }
+    int status = 0;
+    check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 73, "stack guard page rejects writes");
+}
+
+static void guardedMainStackTests() {
+    uintptr_t nativeTop = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+    size_t nativeSize = pthread_get_stacksize_np(pthread_self());
+    std::string error;
+    uintptr_t top = nativeTop;
+    size_t size = nativeSize;
+    unsigned before = stackReservations;
+    for (CacheReservation cache : {CacheReservation{}, CacheReservation{0x120000000, 0x1000000}}) {
+        GuardedMainStack stack;
+        check(prepareMainStack(cache, top, size, stack, error) && stack.mapping == MAP_FAILED, "non-overlapping cache keeps the native stack");
+        check(top == nativeTop && size == nativeSize && stackReservations == before, "legacy path does not reserve new memory");
+    }
+    CacheReservation overlap = {nativeTop - nativeSize, nativeSize};
+    unsigned released = stackReleases;
+    {
+        GuardedMainStack stack;
+        check(prepareMainStack(overlap, top, size, stack, error), "overlapping cache reserves a separate stack");
+        check(top == stack.top && size == stack.size && size >= nativeSize && size >= 8 * 1024 * 1024, "relocated usable bounds preserve native capacity");
+        check(reinterpret_cast<uintptr_t>(stack.mapping) >= 0x300000000ULL && !(top & 15), "new stack is high and ABI aligned");
+        check(!rangesOverlap(reinterpret_cast<uintptr_t>(stack.mapping), stack.mappingSize, overlap.address, overlap.size), "guards also avoid cache reservation");
+        const char *arguments[] = {"/RuntimeRoot/bin/df", nullptr};
+        StartupVectors startup = {};
+        check(!prepareStartupVectors(nullptr, arguments[0], "/RuntimeRoot", 1, arguments, nullptr, nullptr, top, size, startup),
+              "prepare relocated pthread stack metadata");
+        char metadata[96];
+        snprintf(metadata, sizeof(metadata), "main_stack=0x%llx,0x%llx,0x0,0x0",
+                 static_cast<unsigned long long>(top), static_cast<unsigned long long>(size));
+        bool found = false;
+        for (const char *const *item = startup.apple; *item; ++item) found |= !strcmp(*item, metadata);
+        check(found, "main_stack publishes only new usable bounds and zero pthread allocation metadata");
+        randomCalls = 0;
+        *reinterpret_cast<volatile unsigned char *>(top - size) = 42;
+        *reinterpret_cast<volatile unsigned char *>(top - 1) = 43;
+        expectGuard(stack.mapping);
+        expectGuard(reinterpret_cast<void *>(top));
+        check(!stackUsedFixedMapping, "stack allocator never uses MAP_FIXED");
+    }
+    check(stackReleases == released + 1, "RAII releases the whole guarded reservation before a failed handoff returns");
+    for (bool protectionFailure : {true, false}) {
+        top = nativeTop; size = nativeSize; released = stackReleases;
+        {
+            GuardedMainStack stack;
+            rejectStackProtection = protectionFailure;
+            auto blocked = protectionFailure ? overlap : CacheReservation{0x1000, UINTPTR_MAX - 0x1000};
+            check(!prepareMainStack(blocked, top, size, stack, error), "protection failure or allocation inside cache fails closed");
+            check(top == nativeTop && size == nativeSize && !stack.top, "failed allocation never publishes new usable bounds");
+            rejectStackProtection = false;
+        }
+        check(stackReleases == released + 1, "failed stack preparation releases its reservation");
+    }
+    top = UINTPTR_MAX; size = SIZE_MAX - 1; before = stackReservations;
+    GuardedMainStack stack;
+    check(!prepareMainStack({0x1000, 0x1000}, top, size, stack, error) && stackReservations == before, "allocation-size overflow fails before mmap");
 }
 
 static void startupStorageBoundsTest() {
@@ -531,6 +698,11 @@ struct HandoffComplete {};
 int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
     check(checkedFinalThreadCount, "native worker guard runs before destructive cache detachment");
     check(launch->thread.hostTSD == 0x1000 && launch->thread.simulatorTSD == 0x2000, "handoff receives prepared thread storage");
+    uintptr_t nativeTop = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread_self()));
+    check(!mainStackContains(nativeTop, pthread_get_stacksize_np(pthread_self()), reinterpret_cast<uintptr_t>(launch)),
+          "launch descriptor survives replacement of the native stack");
+    check(!launch->stackTop, "absent cache keeps the existing handoff stack");
+    check(!launch->cacheAddress && !launch->cacheSize, "absent cache does not reserve an address range");
     uintptr_t base = reinterpret_cast<uintptr_t>(startupStorage.words);
     auto inStorage = [&](const void *pointer, size_t length) {
         uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
@@ -749,6 +921,8 @@ int main() {
     executableMapping(dylibVariant(executable()), 0);
     executableMapping(universal(true, true, dylibVariant(executable())), page);
     mainStackBoundsTest();
+    cacheReservationTests();
+    guardedMainStackTests();
     startupStorageBoundsTest();
     offMainEntryTest();
     oversizedEntryTest();

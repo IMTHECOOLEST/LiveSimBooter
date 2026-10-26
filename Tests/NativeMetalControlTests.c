@@ -47,7 +47,8 @@ static void basicAndMalformedTests(void) {
     audit_token_t token = tokenFor(17), invalid = token;
     assert(!LSBNativeMetalControlPublish(control, &token));
     assert(!LSBNativeMetalControlRead(control, &authorization));
-    assert(authorization.authorized && authorization.generation == 1 && !memcmp(&authorization.audit, &token, sizeof(token)));
+    assert(authorization.authorized && !authorization.publicAccess && authorization.generation == 1 &&
+           !memcmp(&authorization.audit, &token, sizeof(token)));
     invalid.val[5] = 0;
     assert(LSBNativeMetalControlPublish(control, &invalid) == EINVAL);
     invalid.val[5] = UINT32_MAX;
@@ -69,9 +70,10 @@ static void basicAndMalformedTests(void) {
         assert(LSBNativeMetalControlValidate(control, LSB_NATIVE_METAL_CONTROL_SIZE) == EPROTO);
         assertReadError(control, EPROTO);
         assert(LSBNativeMetalControlPublish(control, &token) == EPROTO);
+        assert(LSBNativeMetalControlPublishPublic(control) == EPROTO);
         atomic_store(&words[index], original);
     }
-    atomic_store(&words[6], 2); // Invalid authorization discriminator.
+    atomic_store(&words[6], 3); // Invalid authorization discriminator.
     assertReadError(control, EPROTO);
     atomic_store(&words[6], 1);
     assertReadError(control, EPROTO); // An authorized token cannot have PID zero.
@@ -87,8 +89,47 @@ static void basicAndMalformedTests(void) {
     assert(LSBNativeMetalControlPublish(control, &token) == EOVERFLOW);
     assertReadError(control, EOVERFLOW);
     assert(LSBNativeMetalControlPublish(control, NULL) == EOVERFLOW);
+    assert(LSBNativeMetalControlPublishPublic(control) == EOVERFLOW);
     assertReadError(NULL, EINVAL);
     assert(LSBNativeMetalControlRead(control, NULL) == EINVAL);
+    free(control);
+}
+
+static void publicAuthorizationTests(void) {
+    LSBNativeMetalControl *control = malloc(LSB_NATIVE_METAL_CONTROL_SIZE);
+    assert(control && !LSBNativeMetalControlInitialize(control, LSB_NATIVE_METAL_CONTROL_SIZE));
+    assert(LSBNativeMetalControlPublishPublic(NULL) == EINVAL);
+    audit_token_t token = tokenFor(123), zero = {{0}};
+    assert(!LSBNativeMetalControlPublish(control, &token));
+    assert(!LSBNativeMetalControlPublishPublic(control));
+    LSBNativeMetalAuthorization authorization;
+    assert(!LSBNativeMetalControlRead(control, &authorization));
+    assert(authorization.authorized && authorization.publicAccess && authorization.generation == 2);
+    assert(!memcmp(&authorization.audit, &zero, sizeof(zero))); // Public publication clears a previous owner's complete identity.
+    _Atomic(uint32_t) *words = (void *)control;
+    for (unsigned index = 8; index < 16; ++index) {
+        atomic_store(&words[index], 123);
+        assertReadError(control, EPROTO); // Public access cannot carry a residual or forged owner token.
+        atomic_store(&words[index], 0);
+    }
+    uint32_t version = atomic_exchange(&words[1], 1);
+    assertReadError(control, EPROTO); // A version-1 helper cannot interpret the public discriminator.
+    atomic_store(&words[1], version);
+    assert(!LSBNativeMetalControlPublish(control, NULL));
+    assert(!LSBNativeMetalControlRead(control, &authorization));
+    assert(!authorization.authorized && !authorization.publicAccess && authorization.generation == 3);
+    assert(!memcmp(&authorization.audit, &zero, sizeof(zero)));
+    assert(!LSBNativeMetalControlPublishPublic(control));
+    assert(!LSBNativeMetalControlPublish(control, &token));
+    assert(!LSBNativeMetalControlRead(control, &authorization));
+    assert(authorization.authorized && !authorization.publicAccess && authorization.generation == 5);
+    assert(!memcmp(&authorization.audit, &token, sizeof(token)));
+    _Atomic(uint64_t) *sequence = (void *)((char *)control + 16);
+    atomic_store(sequence, UINT64_MAX - 1);
+    assert(LSBNativeMetalControlPublishPublic(control) == EOVERFLOW);
+    assert(!atomic_load(&words[6]));
+    for (unsigned index = 8; index < 16; ++index) assert(!atomic_load(&words[index]));
+    assertReadError(control, EOVERFLOW);
     free(control);
 }
 
@@ -109,12 +150,13 @@ static void *readPublications(void *context) {
         if (error) { assert(error == EAGAIN); assertCleared(&authorization); continue; }
         assert(authorization.generation >= generation);
         generation = authorization.generation;
-        if (authorization.authorized) {
+        if (authorization.authorized && !authorization.publicAccess) {
             audit_token_t expected = tokenFor(authorization.audit.val[0]);
             assert(!memcmp(&authorization.audit, &expected, sizeof(expected)));
         } else {
             audit_token_t zero = {{0}};
             assert(!memcmp(&authorization.audit, &zero, sizeof(zero)));
+            assert(!authorization.publicAccess || authorization.authorized);
         }
         atomic_fetch_add(&test->accepted, 1);
     } while (!atomic_load(&test->done));
@@ -134,6 +176,7 @@ static void concurrentPublicationTests(void) {
         audit_token_t token = tokenFor(i);
         assert(!LSBNativeMetalControlPublish(test.control, &token));
         if (!(i % 3)) assert(!LSBNativeMetalControlPublish(test.control, NULL));
+        if (!(i % 5)) assert(!LSBNativeMetalControlPublishPublic(test.control));
     }
     assert(!LSBNativeMetalControlPublish(test.control, NULL));
     atomic_store(&test.done, true);
@@ -179,6 +222,11 @@ static void mappingAndProcessTests(void) {
         assert(!memcmp(&authorization.audit, &expected, sizeof(expected)));
         assert(write(toParent[1], "a", 1) == 1);
         assert(read(toChild[0], &signal, 1) == 1);
+        assert(!LSBNativeMetalControlRead(imported, &authorization) && authorization.authorized && authorization.publicAccess);
+        audit_token_t zero = {{0}};
+        assert(!memcmp(&authorization.audit, &zero, sizeof(zero)));
+        assert(write(toParent[1], "p", 1) == 1);
+        assert(read(toChild[0], &signal, 1) == 1);
         assert(!LSBNativeMetalControlRead(imported, &authorization) && !authorization.authorized);
         LSBNativeMetalControlUnmap(imported);
         _exit(0);
@@ -188,6 +236,9 @@ static void mappingAndProcessTests(void) {
     assert(!LSBNativeMetalControlPublish(writer, &expected));
     assert(write(toChild[1], "a", 1) == 1);
     char signal;
+    assert(read(toParent[0], &signal, 1) == 1);
+    assert(!LSBNativeMetalControlPublishPublic(writer));
+    assert(write(toChild[1], "p", 1) == 1);
     assert(read(toParent[0], &signal, 1) == 1);
     assert(!LSBNativeMetalControlPublish(writer, NULL));
     assert(write(toChild[1], "r", 1) == 1);
@@ -218,8 +269,9 @@ static void mappingAndProcessTests(void) {
 int main(void) {
     alarm(45);
     basicAndMalformedTests();
+    publicAuthorizationTests();
     mappingAndProcessTests(); // Fork before the thread stress test; no test-owned worker thread survives into the child.
     concurrentPublicationTests();
-    puts("NativeMetalControl: coherent publication/revocation, bounded failure, malformed ABI, read-only import and process sharing passed");
+    puts("NativeMetalControl: dedicated/public publication and revocation, bounded failure, malformed ABI, read-only import and process sharing passed");
     return 0;
 }

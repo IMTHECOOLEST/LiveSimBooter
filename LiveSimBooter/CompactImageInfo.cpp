@@ -36,10 +36,12 @@
 
 namespace {
 
-constexpr size_t kMaxImages = 1024, kMaxSegments = 32;
+constexpr size_t kMaxImages = lsb::kCompactImageInfoMaxImages, kMaxSegments = 32;
 constexpr size_t kMaxObjects = 64 + kMaxImages * (8 + 8 * kMaxSegments);
 constexpr size_t kBufferSize = 256 + kMaxImages * (2 * PATH_MAX + 192 + kMaxSegments * 192);
 constexpr size_t kModernHeaderSize = 44, kLegacyHeaderSize = 46, kMaxNativeArchiveSize = 64 * 1024 * 1024;
+static_assert(kBufferSize < kMaxNativeArchiveSize && kBufferSize <= UINT32_MAX && kMaxObjects <= UINT32_MAX,
+              "Snapshot buffers must fit the native archive limit and 32-bit plist offsets/references");
 constexpr uintptr_t kPageSize = 16384;
 enum class ArchiveEncoding { unconfigured, posixChecksum, crc32cAttribute };
 ArchiveEncoding sEncoding;

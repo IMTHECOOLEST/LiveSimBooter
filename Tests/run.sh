@@ -55,6 +55,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_CHILD_KILL_TESTING \
     Tests/ProcessIdentityTests.c Guest/ChildKill.c Guest/ChildWait.c ProcessSupport/ChildStatus.c -DLSB_CHILD_WAIT_TESTING -o "$test_directory/ProcessIdentity"
 "$test_directory/ProcessIdentity"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -O1 \
+    Tests/PeerProcessCompatibilityTests.c -o "$test_directory/PeerProcessCompatibility"
+"$test_directory/PeerProcessCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ProcessSessionTests.c -o "$test_directory/ProcessSession"
 "$test_directory/ProcessSession"
@@ -70,6 +73,18 @@ DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ProcessIdentityInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessIdentityInterpose"
 LSB_GUEST_PID=2147483000 DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessIdentityInterpose"
+identity_runtime="$(cd "$test_directory" && pwd -P)/IdentityRuntimeRoot"
+for identity_name in BaseBoard RunningBoardServices FrontBoard; do
+    identity_framework="$identity_runtime/System/Library/PrivateFrameworks/$identity_name.framework"
+    identity_unrelated="$identity_runtime/Plugins/$identity_name"
+    mkdir -p "$identity_framework" "$identity_runtime/Plugins"
+    xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib Tests/ProcessIdentityCallerFixture.c \
+        -install_name "$identity_framework/$identity_name" -o "$identity_framework/$identity_name"
+    xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib Tests/ProcessIdentityCallerFixture.c \
+        -install_name "$identity_unrelated" -o "$identity_unrelated"
+    LSB_GUEST_PID=2147483000 DYLD_ROOT_PATH="$identity_runtime" DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" \
+        "$test_directory/ProcessIdentityInterpose" "$identity_framework/$identity_name" "$identity_unrelated"
+done
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/CreationMaskTests.c -o "$test_directory/CreationMask"
 "$test_directory/CreationMask"
@@ -79,6 +94,12 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/MetalCompilerRegistrationTests.c -o "$test_directory/MetalCompilerRegistration"
 "$test_directory/MetalCompilerRegistration"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ExtensionKitRegistrationTests.c -o "$test_directory/ExtensionKitRegistration"
+"$test_directory/ExtensionKitRegistration"
+xcrun --sdk macosx clang -arch arm64 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+    Guest/ApplicationRegistrationPlan.m Tests/ApplicationRegistrationTests.m -framework Foundation -o "$test_directory/ApplicationRegistration"
+"$test_directory/ApplicationRegistration"
 xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Werror -arch arm64 \
     Tests/FrameworkBundleCompatibilityTests.m -framework Foundation -framework QuartzCore -o "$test_directory/FrameworkBundleCompatibility"
 "$test_directory/FrameworkBundleCompatibility"
@@ -123,6 +144,43 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_NOTIFI
     Tests/NotificationSharedMemoryTests.c -o "$test_directory/NotificationSharedMemoryInterpose"
 DYLD_INSERT_LIBRARIES="$test_directory/libNotificationSharedMemory.dylib" "$test_directory/NotificationSharedMemoryInterpose"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/CodeSigningCompatibilityTests.c -framework CoreFoundation -o "$test_directory/CodeSigningCompatibility"
+"$test_directory/CodeSigningCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/GuestEntitlementsTests.c ProcessSupport/GuestEntitlements.c -o "$test_directory/GuestEntitlements"
+"$test_directory/GuestEntitlements"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/GuestCodeSignatureTests.c ProcessSupport/GuestCodeSignature.c -o "$test_directory/GuestCodeSignature"
+"$test_directory/GuestCodeSignature"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/GuestEntitlementsConversionTests.m Host/GuestEntitlementsConversion.m ProcessSupport/GuestEntitlements.c \
+    -framework Foundation -o "$test_directory/GuestEntitlementsConversion"
+"$test_directory/GuestEntitlementsConversion"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SpringBoardEntitlementsTests.c -framework CoreFoundation -o "$test_directory/SpringBoardEntitlements"
+"$test_directory/SpringBoardEntitlements"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    -DBSSelfTaskHasEntitlement=LSBSpringBoardOriginalFixture -Wl,-U,_LSBSpringBoardOriginalFixture \
+    Guest/SpringBoardEntitlements.c -framework CoreFoundation -o "$test_directory/libSpringBoardEntitlements.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib -DLSB_SPRINGBOARD_ENTITLEMENTS_PROVIDER \
+    Tests/SpringBoardEntitlementsInterposeTests.c -framework CoreFoundation \
+    -install_name "$test_directory/libSpringBoardEntitlementsProvider.dylib" -o "$test_directory/libSpringBoardEntitlementsProvider.dylib"
+springboard_test_root="$test_directory/SpringBoardRuntimeRoot"
+springboard_test_directory="$springboard_test_root/System/Library/CoreServices/SpringBoard.app"
+mkdir -p "$springboard_test_directory"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SpringBoardEntitlementsInterposeTests.c "$test_directory/libSpringBoardEntitlementsProvider.dylib" -framework CoreFoundation \
+    -o "$springboard_test_directory/SpringBoard"
+DYLD_INSERT_LIBRARIES="$test_directory/libSpringBoardEntitlements.dylib" DYLD_ROOT_PATH="$springboard_test_root" \
+    LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS=1 "$springboard_test_directory/SpringBoard" enabled
+DYLD_INSERT_LIBRARIES="$test_directory/libSpringBoardEntitlements.dylib" DYLD_ROOT_PATH="$springboard_test_root" \
+    LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS=0 "$springboard_test_directory/SpringBoard" disabled
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SpringBoardEntitlementsInterposeTests.c -framework CoreFoundation -Wl,-U,_LSBSpringBoardOriginalFixture \
+    -o "$test_directory/SpringBoardEntitlementsAbsent"
+DYLD_INSERT_LIBRARIES="$test_directory/libSpringBoardEntitlements.dylib" DYLD_ROOT_PATH="$springboard_test_root" \
+    LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS=1 "$test_directory/SpringBoardEntitlementsAbsent" absent
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/SystemPowerCompatibilityTests.c -framework IOKit -framework CoreFoundation -o "$test_directory/SystemPowerCompatibility"
 "$test_directory/SystemPowerCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
@@ -150,6 +208,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/SpawnTransport"
 "$test_directory/SpawnTransport"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_TRANSPORT_TESTING \
+    Tests/PeerProcessTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/PeerProcessTransport"
+"$test_directory/PeerProcessTransport"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_GUEST_RUNTIME \
     Tests/SpawnTransportTests.c ProcessSupport/SpawnTransport.c ProcessSupport/SpawnPlan.c -o "$test_directory/GuestSpawnTransport"
 XPC_FLAGS=0x2 "$test_directory/GuestSpawnTransport"
@@ -166,6 +227,7 @@ DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/BrokerTests.m Host/TerminalSession.m Host/LaunchdConfiguration.m ProcessSupport/LaunchdHandshake.c ProcessSupport/LaunchdProbe.c \
     Host/IndigoHIDServer.m Host/FramebufferServer.m Host/IOSurfaceServer.m ProcessSupport/LaunchdEndpoint.c \
+    Host/GuestEntitlementsConversion.m ProcessSupport/GuestEntitlements.c \
     ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c ProcessSupport/NativeMetalControl.c \
     -framework Foundation -framework IOSurface -o "$test_directory/Broker"
 "$test_directory/Broker"

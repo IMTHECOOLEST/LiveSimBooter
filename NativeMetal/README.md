@@ -1,7 +1,22 @@
 # Isolated native Metal backend
 
-This backend runs only in a separate native LiveProcess that retains the host shared cache. Its Metal device and all system
-frameworks come from native iOS. The UIKit host and simulator guest do not load these adapted backend libraries.
+This backend runs only in separate native LiveProcess instances that retain the host shared cache. Each instance's Metal
+device and all system frameworks come from native iOS. The UIKit host and simulator guest do not load these adapted
+backend libraries. Graphics sessions now use a public helper for `com.apple.metal.simulator` and a dedicated backboardd
+helper. Selecting stock SpringBoard adds a third, dedicated SpringBoard helper. The public helper accepts any client
+holding its endpoint; dedicated helpers still require their owner's exact full audit token. Each helper has its own native
+process, listener and stock process-reference map. Public IOSurface access remains in the UIKit host.
+
+This public-service change has local integration coverage described below. The phone results in the following paragraphs
+predate it and preserve the evidence for the earlier one- and two-helper implementations.
+
+Host **97774** started native helpers **97775** for backboardd and **97776** for SpringBoard. All six registrations returned
+error/status **0**, and guest backboardd **97796** and SpringBoard **97795** each opened three accepted Metal connections.
+Backboardd registered a **1290 × 2796** CAWindowServer framebuffer and connected to IOSurface as owner **22**. SpringBoard
+exited **0** about a second later; its helper retired while backboardd and the other helper survived. SpringBoard drawing,
+boot completion and SpringBoard IOSurface IPC were not observed in that first trial. The then-current two-owner IOSurface
+contract was verified locally; this historical exit preceded the Home Screen result below. Evidence:
+`tmp/lsd-services/console-springboard-metal.log`.
 
 The native construction probe passed on iPhone16,2 / iOS 26.1 in process **81429**: it obtained an `AGXG16Device` for the
 A17 Pro, loaded the two adapted libraries, read deserializer version **9**, and created/released a deserializer. This proves
@@ -25,26 +40,75 @@ an Indigo HID target mismatch. Apple-logo/progress rendering and a complete simu
 See [the stock frame results](../docs/backboardd.md#first-stock-backboardd-frame).
 See [the Metal investigation](../docs/metal.md) for the discovery path and earlier IOSurface results.
 
+The later Solarium-enabled SpringBoard trial found a separate guest compiler-discovery gap. Native SpringBoard **3722**
+loaded the correct SiriUICore `default.metallib`, then `siriChipVert` specialization returned nil with
+`MTLLibraryErrorDomain` code **3**: `MTLCompilerService` lookup failed with error 3, `No such process`. The temporary
+diagnostic preserved the original API results; the library and its function names were present. The guest shim now imports
+the fixed compiler bundle for the exact host-selected SpringBoard executable as well as backboardd, using the existing
+`xpc_add_bundle(path, 2)` API. This compiler remains a simulator service managed by simulator launchd; it is independent
+of the isolated native GPU helper and ExtensionKit registration. Focused registration/configuration tests and registration
+ASan/UBSan pass. Production SpringBoard **3998** then passed the Siri path and, after the matching AutoFillUI binary was
+staged, displayed the Home Screen without the temporary diagnostic. The screenshot has Calendar artwork and changed
+Solarium dock/search styling, but most icons remain placeholders and widget tiles are blank; complete visual fidelity is
+not established. Evidence: `tmp/autofillui-stage/guest-wifi.log`, `console-wifi.log`, and `springboard-wifi.png`. See
+[the captured failure and registration fix](../docs/metal.md#springboard-compiler-registration).
+
+A subsequent stock global IconServices job reached the generic Metal endpoint in native agents **4063**, **4083**,
+**4087**, and **4089** and was rejected by the then-current backboardd-only authorization. Its guest log also identified
+missing simulator CoreImage plugin binaries, including `CIVisionFilters`, `CIBarcode`, `PortraitFilters`, `CIPassThrough`,
+and `CIInpainting`; copied plugin resources alone cannot load these filters. That experiment did not repair the placeholders
+and left the job out of its final selection. The public helper now removes that admission restriction; it does not supply
+missing guest code or itself prove successful icon rendering. Evidence from the earlier experiment:
+`tmp/iconservices-stage/console-wifi.log` and `guest-wifi.log`.
+
 ## Host-selected execution roles
 
-`--native-metal-probe` selects role 1 for the construction-only test. `--launchd-backboardd` automatically starts role 2,
-`LSB_EXECUTION_NATIVE_METAL_SERVICE`, before the simulator launchd process. Both roles are selected by the native host and
-validated in the bootstrap reply; guest argv, environment and ordinary spawn RPCs cannot select them. LiveProcess startup
-remains C. Native Objective-C is loaded only in the separate helper, which retains the host cache and native frameworks.
+`--native-metal-probe` selects role 1 for the construction-only test. Graphics launch modes automatically start two
+role-2 helpers, `LSB_EXECUTION_NATIVE_METAL_SERVICE`, before simulator launchd: public and backboardd. The selected-services
+mode adds a third only when the host selects `com.apple.SpringBoard` and its generated job retains the exact label and
+stock executable path. Roles and policies are selected by the native host, not guest argv, environment or ordinary spawn
+RPCs. LiveProcess startup remains C; native Objective-C runs in the separate helpers with native frameworks and cache.
 
-The role-2 plan passes an unlinked shared authorization page at fixed fd 3, using a read-only descriptor. The broker owns
-the writable mapping and publishes the selected backboardd instance's full kernel audit token before releasing that guest.
-The backend imports a read-only mapping, then LiveProcess closes fd 3. A successful service READY transfers an endpoint
-send right; only then may launchd start. The broker publishes both `com.apple.metal.simulator` and
-`com.apple.metal.simulator.backboardd` within that isolated namespace. Neither the native host nor other guests inherit
-Metal authorization merely by discovering the service name.
+Each role-2 plan passes a separate unlinked 4 KiB control page at fixed fd 3 using a read-only descriptor. The broker owns
+the writable mapping. Control ABI **2** has revoked, dedicated-owner and public-session modes: dedicated publication carries
+the full kernel audit token, while public publication carries a zero audit token. The public mode is published before its
+helper starts. `LSBNativeMetalControlPublish(control, NULL)` revokes either mode. Invalid modes, nonzero public/revoked audit
+fields and older ABI versions fail validation. Rebuild and package `MetalNativeProbe.dylib` with the matching host ABI.
+
+The backend imports its read-only mapping, then LiveProcess closes fd 3. Authenticated READY transfers the helper's endpoint
+send right. Public and backboardd helpers must both be ready before launchd starts; a known SpringBoard-helper failure
+allows the baseline session to continue with only that dedicated route disabled.
+
+| Simulator service | Process and admission policy |
+| --- | --- |
+| `com.apple.metal.simulator` | Separate public native helper; any client holding the endpoint, up to 256 live peers |
+| `com.apple.metal.simulator.backboardd` | Dedicated native helper; exact backboardd audit token, up to 64 live peers |
+| `com.apple.metal.simulator.SpringBoard` | Dedicated native helper when selected; exact SpringBoard audit token, up to 64 live peers |
+| `com.apple.IOSurface.Remote` | Native UIKit host's `IOSurfaceRemoteServer`; any client holding the endpoint, up to 64 live peers |
+
+Each Metal helper has a separate PlugInKit instance UUID, GPU assertion, control file, listener and `processRef` map. These
+endpoints are published into the simulator launchd session. Public admission requires no per-client broker registration;
+it does not install a globally discoverable service in the phone's host bootstrap namespace. Backboardd proceeds after
+five baseline registrations; SpringBoard's sixth registration has independent pending/error state within the same
+30-second startup deadline. Indigo and framebuffer submission remain backboardd-owned.
+
+IOSurface no longer has an owner allowlist. Its native server manages individual client connections, and session shutdown
+cancels all tracked peers and shuts down the server. A client exiting or executing a replacement process does not revoke
+other public clients. Weak tracking uses `allObjects.count`: `NSHashTable.count` can include zeroed weak entries and would
+otherwise exhaust the limit after enough disconnected clients. Metal uses the same live-peer counting rule.
+
+The endpoint transport is reconstructed from the 23A343 host `liblaunch_sim.dylib` original
+`launch_sim_register_endpoint` → `launch_mig_bridge_register` path, MIG **701/801**. Our differently shaped
+`LSB_launch_sim_register_endpoint` accepts a resolved service port and adds reply-audit validation and a bounded deadline;
+see [the service-route details](../docs/metal.md#isolated-native-service-route).
 
 The loader resolves only `Frameworks/NativeMetal/MetalNativeProbe.dylib` beneath the canonical extension executable directory,
 checks the defining image for the required entry points, and rejects path escapes. A missing folder or image is a normal
 preparation error, not a fallback to a guest-supplied path. The helper is independently monitored; it has no simulated
 parent/child wait relationship with launchd. Other execution roles cannot submit a native endpoint in READY.
 
-Assertion invalidation of a still-existing native role revokes the service session and stops its graphics owner. Termination
+Assertion invalidation of a still-existing native role revokes that helper. A dedicated helper also stops its graphics
+owner; public-helper failure in a running session marks its service unavailable without terminating unrelated clients. Termination
 validates the full audit identity and can fall back to the original PlugInKit instance UUID; only `SIGKILL` remains available
 on an invalidated GPU session. A vanished identity waits for its normal exit monitor instead. Local tests cover these paths;
 device background/assertion-loss behavior remains untested.
@@ -115,7 +179,7 @@ RuntimeRoot separately needs the matching simulator `MTLSimDriver` and `MetalSer
 ## The exported peer adapter
 
 The original implementation exports only `init_with_xpc_connection`. That initializer installs an unconditional listener
-handler; replacing it requires an ordinary callable entry point for authenticated peers. The preparation tool adds the
+handler; replacing it requires an ordinary callable entry point for admitted peers. The preparation tool adds the
 export name **`LSBMTLSimulatorAcceptPeer`** to the existing local function without changing executable instructions:
 
 ```c
@@ -156,7 +220,8 @@ activates it. Replace its listener handler with the authorization wrapper while 
 then publish the listener port. Do not change the target queue after activation. The SDK documents event-handler replacement
 as asynchronous and non-preemptive, so this sequence depends on withholding the endpoint until the wrapper is installed.
 
-The listener wrapper checks the full native audit token before forwarding an accepted connection through the alias.
+The listener wrapper checks its control page before forwarding a connection through the alias. Dedicated mode compares
+the complete native audit token; public mode accepts any peer while the session authorization remains active.
 The alias owns the peer's context, creates a separate serial connection queue, installs its protocol handler and activates
 the peer. The wrapper must not overwrite that context or change its handler/queue afterward. A rejected incoming peer may
 be canceled directly; XPC disposes of it. The stock invalidation handler releases its queue and application-context
@@ -164,22 +229,33 @@ reference, deletes the context, then sets the connection context to NULL.
 
 Global application state is initialized lazily through `dispatch_once` when the first handshake arrives. Connection type 0
 creates an application context and returns a `processRef`; types 1 and 2 retrieve that same context from the process-global
-map. The stock driver normally opens all three connections. The reply includes serializer version 9, native registry ID
-and the native feature profile; no invented reply is needed.
+map. Each type-0 handshake creates a separate application context, so one stock server can support multiple client
+contexts; this is the public helper's model. The stock driver normally opens all three connections for its own context.
+The reply includes serializer version 9, native registry ID and the native feature profile; no invented reply is needed.
+The public helper deliberately shares one server and failure domain across its clients. Dedicated backboardd and SpringBoard
+maps remain in separate processes.
 
-Bind each native helper to one owner for its lifetime. Revocation must cancel admitted connections and end that helper;
-reuse for a different owner would overlap asynchronous cleanup with the old global `processRef` map. Authorization is
-checked when a peer is admitted; later shared-control polling is a secondary revocation mechanism, not a hard real-time
-deadline or a way to undo GPU operations already submitted. The broker must terminate the helper when its owner exits.
-The backend retains global state and the listener without an exported shutdown API, making process exit the cleanup boundary.
-The implementation permanently retires a helper after its admitted generation changes or becomes unreadable/revoked.
-The broker refuses a second simultaneous owner, rejects exec by the active graphics owner, and marks dependent work failed
-if the helper dies. Restart the host/session for a new owner; reauthorization is not a helper-reuse mechanism.
+Keep a helper's original policy and control generation for its lifetime. A changed or revoked generation permanently
+retires it; do not repurpose an existing map while old peers are being cleaned up asynchronously. Dedicated helpers retire
+when their owner exits; the public helper lives until session shutdown and does not bind an individual client to its old
+process during exec replacement. Authorization is checked on admission and polled every 100 ms for cancellation. Polling is
+not a hard real-time deadline and cannot undo submitted GPU work; the broker also terminates a revoked helper.
+
+Local tests cover public/dedicated control publication, malformed ABI rejection, cross-process read-only imports and
+revocation; broker startup failures, endpoint ownership, delayed registration after helper death, client exit/exec and
+session teardown; and the real native IOSurface server with three unregistered processes, shared pixels, the live-peer
+limit, recovered capacity after disconnect and shutdown. These tests do not establish successful public Metal rendering
+or icon artwork on the phone.
+
+The broker still refuses a second owner within a dedicated helper and rejects exec by either dedicated graphics owner.
+SpringBoard helper/owner failure retires that pair while backboardd and public services continue; the failed dedicated
+route stays unavailable until a new session. IOSurface now has no per-owner authorization to revoke. The historical phone
+trial with SpringBoard **97795** verified normal-exit cleanup while backboardd survived; it preceded public-service access.
 
 The driver first looks up `com.apple.metal.simulator.<getprogname()>`, then falls back to `com.apple.metal.simulator`.
-The broker publishes the endpoint inside simulator launchd's namespace after helper READY, while authorization is still
-revoked. It publishes the owner's native audit token only when that child's authenticated CHECKIN arrives, before releasing
-its launch plan. Preserve kernel audit tokens; guest PID translation does not apply to this authentication step.
+The broker publishes all configured endpoints inside simulator launchd's namespace after helper READY. Public authorization
+is already active; dedicated authorization remains revoked until the owner's authenticated CHECKIN, before its launch
+plan is released. Preserve kernel audit tokens; guest PID translation does not apply to dedicated admission checks.
 
 The optional stock `reportLeaks` operation invokes fork/exec for `/usr/bin/leaks` and is not supported in this jailed helper.
 The normal device/resource/command path does not use it. The wrapper delegates the stock protocol after admission; it is

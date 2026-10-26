@@ -29,7 +29,8 @@ static void cancelPeers(void) {
 
 static BOOL readAuthorization(LSBNativeMetalAuthorization *snapshot) {
     int error = LSBNativeMetalControlRead(authorization, snapshot);
-    // Stock processRef state is process-global and peer invalidation is asynchronous. Never reuse a helper for another owner.
+    // A helper keeps its original policy for its lifetime: one dedicated owner or all clients of the public session service.
+    // Stock processRef state is process-global and peer invalidation is asynchronous; do not repurpose a live helper.
     if (admittedGeneration && (error || !snapshot->authorized || snapshot->generation != admittedGeneration)) retired = YES;
     if (retired || error || !snapshot->authorized) { cancelPeers(); return NO; }
     admittedGeneration = snapshot->generation;
@@ -69,7 +70,8 @@ int LSBMetalNativeServicePrepare(const char *absoluteFolder, int controlFD, mach
             audit_token_t identity = {{0}};
             xpc_connection_get_audit_token(event, &identity);
             LSBNativeMetalAuthorization snapshot;
-            if (!readAuthorization(&snapshot) || memcmp(&identity, &snapshot.audit, sizeof(identity)) || peers.count >= 64) {
+            if (!readAuthorization(&snapshot) || (!snapshot.publicAccess && memcmp(&identity, &snapshot.audit, sizeof(identity))) ||
+                peers.allObjects.count >= (snapshot.publicAccess ? 256 : 64)) {
                 fprintf(stderr, "[metal-native] rejected native=%u\n", identity.val[5]);
                 xpc_connection_set_event_handler(event, ^(xpc_object_t ignored) { (void)ignored; });
                 xpc_connection_activate(event);
@@ -77,11 +79,11 @@ int LSBMetalNativeServicePrepare(const char *absoluteFolder, int controlFD, mach
                 return;
             }
             [peers addObject:event];
-            fprintf(stderr, "[metal-native] accepted native=%u version=%u generation=%llu\n", identity.val[5], identity.val[7],
-                    (unsigned long long)snapshot.generation);
+            fprintf(stderr, "[metal-native] accepted native=%u version=%u generation=%llu mode=%s\n", identity.val[5], identity.val[7],
+                    (unsigned long long)snapshot.generation, snapshot.publicAccess ? "public" : "dedicated");
             acceptPeer(event);
         });
-        // Existing peers lose authorization on revocation as well. The broker also terminates this isolated helper on owner exit.
+        // The broker revokes dedicated helpers on owner exit and the public helper on session exit. Either revocation cancels all peers.
         revocationTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
         if (!revocationTimer) return ENOMEM;
         dispatch_source_set_timer(revocationTimer, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), 100 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
@@ -90,7 +92,7 @@ int LSBMetalNativeServicePrepare(const char *absoluteFolder, int controlFD, mach
         xpc_endpoint_t endpoint = xpc_endpoint_create(listener);
         *registrationPort = endpoint ? xpc_endpoint_copy_listener_port_4sim(endpoint) : MACH_PORT_NULL;
         if (!MACH_PORT_VALID(*registrationPort)) return EIO;
-        fprintf(stderr, "[metal-native] authenticated service initialized registryID=0x%llx\n", (unsigned long long)device.registryID);
+        fprintf(stderr, "[metal-native] controlled service initialized registryID=0x%llx\n", (unsigned long long)device.registryID);
     }
     return 0;
 }

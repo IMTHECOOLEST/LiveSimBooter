@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MainThreadBootstrap.h"
+#include <stddef.h>
 #include <stdint.h>
 
 struct mach_header;
@@ -21,6 +22,11 @@ struct LSBDyldSimLaunch {
     uintptr_t slide;
     const SimSyscallHelpers *helpers;
     lsb::MainThreadBootstrap thread;
+    // Zero preserves the native stack. Nonzero is a guarded, 16-byte-aligned stack owned for the process lifetime.
+    uintptr_t stackTop = 0;
+    // The entire validated cache span, including gaps, becomes owned PROT_NONE memory before dyld maps its segments.
+    uintptr_t cacheAddress = 0;
+    size_t cacheSize = 0;
 };
 
 // Returns an errno before entry with host TLS restored. Successful handoff never returns to host code.

@@ -11,7 +11,34 @@ That helper retains the native shared cache and Metal framework. The native fram
 own endpoints; neither substitutes for the Metal command service. The implementation and phone evidence below use the
 original simulator **23A343** binaries on iPhone16,2 / iOS **26.1 (23B50)**, tested on 2026-10-25 and 2026-10-26.
 
-## Latest phone results
+The current host provisions separate public and backboardd native Metal helpers, plus a third dedicated helper when its
+selected stock jobs include SpringBoard. The public `com.apple.metal.simulator` endpoint accepts any client holding it;
+the dedicated backboardd/SpringBoard endpoints retain full-audit-token checks. Public `com.apple.IOSurface.Remote` remains
+in the native UIKit host and also accepts any client. These endpoints belong to the simulator launchd session. See
+[the current route and lifetime contract](#isolated-native-service-route); the numbered phone trials below describe the
+earlier one- and two-helper implementations and do not establish public-client rendering.
+
+The later Solarium-enabled SpringBoard trial exposed a separate compiler-discovery gap: native SpringBoard **3722** loaded
+the correct SiriUICore shader library, but specialization of `siriChipVert` failed because its PID domain could not find
+`MTLCompilerService`. The existing compiler registration now also covers the exact selected SpringBoard job. Production
+SpringBoard **3998** passed that Siri path and the subsequent missing AutoFillUI dependency after its matching binary was
+staged, then displayed the Home Screen. Icon artwork and widget tiles remain incomplete. See
+[the captured failure and fix](#springboard-compiler-registration) and [the IconServices boundary](#iconservices-follow-up).
+
+## Two-helper phone trial
+
+Host **97774** launched backboardd's native helper **97775** and SpringBoard's native helper **97776**. All six endpoint
+registrations returned error/status **0**. SpringBoard **97795** and backboardd **97796** each made three accepted Metal
+connections to their assigned helper, using their distinct full audit tokens. Backboardd registered the **1290 × 2796**
+CAWindowServer framebuffer and connected to IOSurface as broker owner **22**.
+
+SpringBoard exited normally with wait status **0** about a second later. The broker retired helper **97776**, while
+backboardd and helper **97775** remained alive. This validates separate Metal admission and cleanup after that owner's
+normal exit. It does not establish SpringBoard drawing or boot completion, and no SpringBoard IOSurface IPC was observed
+in this trial. The then-current two-owner IOSurface contract was covered by the local stock-server test. This historical
+exit preceded the later Home Screen result. Evidence: `tmp/lsd-services/console-springboard-metal.log`.
+
+## Verified single-owner phone results
 
 | Trial | Confirmed result | Boundary |
 | --- | --- | --- |
@@ -247,11 +274,34 @@ The implementation's application-context constructor at `0x325c` calls `MTLCreat
 Keeping simulator Metal loaded in that host would recursively select a simulator client instead of reaching the physical
 GPU. Running the bundled simulator host unchanged under the guest runtime is therefore not the intended native route.
 
-The implemented route uses host-selected execution role **2**, `LSB_EXECUTION_NATIVE_METAL_SERVICE`. For
-`--launchd-backboardd`, the broker starts this helper before simulator launchd and waits for its authenticated READY reply
-carrying an owned endpoint send right. It registers that endpoint as both `com.apple.metal.simulator` and
-`com.apple.metal.simulator.backboardd`, alongside Indigo, IOSurface and framebuffer. All five registrations complete before
-the backboardd replacement is released. The initial xpcproxy can run first so launchd can service the registration RPCs.
+The implemented route uses host-selected execution role **2**, `LSB_EXECUTION_NATIVE_METAL_SERVICE`. Graphics launch modes
+start a dedicated backboardd helper and a separate public helper before simulator launchd. If the host selects
+`com.apple.SpringBoard` and its generated job retains that label and the stock executable path, it adds a third helper.
+Guest arguments, environment and ordinary spawn RPCs cannot request native service mode. All helpers load the same fixed
+backend files in separate native LiveProcess instances, each with its own PlugInKit instance UUID and GPU assertion.
+
+Each authenticated READY transfers its helper's endpoint send right. Public and backboardd helpers must be ready before
+launchd starts. A known SpringBoard-helper failure records a SpringBoard-only error and permits the baseline session to
+continue. The generic endpoint no longer aliases backboardd's listener:
+
+| Simulator service name | Native process and admission policy |
+| --- | --- |
+| `com.apple.metal.simulator` | Separate public helper; any client holding the endpoint |
+| `com.apple.metal.simulator.backboardd` | Dedicated helper; exact backboardd audit token |
+| `com.apple.metal.simulator.SpringBoard` | Dedicated helper; exact selected stock SpringBoard audit token |
+| `com.apple.IOSurface.Remote` | UIKit host's native server; any client holding the endpoint |
+
+The five baseline registrations cover Indigo, IOSurface, framebuffer, public Metal and dedicated backboardd Metal.
+Completing them releases baseline work without waiting for SpringBoard's sixth registration. SpringBoard has its own
+pending/error state and waits for its specific route. All registrations consume one bounded 30-second startup budget;
+an uncertain timeout is not retried. Initial xpcproxy jobs can run first so launchd can service these RPCs. A registration
+worker retains its endpoint send rights until completion; a delayed successful reply cannot clear a helper-death error.
+
+`ProcessSupport/LaunchdEndpoint.c` names its internal adapter `LSB_launch_sim_register_endpoint` to distinguish its changed
+signature from Apple's original `launch_sim_register_endpoint`. The original **23A343**
+`usr/lib/system/host/liblaunch_sim.dylib` delegates to `launch_mig_bridge_register`, using MIG request **701** and reply
+**801**. The local reconstruction preserves that wire protocol while accepting an already resolved launchd service port,
+validating the reply's complete audit token, and imposing a bounded deadline. It does not load the host liblaunch_sim API.
 
 The C LiveProcess entry obtains the role only from validated broker bootstrap metadata. Guest paths, environment variables
 and spawn requests cannot request native mode. Role 2 retains the native cache and loads the backend only from
@@ -259,26 +309,55 @@ and spawn requests cannot request native mode. Role 2 retains the native cache a
 bundled files produce a normal preparation/READY error. The backend can use native Objective-C and dispatch; it is separate
 from both the UIKit host and the simulator process. The construction-only host CLI `--native-metal-probe` selects role 1.
 
-The broker creates an unlinked 4 KiB authorization file and retains its writable mapping. Only its read-only descriptor is
-passed to the helper at fixed **fd 3** through the existing descriptor transport. The helper imports a read-only mapping;
-the descriptor is then closed. There is no simulated parent/child wait relationship between this helper and launchd.
-Before releasing backboardd's launch plan, the broker publishes its complete kernel-audited native token and generation.
-The listener admits only exact-token matches. Guest PID translation does not alter audit tokens or authorize native peers.
+The broker creates a separate unlinked 4 KiB control file for each helper and retains its writable mapping. Only the
+helper's read-only descriptor is passed at fixed **fd 3** through the existing descriptor transport; the helper imports
+it, then closes the descriptor. Control ABI **2** distinguishes revoked, dedicated-owner and public-session modes.
+Dedicated mode carries the complete kernel-audited native token and is published before releasing that owner's launch
+plan. Public mode is published before starting the helper and requires a zero audit token; no per-client authorization is
+needed. `LSBNativeMetalControlPublish(control, NULL)` revokes either policy. Older ABI versions, invalid modes and residual
+audit words in public/revoked records are rejected. Host and packaged `MetalNativeProbe.dylib` must use the same ABI.
 
-The listener enables `xpc_connection_enable_sim2host_4sim` before activation. An export-trie alias exposes the original
-implementation's peer handler to the authorization wrapper without changing its instructions. The matching stock server
-handles all three connection types after admission. The successful clear and triangle trials establish mode-2 Metal framing,
-resource creation, source/pipeline compilation, GPU execution and shared IOSurface readback. The later stock backboardd
-trial also verifies the first real frame reaching the host image view; complete simulator boot remains unverified.
+The shared host `IOSurfaceRemoteServer` no longer has a broker owner allowlist. Each native client is handled by Apple's
+stock implementation, and closing the simulator session cancels all tracked peers and shuts down the server. A public
+client's exit or exec replacement does not disturb other clients. Indigo input and framebuffer submission retain their
+backboardd-only ownership.
 
-Each helper is limited to one owner/generation. A changed or revoked generation retires it permanently; the stock
-implementation retains a process-global `processRef` map and provides no reusable shutdown API. On owner exit or
-cancellation the broker revokes first, then terminates the helper. Helper failure fails pending dependent work and blocks
-further backboardd launches in that session. Restart the host/session to obtain a fresh helper. Exec by a process already
-owning a graphics service returns `ENOTSUP`; a second simultaneous Metal owner returns `EBUSY`.
+The Metal listener enables `xpc_connection_enable_sim2host_4sim` before activation. An export-trie alias exposes the original
+implementation's peer handler without changing its instructions. The wrapper applies the selected admission policy and
+then leaves each accepted connection's context, queue and handler to the stock implementation. Type-0 handshakes create
+independent application contexts and return `processRef` values; types 1 and 2 attach to their corresponding context.
+The stock map supports multiple contexts in one process, which the public helper now uses. This does not provide isolation
+between public clients: they share that helper's map and failure domain, while the dedicated graphics maps remain in
+separate processes.
 
-See [NativeMetal/README.md](../NativeMetal/README.md) for the pinned preparation tool, signing/package procedure, peer alias,
-authorization and lifetime limits. Keep simulator Metal out of the UIKit host and the native helper's system dependencies.
+Live connection limits are **256** for public Metal, **64** per dedicated Metal helper, and **64** for public IOSurface.
+The wrappers weakly track connections owned by the stock servers and count `allObjects.count` rather than `NSHashTable.count`.
+The latter can include zeroed weak entries; a native IOSurface reconnect test reproduced a permanent-full condition until
+this was corrected. Shutdown cancels remaining peers without retaining already disconnected connections indefinitely.
+
+A helper keeps its original policy and generation for life. Changing or revoking that generation permanently retires it;
+the stock implementation has no reusable shutdown API for replacing the process-global context map. Dedicated-owner exit
+revokes and terminates that owner's helper; dedicated-helper failure also stops its owner. SpringBoard helper/owner
+failure leaves the backboardd and public helpers intact. Public-client exit or exec leaves public authorization unchanged.
+Once the session is running, public-helper failure marks its service unavailable without terminating unrelated public
+clients or either dedicated helper. Public startup failure instead unwinds the session before launchd is released.
+Launchd teardown revokes and terminates all its helpers. Peer admission checks the control record, and
+100-ms polling provides secondary cancellation; it cannot undo GPU work already submitted.
+
+Exec by a dedicated graphics owner still returns `ENOTSUP`, and binding another owner to an occupied dedicated helper
+returns `EBUSY`. Ordinary public clients have no such owner binding and use the existing exec replacement path. Native
+helpers have no simulated parent/child wait relationship with launchd. Service names are registered in simulator launchd;
+public access does not add a service to the phone's global host bootstrap namespace.
+
+Local coverage includes control ABI discrimination, malformed records, concurrent publication and cross-process revocation;
+broker dependency startup, public READY failure, endpoint send-right ownership, delayed registration after helper death,
+independent client exit/exec and session cleanup; and real native IOSurface allocation/shared pixels from three processes
+without authorization, overflow rejection, capacity recovery and shutdown. The IOSurface run is recorded in
+`tmp/IOSurfaceServer-public-test.log`. This coverage does not itself verify icon artwork or public Metal rendering on the
+phone. Earlier clear/triangle and backboardd phone results remain evidence for the underlying framing and renderer.
+
+See [NativeMetal/README.md](../NativeMetal/README.md) for preparation, signing/package procedure and the peer alias. Keep
+simulator Metal out of the UIKit host and the native helpers' system dependencies.
 
 ## Native iOS 26.1 ABI inspection
 
@@ -400,11 +479,13 @@ why merely deploying resources under RuntimeRoot is insufficient; a device trace
 has not been captured. No environment variable selecting an additional compiler bundle was found in this libxpc build.
 `IPHONE_SIMULATOR_ROOT` is used there for SystemVersion.plist, not this registration path.
 
-The narrow C compatibility hook in `Guest/MetalCompilerRegistration.c` now runs from the inserted guest shim's constructor,
-after its libSystem dependency has initialized and after the native-cache handoff. Only the generated backboardd job sets
-`LSB_REGISTER_METAL_COMPILER=1`. The hook also requires the actual canonical `_NSGetExecutablePath` to equal canonical
-`DYLD_ROOT_PATH` plus `/usr/libexec/backboardd`, so an inherited variable cannot register a domain from launchd, xpcproxy,
-the compiler, or another executable. It resolves the one fixed compiler bundle inside that runtime root, rejects a bundle
+The narrow C compatibility hook in `Guest/MetalCompilerRegistration.c` runs from the inserted guest shim's constructor,
+after its libSystem dependency has initialized and after the native-cache handoff. The generated backboardd job and the
+selected job with exact label `com.apple.SpringBoard` and effective program
+`/System/Library/CoreServices/SpringBoard.app/SpringBoard` receive `LSB_REGISTER_METAL_COMPILER=1`. The hook also requires
+the actual canonical `_NSGetExecutablePath` to equal canonical `DYLD_ROOT_PATH` plus `/usr/libexec/backboardd` or that exact
+SpringBoard path. An inherited variable cannot register a domain from launchd, xpcproxy, the compiler, or another
+executable. It resolves the one fixed compiler bundle inside that runtime root, rejects a bundle
 symlink escaping the root, and requires nonempty regular readable `Info.plist` and `MTLCompilerService` files without following
 their final symlinks. Missing or invalid files produce an errno log and skip registration. There is no general plugin scan.
 
@@ -412,7 +493,7 @@ The hook uses the normally declared C API `xpc_add_bundle(path, 2)`. In this lib
 the API uncorks the domain and sends routine 800 with `type=5`, the caller's PID as `handle`, and the physical bundle path.
 It registers the service for demand launch rather than starting it directly. The API returns void and can abort on certain
 domain errors; the log therefore says only that the call returned, with success unconfirmed. It has no added retry, timeout,
-queue, or listener. A new backboardd replacement process runs its own constructor; service/domain lifetime remains managed
+queue, or listener. A new authorized guest process runs its own constructor; service/domain lifetime remains managed
 by simulator launchd. The constructor is deliberately not called from a dyld image callback.
 
 Focused tests cover exact opt-in, canonical role/path checks, sibling-root and symlink escapes, missing/special/empty files,
@@ -422,6 +503,68 @@ compiler launch and shader compilation on the phone. The later stock backboardd 
 and reaches its first presented frame. Relevant disassemblies are `tmp/backboardd/libxpc-sim-disassembly.txt` (`_xpc_add_bundle` at `0x243a4`,
 `__xpc_bootstrap_services` at `0x1aa84`, `__xpc_bundle_resolve_sync` at `0x29ac4`) and
 `tmp/backboardd/launchd-disassembly.txt` (cache fallback at `0x10000b3f4`–`0x10000b42c`).
+
+### SpringBoard compiler registration
+
+After the matching feature flags enabled the Solarium path, stock SpringBoard **3206** and **3290** aborted in
+`-[SUICOrbView _loadMetalPipelines]`: render-pipeline validation found a nil vertex function. Deploying the matching shader
+resources did not resolve it. The normal Siri class bundle and an explicit physical bundle both selected the same
+**217,164-byte** simulator `SiriUICore.framework/default.metallib`; nil `executableURL` was expected for a framework whose
+code resides in the cache. The file's function table contains **32** entries, including vertex `siriChipVert` and fragment
+`siriChipFrag`. Its SHA-256 is `697c4481b265d41acf1c3781b983f40032bd515866b04fdc322b367c33430606`.
+
+The temporary diagnostic in native SpringBoard **3722** captured a nonnil `_MTLLibrary` from
+`newDefaultLibraryWithBundle:error:` and nil from `newFunctionWithName:constantValues:error:` for `siriChipVert`.
+The latter returned `MTLLibraryErrorDomain` code **3**:
+
+```text
+Unable to reach MTLCompilerService. The process is unavailable because the compiler is no longer active.
+Latest invalidation reason: failed at lookup with error 3 - No such process
+```
+
+Siri passes a null error pointer to both APIs, hiding this cause behind the later pipeline assertion. The diagnostic only
+captured the original method results and errors; it did not force a library, function or pipeline result. Evidence is the
+**3722** segment of `tmp/siri-metal-diagnostic/guest-wifi.log`. The resource comparison is in
+`tmp/lsd-services/app-registration-com.kdt.LiveSimBooter.material-resources-probe.log`, and the independently parsed function
+table is `tmp/material-resources-research/siri-metallib-functions.json`.
+
+SpringBoard previously received only ExtensionKit's PID-domain import. That registers `extensionkitservice.xpc`, not the
+Metal compiler. The earlier triangle probe explicitly registered the compiler, and the production compiler constructor
+accepted only backboardd. The fix extends that existing normal `xpc_add_bundle(path, 2)` call to the second exact executable
+role and adds its opt-in only after the host validates the selected SpringBoard label and effective program. It does not
+change the native Metal helper, shader contents, feature flags or compiler replies.
+
+Tests on the applied source pass for both authorized executable paths, canonical-root aliases, wrong-directory and
+prefix lookalikes, sibling-root and symlink escapes, and missing, empty, symlinked or special compiler-bundle files.
+The registration boundary also passes ASan/UBSan. The launch-configuration tests verify the exact trusted pair and keep
+the opt-in out of unrelated jobs and bootstrap Self/Child environments. Logs are
+`tmp/siri-metal-diagnostic/tests-registration-applied.log`, `tests-registration-applied-asan.log`, and
+`tests-launchd-configuration-applied.log`.
+
+The production phone follow-up reached the Home Screen with native SpringBoard **3998**, after the compiler import and
+the matching AutoFillUI framework binary were installed. It passed the earlier Siri nil-vertex assertion without the
+temporary Metal diagnostic or forced shader results. The screenshot shows application labels, Calendar artwork, and
+changed dock/search styling with Solarium enabled; it does not establish complete glass-effect fidelity. Most application
+icons still have gradient placeholders and widget tiles are blank. Evidence is `tmp/autofillui-stage/guest-wifi.log`,
+`console-wifi.log`, and `springboard-wifi.png`.
+
+### IconServices follow-up
+
+The matching stock global job `com.apple.iconservices.iconservicesagent` publishes `com.apple.iconservices` and runs
+`/System/Library/CoreServices/iconservicesagent`. It is not a PID-domain XPC bundle. Its executable and original launchd
+plist were staged and signed; all 17 strong executable dependencies were already cached. Full resource copying did not
+include every dynamically loaded plugin executable.
+
+The phone experiment started native agents **4063**, **4083**, **4087**, and **4089**. Each reached the generic Metal
+endpoint and was rejected by the then-current backboardd-only owner restriction. The guest also reported missing
+matching CoreImage plugin code under `/System/Library/CoreImage`: `CIVisionFilters`, `CIBarcode`, `PortraitFilters`,
+`CIPassThrough`, and `CIInpainting`. Falling back to the native arm64e plugins failed the simulator architecture check.
+Evidence is `tmp/iconservices-stage/console-wifi.log` and `guest-wifi.log`; this experiment did not fix the placeholders.
+
+That experiment left IconServices out of its final Home Screen selection and introduced no additional Metal owner.
+The current public helper removes the generic endpoint's backboardd restriction for IconServices and other clients, as
+specified in [the current architecture](#isolated-native-service-route). The required simulator CoreImage plugin binaries
+remain a separate deployment requirement; opening the public endpoint alone does not establish successful icon artwork.
 
 ## Simulator framework resource lookup
 
@@ -482,3 +625,20 @@ containment, exact fallback, recursion, concurrent creation and preservation of 
 interposer. The focused tests pass normally, under ASan/UBSan and under TSan; the C source also links for arm64 iOS Simulator.
 Local Foundation disassemblies and seed-probe results are in `tmp/metal-iosurface/foundation-bundle-lookup.txt`,
 `foundation-cfbundle.txt`, `foundation-bundle-resource.txt`, and `quartzcore-bundle-seed-native.log`.
+
+### RenderBox binary archives on simulator devices
+
+Public admission exposed an additional stock IconServices failure on 2026-10-26: RenderBox called
+`newBinaryArchiveWithDescriptor:error:`, and Metal asserted in
+`+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]` because the target architecture was nil.
+The iOS 26 simulator `_MTLDevice` implementation of `targetDeviceArchitecture` returns nil; `MTLSimDevice` does not override it.
+RenderBox's existing `RB_USE_BINARY_ARCHIVE=0` option skips this hardware archive path and retains ordinary shader compilation.
+
+`LiveProcess/main.c` now supplies that setting to every simulator guest, replacing any conflicting inherited value.
+It also covers apps started with a replacement environment. Native Metal helper processes return before this guest handoff.
+IconServices receives the matching runtime framework resources and registers the simulator Metal compiler in its PID domain,
+using the same canonical executable checks as backboardd and SpringBoard.
+
+The five stock CoreImage filter bundles (`CIVisionFilters`, `CIBarcode`, `PortraitFilters`, `CIPassThrough`, `CIInpainting`)
+were separately signed and copied into RuntimeRoot. Their original `MH_BUNDLE` type and simulator platform remain intact;
+all strong dependencies are already present. Device copies use transfer completion and file size, without post-copy checksums.

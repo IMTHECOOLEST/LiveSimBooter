@@ -32,8 +32,12 @@ static mach_msg_timeout_t remainingMilliseconds(int64_t deadline) {
     return now < 0 || now >= deadline ? 0 : (mach_msg_timeout_t)((deadline - now + 999999) / 1000000);
 }
 
-static int registerEndpoint(mach_port_t service, const audit_token_t *audit, const char *name, mach_port_t endpoint,
-                            uint32_t timeoutMilliseconds, kern_return_t *status) {
+// Reconstructed from iOS 26.0 (23A343) RuntimeRoot/usr/lib/system/host/liblaunch_sim.dylib:
+// launch_sim_register_endpoint calls launch_mig_bridge_register (MIG request 701, reply 801).
+// Sim26Booter's use of the original API: https://github.com/khanhduytran0/Sim26Booter/blob/main/SimBooter/main.m
+// This version accepts an already-resolved service port and adds reply audit validation and a bounded deadline.
+static int LSB_launch_sim_register_endpoint(mach_port_t service, const audit_token_t *audit, const char *name, mach_port_t endpoint,
+                                           uint32_t timeoutMilliseconds, kern_return_t *status) {
     if (status) *status = -1;
     if (!timeoutMilliseconds || timeoutMilliseconds > 30000) return EINVAL;
     if (!MACH_PORT_VALID(service) || !MACH_PORT_VALID(endpoint) || !audit || !audit->val[5] || audit->val[5] > INT_MAX || !name) return EINVAL;
@@ -109,7 +113,7 @@ int LSBLaunchdRegisterEndpoint(mach_port_t service, const audit_token_t *expecte
 int LSBLaunchdRegisterEndpointWithTimeout(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
                                          mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *bootstrapStatus) {
     int savedErrno = errno;
-    int result = registerEndpoint(service, expectedAudit, name, endpoint, timeoutMilliseconds, bootstrapStatus);
+    int result = LSB_launch_sim_register_endpoint(service, expectedAudit, name, endpoint, timeoutMilliseconds, bootstrapStatus);
     errno = savedErrno;
     return result;
 }

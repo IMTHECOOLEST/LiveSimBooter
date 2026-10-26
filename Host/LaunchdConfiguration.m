@@ -217,6 +217,22 @@ static int addServiceJobs(NSString *root, const char *const labels[], NSMutableD
                 [key rangeOfString:@"\0"].location != NSNotFound || [value rangeOfString:@"\0"].location != NSNotFound) return EINVAL;
             if (serviceEnvironmentKey(key)) safeEnvironment[key] = value;
         }
+        // Cached framework paths need the matching simulator resources. Only this exact host-selected job receives the opt-in.
+        NSString *effectiveProgram = program ?: arguments[0];
+        if ([label isEqualToString:@"com.apple.SpringBoard"] &&
+            [effectiveProgram isEqualToString:@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"]) {
+            safeEnvironment[@"LSB_SIMULATE_FRAMEWORK_BUNDLES"] = @"1";
+            safeEnvironment[@"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS"] = @"1";
+            // libxpc PID-domain imports use cache image paths, independently of CFBundle resource redirection.
+            safeEnvironment[@"LSB_REGISTER_EXTENSIONKIT"] = @"1";
+            safeEnvironment[@"LSB_REGISTER_METAL_COMPILER"] = @"1";
+        }
+        if ([label isEqualToString:@"com.apple.iconservices.iconservicesagent"] &&
+            [effectiveProgram isEqualToString:@"/System/Library/CoreServices/iconservicesagent"]) {
+            // Icon rendering needs the matching simulator resources and its own PID-domain shader compiler.
+            safeEnvironment[@"LSB_REGISTER_METAL_COMPILER"] = @"1";
+            safeEnvironment[@"LSB_SIMULATE_FRAMEWORK_BUNDLES"] = @"1";
+        }
         if (safeEnvironment.count) job[@"EnvironmentVariables"] = safeEnvironment;
         NSData *jobData = [NSPropertyListSerialization dataWithPropertyList:job format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
         if (!jobData) return EINVAL;
@@ -294,7 +310,11 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"HOME": dataPath, @"CFFIXED_USER_HOME": dataPath, @"TMPDIR": [dataPath stringByAppendingString:@"/tmp/"],
             @"PATH": [NSString stringWithFormat:@"%@/usr/bin:%@/bin:%@/usr/sbin:%@/sbin", root, root, root, root]
         } mutableCopy];
-        if (services) runtimeEnvironment[@"LSB_SIMULATE_NOTIFICATION_SHM"] = @"1";
+        if (services) {
+            runtimeEnvironment[@"LSB_SIMULATE_NOTIFICATION_SHM"] = @"1";
+            runtimeEnvironment[@"LSB_SIMULATE_CODE_SIGNING"] = @"1";
+            runtimeEnvironment[@"LSB_ENABLE_PEER_PROCESS_INSPECTION"] = @"1";
+        }
         if (backboard) {
             runtimeEnvironment[@"LSB_SIMULATE_SYSTEM_POWER"] = @"1";
             // The cached client dlopens getenv directly; an absent value resolves its dispatch table back to its own trampolines.

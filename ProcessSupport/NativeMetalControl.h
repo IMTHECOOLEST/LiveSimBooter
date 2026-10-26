@@ -11,13 +11,14 @@ extern "C" {
 #endif
 
 #define LSB_NATIVE_METAL_CONTROL_SIZE 4096u
-#define LSB_NATIVE_METAL_CONTROL_VERSION 1u
+#define LSB_NATIVE_METAL_CONTROL_VERSION 2u
 
 // Opaque, pointer-free shared ABI. Initialize before sharing; never reinitialize a published mapping.
 typedef struct LSBNativeMetalControl LSBNativeMetalControl;
 typedef struct {
     uint64_t generation;
     bool authorized;
+    bool publicAccess;
     audit_token_t audit;
 } LSBNativeMetalAuthorization;
 
@@ -27,6 +28,8 @@ int LSBNativeMetalControlValidate(const LSBNativeMetalControl *control, size_t s
 // NULL revokes. Invalid tokens return EINVAL without changing the record. Concurrent publishers return EBUSY; serialize host updates.
 // Successful publication is immediately visible to subsequent coherent reads. Exhaustion permanently fails closed with EOVERFLOW.
 int LSBNativeMetalControlPublish(LSBNativeMetalControl *control, const audit_token_t *audit);
+// Authorize any client for a session-owned public helper. Publishes a zero audit token; Publish(NULL) revokes this mode too.
+int LSBNativeMetalControlPublishPublic(LSBNativeMetalControl *control);
 // Requires a complete mapped page. Clears output on every error. A coherent revoked snapshot returns 0 with authorized=false.
 // Makes at most eight attempts; an in-progress publication returns EAGAIN. No locks, allocation, or unbounded waits.
 int LSBNativeMetalControlRead(const LSBNativeMetalControl *control, LSBNativeMetalAuthorization *authorization);

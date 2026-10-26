@@ -2,14 +2,29 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/event.h>
 #include <sys/wait.h>
+#include "../Host/GuestEntitlementsConversion.h"
+static int testCopyXMLFromDEREntitlements(const void *, size_t, void **, size_t *);
+static int testReadMachOCodeDirectoryHash(int, unsigned char [20]);
+static kern_return_t testTaskInfo(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+#define LSBCopyXMLFromDEREntitlements testCopyXMLFromDEREntitlements
+#define LSBReadMachOCodeDirectoryHash testReadMachOCodeDirectoryHash
 #define LSBLaunchdRegisterEndpointWithTimeout LSBTestRegisterEndpoint
+#define task_info testTaskInfo
+#define handleMessage brokerHandleMessage
 #include "../Host/Broker.m"
+#undef handleMessage
+#undef task_info
 #undef LSBLaunchdRegisterEndpointWithTimeout
+#undef LSBCopyXMLFromDEREntitlements
+#undef LSBReadMachOCodeDirectoryHash
 
 typedef struct {
     unsigned objectID;
@@ -38,17 +53,67 @@ static audit_token_t signaledAudit;
 static void (^signalHook)(void);
 static LSBExtensionEvent extensionCallback;
 static void (^readyReplyHook)(void);
+static void (^checkInReplyHook)(void);
 static unsigned endpointCalls;
-static int endpointErrors[5];
-static char registeredEndpoints[5][128];
-static mach_port_t registeredPorts[5];
-static audit_token_t registeredAudits[5];
-static uint32_t registeredTimeouts[5];
+static NSMutableArray<NSNumber *> *publicTestEndpoints;
+static int endpointErrors[6];
+static char registeredEndpoints[6][128];
+static mach_port_t registeredPorts[6];
+static audit_token_t registeredAudits[6];
+static uint32_t registeredTimeouts[6];
 static void (^endpointHook)(unsigned index);
+static NSData *entitlementsReply;
+static int xmlConversionError;
+static NSData *codeDirectoryHash;
+static int codeDirectoryHashError;
+static void (^afterCodeDirectoryRead)(int fd);
+static LSBPeerProcessIdentity identityReply;
+static audit_token_t testTaskAudit;
+static BOOL useRealTaskInfo, preserveCheckInIdentity, mismatchTaskAudit;
+static kern_return_t taskInfoError;
+
+static int testReadMachOCodeDirectoryHash(int fd, unsigned char output[20]) {
+    struct stat info;
+    assert(!fstat(fd, &info) && S_ISREG(info.st_mode));
+    memset(output, 0, LSB_GUEST_CDHASH_BYTES);
+    if (codeDirectoryHashError) return codeDirectoryHashError;
+    if (!codeDirectoryHash) return ENOENT;
+    assert(codeDirectoryHash.length == LSB_GUEST_CDHASH_BYTES);
+    memcpy(output, codeDirectoryHash.bytes, codeDirectoryHash.length);
+    if (afterCodeDirectoryRead) afterCodeDirectoryRead(fd);
+    return 0;
+}
+
+static kern_return_t testTaskInfo(task_name_t port, task_flavor_t flavor, task_info_t output, mach_msg_type_number_t *count) {
+    if (useRealTaskInfo) return task_info(port, flavor, output, count);
+    assert(flavor == TASK_AUDIT_TOKEN && *count == TASK_AUDIT_TOKEN_COUNT);
+    if (taskInfoError) return taskInfoError;
+    audit_token_t audit = testTaskAudit;
+    if (mismatchTaskAudit) ++audit.val[7];
+    memcpy(output, &audit, sizeof(audit));
+    *count = TASK_AUDIT_TOKEN_COUNT;
+    return KERN_SUCCESS;
+}
+
+static void handleMessage(LSBReceivedMessage *message) {
+    testTaskAudit = message->audit;
+    if (message->kind == LSB_REQUEST_CHECKIN && !preserveCheckInIdentity) {
+        message->peerIdentity.audit = message->audit;
+        memcpy(message->peerIdentity.shortInfo, &message->audit.val[5], sizeof(uint32_t));
+    }
+    if (message->kind == LSB_REQUEST_COPY_PROCESS_IDENTITY)
+        for (LSBJob *job in jobs) if (job.pid == message->targetPID) { testTaskAudit = job.audit; break; }
+    brokerHandleMessage(message);
+}
+
+static int testCopyXMLFromDEREntitlements(const void *der, size_t size, void **xml, size_t *xmlSize) {
+    if (xmlConversionError) { *xml = NULL; *xmlSize = 0; return xmlConversionError; }
+    return LSBCopyXMLFromDEREntitlements(der, size, xml, xmlSize);
+}
 
 int LSBTestRegisterEndpoint(mach_port_t service, const audit_token_t *audit, const char *name,
                             mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *status) {
-    assert(!NSThread.isMainThread && MACH_PORT_VALID(service) && audit && name && status && endpointCalls < 5);
+    assert(!NSThread.isMainThread && MACH_PORT_VALID(service) && audit && name && status && endpointCalls < 6);
     unsigned index = endpointCalls++;
     assert(strlen(name) < sizeof(registeredEndpoints[index]));
     strcpy(registeredEndpoints[index], name);
@@ -91,14 +156,9 @@ int LSBTestRegisterEndpoint(mach_port_t service, const audit_token_t *audit, con
 @end
 
 @interface RecordedIOSurfaceServer : LSBIOSurfaceServer
-@property unsigned authorizations, revocations, closes;
-@property audit_token_t authorizedAudit;
+@property unsigned closes;
 @end
 @implementation RecordedIOSurfaceServer
-- (void)authorizeClientWithAuditToken:(const audit_token_t *)audit {
-    if (audit) { self.authorizedAudit = *audit; ++self.authorizations; }
-    else { self.authorizedAudit = (audit_token_t){{0}}; ++self.revocations; }
-}
 - (pid_t)connectedClientPID { return 0; }
 - (mach_port_t)registrationPort { return 333; }
 - (void)close { ++self.closes; }
@@ -179,7 +239,7 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
     assert(message && message->object && replyCount < 128);
     int sendError = message->kind == LSB_REQUEST_READY ? readySendError : 0;
     if (plan) {
-        assert(root && !strcmp(root, "/tmp/RuntimeRoot") && fds);
+        assert(root && !strcmp(root, runtimeRoot.fileSystemRepresentation) && fds);
         for (unsigned i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
     }
     unsigned identifier = ((TestMessageObject *)message->object)->identifier;
@@ -188,6 +248,23 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
     message->object = NULL;
     if (message->kind == LSB_REQUEST_READY && readyReplyHook) readyReplyHook();
     return sendError;
+}
+int LSBTransportReplyEntitlements(LSBReceivedMessage *message, int error, const void *bytes, size_t size) {
+    assert(message->kind == LSB_REQUEST_COPY_ENTITLEMENTS);
+    assert(error ? !bytes && !size : bytes && size >= 8);
+    if (!error && message->entitlementOperation == 5) assert(size == LSB_GUEST_CDHASH_BYTES);
+    else if (!error) assert(((const unsigned char *)bytes)[3] == (message->entitlementOperation == 7 ? 0x71 : 0x72));
+    entitlementsReply = error ? nil : [NSData dataWithBytes:bytes length:size];
+    return LSBTransportReply(message, error, 0, 0, NULL, NULL, NULL);
+}
+int LSBTransportReplyProcessIdentity(LSBReceivedMessage *message, int error, const LSBPeerProcessIdentity *identity) {
+    assert(message->kind == LSB_REQUEST_COPY_PROCESS_IDENTITY && (error ? identity == NULL : identity != NULL));
+    LSBPeerProcessIdentityDispose(&identityReply);
+    if (!error) {
+        identityReply = *identity;
+        assert(mach_port_mod_refs(mach_task_self(), identityReply.taskName, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS);
+    }
+    return LSBTransportReply(message, error, 0, 0, NULL, NULL, NULL);
 }
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
@@ -213,6 +290,7 @@ int LSBTransportReplyBootstrapWithMetadata(LSBReceivedMessage *message, int erro
                                            const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD,
                                            const LSBBootstrapMetadata *metadata) {
     assert(metadata && metadata->guestPID > 0 && metadata->parentPID >= 0 && metadata->ports);
+    if (checkInReplyHook) checkInReplyHook();
     int result;
     if (metadata->launchdTankPort)
         result = LSBTransportReplyLaunchdBootstrap(message, error, pid, requestID, root, plan, fds, statusFD, wakeFD, metadata->launchdTankPort);
@@ -228,6 +306,7 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     message->object = NULL;
     if (MACH_PORT_VALID(message->nativeServicePort)) mach_port_deallocate(mach_task_self(), message->nativeServicePort);
     message->nativeServicePort = MACH_PORT_NULL;
+    LSBPeerProcessIdentityDispose(&message->peerIdentity);
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) {
         if (message->fds[i] >= 0) close(message->fds[i]);
         message->fds[i] = -1;
@@ -254,16 +333,29 @@ static void resetBroker(void) {
     }
     startingJob = nil;
     jobs = [NSMutableArray new];
+    for (NSNumber *endpoint in publicTestEndpoints)
+        assert(!mach_port_mod_refs(mach_task_self(), endpoint.unsignedIntValue, MACH_PORT_RIGHT_RECEIVE, -1));
+    publicTestEndpoints = [NSMutableArray new];
     runtimeRoot = @"/tmp/RuntimeRoot";
     nextIdentifier = 1;
     launchLaneFailed = NO;
     enableIndigo = NO;
-    retiredIdentityCount = auditResolutionLogs = 0;
+    enableSpringBoardMetal = NO;
+    retiredIdentityCount = auditResolutionLogs = peerIdentityLogs = guestEntitlementErrorLogs = guestProxySigningErrorLogs = 0;
     retiredIdentitiesFull = NO;
     memset(retiredIdentities, 0, sizeof(retiredIdentities));
     readyReplyHook = nil;
+    checkInReplyHook = nil;
     signalHook = nil;
     endpointHook = nil;
+    entitlementsReply = nil;
+    LSBPeerProcessIdentityDispose(&identityReply);
+    useRealTaskInfo = preserveCheckInIdentity = mismatchTaskAudit = NO;
+    taskInfoError = KERN_SUCCESS;
+    xmlConversionError = 0;
+    codeDirectoryHash = nil;
+    codeDirectoryHashError = 0;
+    afterCodeDirectoryRead = nil;
     endpointCalls = 0;
     memset(endpointErrors, 0, sizeof(endpointErrors));
     memset(registeredEndpoints, 0, sizeof(registeredEndpoints));
@@ -295,6 +387,11 @@ static LSBReceivedMessage *messageFor(uint32_t kind, pid_t pid, uint32_t generat
     message->requestID = requestID;
     message->audit.val[5] = (unsigned)pid;
     message->audit.val[7] = generation;
+    if (kind == LSB_REQUEST_CHECKIN) {
+        assert(task_name_for_pid(mach_task_self(), getpid(), &message->peerIdentity.taskName) == KERN_SUCCESS);
+        message->peerIdentity.audit = message->audit;
+        memcpy(message->peerIdentity.shortInfo, &message->audit.val[5], sizeof(uint32_t));
+    }
     return message;
 }
 
@@ -775,7 +872,6 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
         assert(proxy.phase == JobRunning && !startingJob && replyFor(proxyObject) && !replyFor(proxyObject)->error);
         assert(!indigo.authorizations && !parent.indigoAuthorizedIdentifier);
         assert(!framebuffer.authorizations && !parent.framebufferAuthorizedIdentifier);
-        assert(!iosurface.authorizations && !parent.iosurfaceAuthorizedIdentifier);
 
         unsigned execObject;
         request = spawnRequest(&fd, &execObject);
@@ -797,7 +893,6 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
             assert(!findJob(replacement.identifier) && !proxy.replacementIdentifier && findJob(proxy.identifier));
             assert(submittedLaunches == launches + 1 && !indigo.authorizations && !indigo.revocations && !deliveredSignals);
             assert(!framebuffer.authorizations && !framebuffer.revocations);
-            assert(!iosurface.authorizations && !iosurface.revocations);
             assertClosed(fd);
             continue;
         }
@@ -814,9 +909,6 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
         audit_token_t framebufferAudit = framebuffer.authorizedAudit;
         assert(framebuffer.authorizations == 1 && !framebuffer.revocations && !memcmp(&framebufferAudit, &identity, sizeof(identity)));
         assert(parent.framebufferAuthorizedIdentifier == replacement.identifier && !framebuffer.connectedClientPID);
-        audit_token_t iosurfaceAudit = iosurface.authorizedAudit;
-        assert(iosurface.authorizations == 1 && !iosurface.revocations && !memcmp(&iosurfaceAudit, &identity, sizeof(identity)));
-        assert(parent.iosurfaceAuthorizedIdentifier == replacement.identifier && !iosurface.connectedClientPID);
         LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, reportedPID, 202, replacement.identifier);
         ready->audit = identity;
         ready->error = scenario == 3 ? ENOEXEC : 0;
@@ -825,7 +917,6 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
             assert(replyFor(execObject)->error == ENOEXEC && findJob(proxy.identifier) && !proxy.replacementIdentifier);
             assert(!findJob(replacement.identifier) && indigo.revocations == 1 && !parent.indigoAuthorizedIdentifier);
             assert(framebuffer.revocations == 1 && !parent.framebufferAuthorizedIdentifier);
-            assert(iosurface.revocations == 1 && !parent.iosurfaceAuthorizedIdentifier);
             assert(!deliveredSignals);
             continue;
         }
@@ -833,11 +924,9 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
         // Retiring xpcproxy must not revoke the newly authorized replacement.
         assert(indigo.authorizations == 1 && !indigo.revocations && parent.indigoAuthorizedIdentifier == replacement.identifier);
         assert(framebuffer.authorizations == 1 && !framebuffer.revocations && parent.framebufferAuthorizedIdentifier == replacement.identifier);
-        assert(iosurface.authorizations == 1 && !iosurface.revocations && parent.iosurfaceAuthorizedIdentifier == replacement.identifier);
         recordChildExit(proxy.identifier, SIGKILL);
         assert(!indigo.revocations);
         assert(!framebuffer.revocations);
-        assert(!iosurface.revocations);
         // Death before the first Indigo connection still revokes this exact native identity.
         assert(!indigo.connectedClientPID);
         recordChildExit(replacement.identifier, SIGTERM);
@@ -846,23 +935,20 @@ static void testGraphicsRegistrationGatesExecOnly(void) {
         assert(indigo.revocations == 1 && !memcmp(&authorized, &empty, sizeof(empty)) && !parent.indigoAuthorizedIdentifier);
         framebufferAudit = framebuffer.authorizedAudit;
         assert(framebuffer.revocations == 1 && !memcmp(&framebufferAudit, &empty, sizeof(empty)) && !parent.framebufferAuthorizedIdentifier);
-        iosurfaceAudit = iosurface.authorizedAudit;
-        assert(iosurface.revocations == 1 && !memcmp(&iosurfaceAudit, &empty, sizeof(empty)) && !parent.iosurfaceAuthorizedIdentifier);
         recordChildExit(replacement.identifier, SIGTERM);
         assert(indigo.revocations == 1);
         assert(framebuffer.revocations == 1);
-        assert(iosurface.revocations == 1);
     }
 }
 
 static void testGraphicsOwnerExecIsRejectedWithoutChangingAuthorization(void) {
-  for (unsigned servers = 1; servers <= 7; ++servers) {
+  for (unsigned servers = 1; servers <= 3; ++servers) {
     resetBroker();
     LSBJob *parent = runTestJob(nil, 210);
     parent.simulatorLaunchd = YES;
     RecordedIndigoServer *indigo = (servers & 1) ? [RecordedIndigoServer new] : nil;
     RecordedFramebufferServer *framebuffer = (servers & 2) ? [RecordedFramebufferServer new] : nil;
-    RecordedIOSurfaceServer *iosurface = (servers & 4) ? [RecordedIOSurfaceServer new] : nil;
+    RecordedIOSurfaceServer *iosurface = [RecordedIOSurfaceServer new];
     parent.indigo = indigo;
     parent.framebuffer = framebuffer;
     parent.iosurface = iosurface;
@@ -878,7 +964,6 @@ static void testGraphicsOwnerExecIsRejectedWithoutChangingAuthorization(void) {
     assert(old.phase == JobRunning);
     if (indigo) assert(indigo.authorizations == 1 && parent.indigoAuthorizedIdentifier == old.identifier);
     if (framebuffer) assert(framebuffer.authorizations == 1 && parent.framebufferAuthorizedIdentifier == old.identifier);
-    if (iosurface) assert(iosurface.authorizations == 1 && parent.iosurfaceAuthorizedIdentifier == old.identifier);
     unsigned launches = submittedLaunches;
     uint64_t next = nextIdentifier;
     LSBChildStatus *ledger = old.childStatus;
@@ -902,21 +987,15 @@ static void testGraphicsOwnerExecIsRejectedWithoutChangingAuthorization(void) {
             assert(parent.framebufferAuthorizedIdentifier == old.identifier && !memcmp(&authorized, &identity, sizeof(identity)));
             assert(framebuffer.authorizations == 1 && !framebuffer.revocations);
         }
-        if (iosurface) {
-            audit_token_t authorized = iosurface.authorizedAudit;
-            assert(parent.iosurfaceAuthorizedIdentifier == old.identifier && !memcmp(&authorized, &identity, sizeof(identity)));
-            assert(iosurface.authorizations == 1 && !iosurface.revocations);
-        }
         assertClosed(fd);
         LSBChildObservation observation;
         assert(!LSBChildStatusObserve(parent.childStatus, old.guestPID, &observation));
         assert(!observation.execGeneration && !observation.exited && observation.nativePID == old.pid);
     }
     recordChildExit(old.identifier, SIGTERM);
-    assert(!parent.indigoAuthorizedIdentifier && !parent.framebufferAuthorizedIdentifier && !parent.iosurfaceAuthorizedIdentifier);
+    assert(!parent.indigoAuthorizedIdentifier && !parent.framebufferAuthorizedIdentifier);
     if (indigo) assert(indigo.revocations == 1);
     if (framebuffer) assert(framebuffer.revocations == 1);
-    if (iosurface) assert(iosurface.revocations == 1);
   }
 }
 
@@ -1050,7 +1129,7 @@ static LSBJob *managedJob(LSBJob *parent, pid_t identity) {
 }
 
 static void testGlobalJobCapacity(void) {
-    assert(BrokerJobCapacity == 2 * LSB_CHILD_STATUS_CAPACITY + 2);
+    assert(BrokerJobCapacity == 2 * LSB_CHILD_STATUS_CAPACITY + 3);
     for (unsigned replacing = 0; replacing < 2; ++replacing) {
         resetBroker();
         for (unsigned index = 0; index < BrokerJobCapacity - 1; ++index) managedJob(nil, 6000 + index);
@@ -1114,7 +1193,8 @@ static void testFullLaunchdBatchFitsExecOverlap(void) {
     resetBroker();
     LSBJob *launchd = managedJob(nil, 6700);
     launchd.simulatorLaunchd = YES;
-    managedJob(nil, 6701); // Host-owned native Metal helper occupies a physical job, not a launchd child-ledger slot.
+    managedJob(nil, 6701); // Host-owned native Metal helpers occupy physical jobs, not launchd child-ledger slots.
+    managedJob(nil, 6750);
     NSMutableArray<LSBJob *> *proxies = [NSMutableArray array];
     for (unsigned i = 0; i < LSB_CHILD_STATUS_CAPACITY; ++i) [proxies addObject:managedJob(launchd, 6702 + i)];
     int fds[LSB_CHILD_STATUS_CAPACITY];
@@ -1414,9 +1494,10 @@ static mach_port_t newServiceEndpoint(void) {
     return endpoint;
 }
 
-static LSBJob *queueNativeMetalSession(LSBJob **launchd, const LSBNativeMetalControl **reader) {
+static LSBJob *queueNativeMetalSessionWithSpringBoard(LSBJob **launchd, const LSBNativeMetalControl **reader, BOOL springBoard) {
     resetBroker();
     enableIndigo = YES;
+    enableSpringBoardMetal = springBoard;
     int fd;
     unsigned object;
     LSBReceivedMessage *initial = spawnRequest(&fd, &object);
@@ -1425,9 +1506,9 @@ static LSBJob *queueNativeMetalSession(LSBJob **launchd, const LSBNativeMetalCon
     setRequestProgram(initial, "/sbin/launchd_sim");
     assert(!LSBPlanAddString(&initial->plan, "LSB_SIMULATOR_LAUNCHD=1", &initial->plan.envp[initial->plan.envc++]));
     assert(!enqueueInitialJob(initial, LSB_EXECUTION_SIMULATOR));
-    assert(jobs.count == 2 && startingJob == jobs[0] && submittedLaunches == 1);
+    assert(jobs.count == (springBoard ? 4u : 3u) && startingJob == jobs[0] && submittedLaunches == 1);
     LSBJob *helper = jobs[0];
-    *launchd = jobs[1];
+    *launchd = jobs.lastObject;
     assert(helper.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE && helper.nativeMetalControl && !helper.parentIdentifier);
     assert(submittedLaunchOptions == LSB_EXTENSION_LAUNCH_GPU);
     assert((*launchd).simulatorLaunchd && !(*launchd).parentIdentifier && (*launchd).nativeMetalServiceIdentifier == helper.identifier);
@@ -1437,8 +1518,23 @@ static LSBJob *queueNativeMetalSession(LSBJob **launchd, const LSBNativeMetalCon
     assert(helper.request->plan.fds[index].number == 3 && !helper.request->plan.fds[index].flags);
     assert((fcntl(helper.request->fds[index], F_GETFL) & O_ACCMODE) == O_RDONLY);
     assert(!LSBNativeMetalControlImport(helper.request->fds[index], reader));
+    if (springBoard) {
+        LSBJob *second = jobs[1];
+        struct stat firstFile, secondFile;
+        assert(!fstat(helper.request->fds[index], &firstFile));
+        assert(!fstat(second.request->fds[second.request->plan.fdCount - 1], &secondFile));
+        assert(firstFile.st_dev != secondFile.st_dev || firstFile.st_ino != secondFile.st_ino);
+        assert(helper.nativeMetalControl != second.nativeMetalControl && second.nativeMetalControl);
+        assert((*launchd).springBoardMetalSelected && (*launchd).springBoardMetalServiceIdentifier == second.identifier);
+    }
+    LSBJob *publicHelper = findJob((*launchd).publicMetalServiceIdentifier);
+    assert(publicHelper && publicHelper == jobs[jobs.count - 2] && publicHelper != helper && !publicHelper.parentIdentifier);
+    assert(publicHelper.nativeMetalControl && publicHelper.nativeMetalControl != helper.nativeMetalControl);
     LSBNativeMetalAuthorization authorization;
-    assert(!LSBNativeMetalControlRead(*reader, &authorization) && !authorization.authorized);
+    assert(!LSBNativeMetalControlRead(publicHelper.nativeMetalControl, &authorization) && authorization.authorized && authorization.publicAccess);
+    audit_token_t empty = {{0}};
+    assert(!memcmp(&authorization.audit, &empty, sizeof(empty)) && !publicHelper.nativeMetalAuthorizedIdentifier);
+    assert(!LSBNativeMetalControlRead(*reader, &authorization) && !authorization.authorized && !authorization.publicAccess);
     reportedPID = getpid() + 300;
     handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 900, 0));
     assert(helper.phase == JobDispatched && replies[replyCount - 1].executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE);
@@ -1446,7 +1542,28 @@ static LSBJob *queueNativeMetalSession(LSBJob **launchd, const LSBNativeMetalCon
     return helper;
 }
 
+static LSBJob *queueNativeMetalSession(LSBJob **launchd, const LSBNativeMetalControl **reader) {
+    return queueNativeMetalSessionWithSpringBoard(launchd, reader, NO);
+}
+
+static void readyPublicMetalHelper(LSBJob *launchd) {
+    LSBJob *helper = findJob(launchd.publicMetalServiceIdentifier);
+    assert(helper && helper.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE);
+    if (helper.phase == JobRunning) return;
+    assert(startingJob == helper && helper.phase == JobStarting && launchd.phase == JobQueued);
+    reportedPID = getpid() + (pid_t)helper.identifier + 500;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 990, 0));
+    assert(helper.phase == JobDispatched && launchd.phase == JobQueued);
+    mach_port_t endpoint = newServiceEndpoint();
+    [publicTestEndpoints addObject:@(endpoint)];
+    LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, helper.pid, helper.pidVersion, helper.identifier);
+    ready->nativeServicePort = endpoint;
+    handleMessage(ready);
+    assert(helper.phase == JobRunning && startingJob == launchd);
+}
+
 static void makeSessionLaunchdRunning(LSBJob *launchd) {
+    readyPublicMetalHelper(launchd);
     assert(startingJob == launchd && launchd.phase == JobStarting);
     launchd.phase = JobRunning;
     launchd.pid = launchd.guestPID = getpid() + 100;
@@ -1474,7 +1591,8 @@ static void testNativeMetalReadyGatesLaunchd(void) {
         handleMessage(ready);
         if (!failure) {
             assert(helper.phase == JobRunning && helper.nativeServicePort == endpoint && hasRight(endpoint, MACH_PORT_TYPE_SEND));
-            assert(startingJob == launchd && submittedLaunches == 2 && !helper.parentIdentifier && !launchd.parentIdentifier);
+            assert(startingJob == findJob(launchd.publicMetalServiceIdentifier) && submittedLaunches == 2);
+            assert(!helper.parentIdentifier && !launchd.parentIdentifier);
             makeSessionLaunchdRunning(launchd);
             finishJob(launchd, ECANCELED);
         } else assert(!jobs.count && !startingJob && submittedLaunches == 1);
@@ -1630,7 +1748,7 @@ static void testMetalEndpointRegistration(void) {
         registerDisplayServices(launchd, service);
         runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
         assert(endpointCalls == (failure == 1 ? 4u : 5u) && launchd.servicesError == (failure ? EACCES : 0));
-        assert(!strcmp(registeredEndpoints[3], "com.apple.metal.simulator") && registeredPorts[3] == endpoint);
+        assert(!strcmp(registeredEndpoints[3], "com.apple.metal.simulator") && registeredPorts[3] == findJob(launchd.publicMetalServiceIdentifier).nativeServicePort);
         if (failure != 1) assert(!strcmp(registeredEndpoints[4], "com.apple.metal.simulator.backboardd") && registeredPorts[4] == endpoint);
         audit_token_t expected = launchd.audit;
         assert(!memcmp(&registeredAudits[3], &expected, sizeof(expected)));
@@ -1644,35 +1762,889 @@ static void testMetalEndpointRegistration(void) {
 }
 
 static void testMetalRegistrationCannotClearHelperDeath(void) {
-    LSBJob *launchd;
-    const LSBNativeMetalControl *reader;
-    LSBJob *helper = queueNativeMetalSession(&launchd, &reader);
-    mach_port_t endpoint = newServiceEndpoint(), service = newServiceEndpoint();
+    for (unsigned publicDeath = 0; publicDeath < 2; ++publicDeath) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *reader;
+        LSBJob *helper = queueNativeMetalSession(&launchd, &reader);
+        mach_port_t endpoint = newServiceEndpoint(), service = newServiceEndpoint();
+        LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, helper.pid, helper.pidVersion, helper.identifier);
+        ready->nativeServicePort = endpoint;
+        handleMessage(ready);
+        makeSessionLaunchdRunning(launchd);
+        LSBJob *dying = publicDeath ? findJob(launchd.publicMetalServiceIdentifier) : helper;
+        mach_port_t dyingPort = dying.nativeServicePort;
+        launchd.servicesPending = YES;
+        dispatch_semaphore_t entered = dispatch_semaphore_create(0), release = dispatch_semaphore_create(0);
+        endpointHook = ^(unsigned index) {
+            if (index) return;
+            dispatch_semaphore_signal(entered);
+            assert(!dispatch_semaphore_wait(release, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+        };
+        registerDisplayServices(launchd, service);
+        assert(!dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+        recordChildExit(dying.identifier, SIGABRT);
+        assert(launchd.servicesError == EPIPE && !launchd.servicesPending);
+        // Each in-flight endpoint registration owns a reference even after its helper is retired.
+        assert(hasRight(dyingPort, MACH_PORT_TYPE_SEND));
+        launchd.servicesPending = YES;
+        dispatch_semaphore_signal(release);
+        runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
+        assert(launchd.servicesError == EPIPE && endpointCalls == 2 && !hasRight(dyingPort, MACH_PORT_TYPE_SEND));
+        finishJob(launchd, ECANCELED);
+        assert(!mach_port_mod_refs(mach_task_self(), endpoint, MACH_PORT_RIGHT_RECEIVE, -1));
+        assert(!mach_port_deallocate(mach_task_self(), service));
+        assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
+        LSBNativeMetalControlUnmap(reader);
+    }
+}
+
+static void testHostSpringBoardMetalSelection(void) {
+    char temporary[] = "/tmp/LSBBrokerSpringBoard.XXXXXX";
+    assert(mkdtemp(temporary));
+    char canonical[PATH_MAX];
+    assert(realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    NSArray *cases = @[
+        @{@"Label": @"com.apple.SpringBoard", @"Program": @"/System/Library/CoreServices/SpringBoard.app/SpringBoard", @"expected": @YES},
+        @{@"Label": @"com.apple.SpringBoard", @"ProgramArguments": @[@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"], @"expected": @YES},
+        @{@"Label": @"com.apple.SpringBoard", @"Program": @"/bin/df",
+          @"ProgramArguments": @[@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"], @"expected": @NO},
+        @{@"Label": @"com.apple.SpringBoard", @"Program": @"/System/Library/CoreServices/SpringBoard.app/SpringBoardOther", @"expected": @NO},
+        @{@"Label": @"com.apple.other", @"Program": @"/System/Library/CoreServices/SpringBoard.app/SpringBoard", @"expected": @NO}
+    ];
+    for (NSDictionary *test in cases) {
+        resetBroker();
+        runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+        NSString *daemons = [runtimeRoot stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
+        assert([manager createDirectoryAtPath:daemons withIntermediateDirectories:YES attributes:nil error:NULL]);
+        NSDictionary *backboard = @{@"MachServices": @{@"com.apple.backboardd.virtualframebuffer": @YES}};
+        assert([backboard writeToFile:[daemons stringByAppendingPathComponent:@"com.apple.backboardd.plist"] atomically:YES]);
+        NSDictionary *preferences = @{@"Label": @"com.apple.cfprefsd.xpc.daemon", @"ProgramArguments": @[@"/usr/sbin/cfprefsd", @"daemon"],
+                                     @"MachServices": @{@"com.apple.cfprefsd.daemon": @YES}};
+        assert([preferences writeToFile:[daemons stringByAppendingPathComponent:@"com.apple.cfprefsd.xpc.daemon.plist"] atomically:YES]);
+        NSString *label = test[@"Label"], *path = [daemons stringByAppendingPathComponent:[label stringByAppendingString:@".plist"]];
+        NSMutableDictionary *stock = test.mutableCopy;
+        [stock removeObjectForKey:@"expected"];
+        assert([stock writeToFile:path atomically:YES]);
+        LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
+        const char *argv[] = {"LiveSimBooter", "--launchd-services", label.UTF8String, NULL};
+        assert(!initialPlan(initial, 3, argv, NULL));
+        assert(enableSpringBoardMetal == [test[@"expected"] boolValue]);
+        BOOL selected = YES;
+        const char *unselected[] = {"com.apple.other", NULL};
+        assert(!configuredSpringBoardMetal(&initial->plan, unselected, &selected) && !selected);
+        disposeMessage(initial);
+    }
+    assert([manager removeItemAtPath:directory error:NULL]);
+    resetBroker();
+    LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
+    const char *argv[] = {"LiveSimBooter", "/System/Library/CoreServices/SpringBoard.app/SpringBoard", NULL};
+    const char *env[] = {"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS=1", "LSB_NATIVE_METAL_SERVICE=1", NULL};
+    assert(!initialPlan(initial, 2, argv, env) && !enableSpringBoardMetal && !enableIndigo);
+    disposeMessage(initial); // Neither an executable path nor guest environment can provision the host-native role.
+}
+
+static LSBJob *readyMetalHelper(LSBJob *helper, mach_port_t endpoint, uint32_t generation) {
+    if (helper.phase == JobStarting) {
+        reportedPID = getpid() + (pid_t)helper.identifier + 300;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, generation, 0));
+    }
+    assert(helper.phase == JobDispatched);
     LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, helper.pid, helper.pidVersion, helper.identifier);
     ready->nativeServicePort = endpoint;
     handleMessage(ready);
-    makeSessionLaunchdRunning(launchd);
-    launchd.servicesPending = YES;
-    dispatch_semaphore_t entered = dispatch_semaphore_create(0), release = dispatch_semaphore_create(0);
-    endpointHook = ^(unsigned index) {
-        if (index) return;
-        dispatch_semaphore_signal(entered);
-        assert(!dispatch_semaphore_wait(release, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+    assert(helper.phase == JobRunning && helper.nativeServicePort == endpoint);
+    return helper;
+}
+
+static LSBJob *startGraphicsOwner(LSBJob *launchd, const char *program, uint32_t generation) {
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    setRequestProgram(request, program);
+    enqueueSpawn(request, launchd);
+    LSBJob *owner = startingJob;
+    assert(owner);
+    reportedPID = getpid(); // READY obtains a real process group; distinct audit generations model the independent owners.
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, generation, 0));
+    assert(owner.phase == JobDispatched);
+    handleMessage(messageFor(LSB_REQUEST_READY, owner.pid, owner.pidVersion, owner.identifier));
+    assert(owner.phase == JobRunning && replyFor(object) && !replyFor(object)->error);
+    return owner;
+}
+
+static void testPublicMetalReadyFailureRevokesSession(void) {
+    for (unsigned failure = 0; failure < 3; ++failure) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *privateReader, *publicReader;
+        LSBJob *privateHelper = queueNativeMetalSession(&launchd, &privateReader);
+        LSBJob *publicHelper = findJob(launchd.publicMetalServiceIdentifier);
+        assert(!LSBNativeMetalControlImport(publicHelper.request->fds[publicHelper.request->plan.fdCount - 1], &publicReader));
+        mach_port_t privatePort = newServiceEndpoint();
+        readyMetalHelper(privateHelper, privatePort, 900);
+        assert(startingJob == publicHelper && launchd.phase == JobQueued);
+        reportedPID = getpid() + 501;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 991, 0));
+        LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, publicHelper.pid, publicHelper.pidVersion, publicHelper.identifier);
+        ready->audit.val[1] ^= 1;
+        handleMessage(ready);
+        assert(replies[replyCount - 1].error == EACCES && publicHelper.phase == JobDispatched && launchd.phase == JobQueued);
+        ready = messageFor(LSB_REQUEST_READY, publicHelper.pid, publicHelper.pidVersion, publicHelper.identifier);
+        mach_port_t publicPort = failure ? newServiceEndpoint() : MACH_PORT_NULL;
+        ready->nativeServicePort = publicPort;
+        if (failure == 1) ready->error = ENOEXEC;
+        if (failure == 2) readySendError = EPIPE;
+        handleMessage(ready);
+        assert(!jobs.count && !startingJob && submittedLaunches == 2);
+        LSBNativeMetalAuthorization authorization;
+        assert(!LSBNativeMetalControlRead(publicReader, &authorization) && !authorization.authorized && !authorization.publicAccess);
+        assert(!LSBNativeMetalControlRead(privateReader, &authorization) && !authorization.authorized);
+        assert(!hasRight(privatePort, MACH_PORT_TYPE_SEND));
+        assert(!mach_port_mod_refs(mach_task_self(), privatePort, MACH_PORT_RIGHT_RECEIVE, -1));
+        if (MACH_PORT_VALID(publicPort)) {
+            assert(!hasRight(publicPort, MACH_PORT_TYPE_SEND));
+            assert(!mach_port_mod_refs(mach_task_self(), publicPort, MACH_PORT_RIGHT_RECEIVE, -1));
+        }
+        LSBNativeMetalControlUnmap(privateReader);
+        LSBNativeMetalControlUnmap(publicReader);
+    }
+}
+
+static void testPublicMetalLifetimeAndClientIndependence(void) {
+    for (unsigned helperFails = 0; helperFails < 2; ++helperFails) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *privateReader, *publicReader;
+        LSBJob *privateHelper = queueNativeMetalSession(&launchd, &privateReader);
+        LSBJob *publicHelper = findJob(launchd.publicMetalServiceIdentifier);
+        assert(!LSBNativeMetalControlImport(publicHelper.request->fds[publicHelper.request->plan.fdCount - 1], &publicReader));
+        mach_port_t privatePort = newServiceEndpoint();
+        readyMetalHelper(privateHelper, privatePort, 900);
+        // The public service must also become ready before releasing simulator launchd.
+        assert(startingJob == publicHelper && launchd.phase == JobQueued);
+        makeSessionLaunchdRunning(launchd);
+        mach_port_t publicPort = publicHelper.nativeServicePort;
+        assert(publicPort != privatePort && submittedLaunches == 3);
+        RecordedIOSurfaceServer *iosurface = [RecordedIOSurfaceServer new];
+        launchd.iosurface = iosurface;
+        LSBJob *backboard = startGraphicsOwner(launchd, "/usr/libexec/backboardd", 920);
+        LSBNativeMetalAuthorization privateAuth, publicAuth;
+        assert(!LSBNativeMetalControlRead(privateReader, &privateAuth) && privateAuth.authorized && !privateAuth.publicAccess);
+        assert(!LSBNativeMetalControlRead(publicReader, &publicAuth) && publicAuth.authorized && publicAuth.publicAccess);
+        LSBJob *firstClient = startGraphicsOwner(launchd, "/System/Library/CoreServices/iconservicesagent", 921);
+        LSBJob *secondClient = startGraphicsOwner(launchd, "/Applications/Calculator.app/Calculator", 922);
+        assert(!publicHelper.nativeMetalAuthorizedIdentifier);
+        recordChildExit(firstClient.identifier, 0);
+        assert(findJob(publicHelper.identifier) && findJob(secondClient.identifier) && !iosurface.closes);
+        LSBNativeMetalAuthorization unchanged;
+        assert(!LSBNativeMetalControlRead(publicReader, &unchanged) && !memcmp(&unchanged, &publicAuth, sizeof(unchanged)));
+        // Public graphics access must not bind the client to its old native process during exec replacement.
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        request->kind = LSB_REQUEST_EXEC;
+        request->audit = secondClient.audit;
+        handleMessage(request);
+        LSBJob *replacement = startingJob;
+        assert(replacement && replacement.identifier == secondClient.replacementIdentifier && !replyFor(object));
+        reportedPID = getpid() + 800;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 923, 0));
+        handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 923, replacement.identifier));
+        assert(replacement.phase == JobRunning && !findJob(secondClient.identifier) && !replyFor(object)->error);
+        assert(!LSBNativeMetalControlRead(publicReader, &unchanged) && !memcmp(&unchanged, &publicAuth, sizeof(unchanged)));
+        if (helperFails) {
+            recordChildExit(publicHelper.identifier, SIGABRT);
+            assert(!findJob(publicHelper.identifier) && launchd.servicesError == EPIPE && !launchd.servicesPending);
+            assert(findJob(privateHelper.identifier) && findJob(backboard.identifier) && findJob(replacement.identifier));
+            assert(!LSBNativeMetalControlRead(privateReader, &unchanged) && !memcmp(&unchanged, &privateAuth, sizeof(unchanged)));
+            assert(!iosurface.closes);
+        }
+        finishJob(launchd, ECANCELED);
+        assert(!findJob(publicHelper.identifier) && !findJob(privateHelper.identifier) && iosurface.closes == 1);
+        assert(!LSBNativeMetalControlRead(publicReader, &publicAuth) && !publicAuth.authorized && !publicAuth.publicAccess);
+        assert(!hasRight(publicPort, MACH_PORT_TYPE_SEND) && !hasRight(privatePort, MACH_PORT_TYPE_SEND));
+        assert(!mach_port_mod_refs(mach_task_self(), privatePort, MACH_PORT_RIGHT_RECEIVE, -1));
+        LSBNativeMetalControlUnmap(privateReader);
+        LSBNativeMetalControlUnmap(publicReader);
+    }
+}
+
+static void testSecondMetalHelperFailureIsIndependent(void) {
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *firstReader, *secondReader;
+        LSBJob *first = queueNativeMetalSessionWithSpringBoard(&launchd, &firstReader, YES), *second = jobs[1];
+        assert(!LSBNativeMetalControlImport(second.request->fds[second.request->plan.fdCount - 1], &secondReader));
+        mach_port_t endpoint = newServiceEndpoint();
+        readyMetalHelper(first, endpoint, 900);
+        assert(startingJob == second && launchd.phase == JobQueued && submittedLaunches == 2);
+        reportedPID = getpid() + 302;
+        handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 901, 0));
+        LSBReceivedMessage *forged = messageFor(LSB_REQUEST_READY, second.pid, second.pidVersion, first.identifier);
+        handleMessage(forged);
+        assert(replies[replyCount - 1].error == ESRCH && second.phase == JobDispatched && launchd.phase == JobQueued);
+        forged = messageFor(LSB_REQUEST_READY, second.pid, second.pidVersion, second.identifier);
+        forged->audit.val[1] ^= 1;
+        handleMessage(forged);
+        assert(replies[replyCount - 1].error == EACCES && second.phase == JobDispatched);
+        LSBReceivedMessage *ready = messageFor(LSB_REQUEST_READY, second.pid, second.pidVersion, second.identifier);
+        ready->error = failure ? ENOEXEC : 0; // Missing endpoint is a distinct READY protocol failure.
+        handleMessage(ready);
+        assert(!findJob(second.identifier) && findJob(first.identifier) && first.phase == JobRunning);
+        assert(launchd.springBoardMetalError == (failure ? ENOEXEC : EPROTO) && !launchd.servicesError);
+        assert(startingJob == findJob(launchd.publicMetalServiceIdentifier));
+        makeSessionLaunchdRunning(launchd);
+        LSBJob *backboard = startGraphicsOwner(launchd, "/usr/libexec/backboardd", 902);
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        setRequestProgram(request, "/System/Library/CoreServices/SpringBoard.app/SpringBoard");
+        enqueueSpawn(request, launchd);
+        assert(replyFor(object)->error == launchd.springBoardMetalError && !startingJob);
+        LSBNativeMetalAuthorization authorization;
+        assert(!LSBNativeMetalControlRead(firstReader, &authorization) && authorization.authorized);
+        audit_token_t expected = backboard.audit;
+        assert(!memcmp(&authorization.audit, &expected, sizeof(expected)));
+        assert(!LSBNativeMetalControlRead(secondReader, &authorization) && !authorization.authorized);
+        finishJob(launchd, ECANCELED);
+        assert(!hasRight(endpoint, MACH_PORT_TYPE_SEND));
+        assert(!mach_port_mod_refs(mach_task_self(), endpoint, MACH_PORT_RIGHT_RECEIVE, -1));
+        LSBNativeMetalControlUnmap(firstReader);
+        LSBNativeMetalControlUnmap(secondReader);
+    }
+}
+
+static void testSeparateMetalOwners(void) {
+    for (unsigned failure = 0; failure < 5; ++failure) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *firstReader, *secondReader;
+        LSBJob *first = queueNativeMetalSessionWithSpringBoard(&launchd, &firstReader, YES), *second = jobs[1];
+        assert(!LSBNativeMetalControlImport(second.request->fds[second.request->plan.fdCount - 1], &secondReader));
+        mach_port_t firstPort = newServiceEndpoint(), secondPort = newServiceEndpoint();
+        readyMetalHelper(first, firstPort, 900);
+        assert(startingJob == second && launchd.phase == JobQueued);
+        readyMetalHelper(second, secondPort, 903);
+        assert(startingJob == findJob(launchd.publicMetalServiceIdentifier) && firstPort != secondPort && submittedLaunches == 3);
+        makeSessionLaunchdRunning(launchd);
+        RecordedIOSurfaceServer *iosurface = [RecordedIOSurfaceServer new];
+        launchd.iosurface = iosurface;
+        LSBJob *backboard = startGraphicsOwner(launchd, "/usr/libexec/backboardd", 904);
+        LSBJob *springBoard = startGraphicsOwner(launchd, "/System/Library/CoreServices/SpringBoard.app/SpringBoard", 905);
+        LSBNativeMetalAuthorization firstAuth, secondAuth;
+        assert(!LSBNativeMetalControlRead(firstReader, &firstAuth) && firstAuth.authorized);
+        assert(!LSBNativeMetalControlRead(secondReader, &secondAuth) && secondAuth.authorized);
+        audit_token_t firstAudit = backboard.audit, secondAudit = springBoard.audit;
+        assert(!memcmp(&firstAuth.audit, &firstAudit, sizeof(firstAudit)) && !memcmp(&secondAuth.audit, &secondAudit, sizeof(secondAudit)));
+        assert(first.nativeMetalAuthorizedIdentifier == backboard.identifier && second.nativeMetalAuthorizedIdentifier == springBoard.identifier);
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *exec = spawnRequest(&fd, &object);
+        exec->kind = LSB_REQUEST_EXEC;
+        enqueueExec(exec, springBoard);
+        assert(replyFor(object)->error == ENOTSUP && !springBoard.replacementIdentifier);
+        if (failure == 4) finishJob(launchd, ECANCELED);
+        else if (failure == 3) recordChildExit(backboard.identifier, 0);
+        else if (failure == 2) extensionCallback(second.identifier, 0, ECANCELED, NULL);
+        else if (failure == 1) recordChildExit(second.identifier, SIGABRT);
+        else recordChildExit(springBoard.identifier, 0);
+        if (failure < 3) {
+            assert(!findJob(second.identifier) && !findJob(springBoard.identifier) && findJob(first.identifier) && findJob(backboard.identifier));
+            assert(!launchd.servicesError && launchd.springBoardMetalError && !launchd.springBoardMetalPending);
+            LSBNativeMetalAuthorization unchanged;
+            assert(!LSBNativeMetalControlRead(firstReader, &unchanged) && !memcmp(&unchanged, &firstAuth, sizeof(unchanged)));
+        } else if (failure == 3) {
+            assert(!findJob(first.identifier) && !findJob(backboard.identifier) && findJob(second.identifier) && findJob(springBoard.identifier));
+            LSBNativeMetalAuthorization unchanged;
+            assert(!LSBNativeMetalControlRead(secondReader, &unchanged) && !memcmp(&unchanged, &secondAuth, sizeof(unchanged)));
+        } else assert(!findJob(first.identifier) && !findJob(second.identifier));
+        finishJob(launchd, ECANCELED);
+        assert(!LSBNativeMetalControlRead(firstReader, &firstAuth) && !firstAuth.authorized);
+        assert(!LSBNativeMetalControlRead(secondReader, &secondAuth) && !secondAuth.authorized);
+        assert(!hasRight(firstPort, MACH_PORT_TYPE_SEND) && !hasRight(secondPort, MACH_PORT_TYPE_SEND));
+        assert(!mach_port_mod_refs(mach_task_self(), firstPort, MACH_PORT_RIGHT_RECEIVE, -1));
+        assert(!mach_port_mod_refs(mach_task_self(), secondPort, MACH_PORT_RIGHT_RECEIVE, -1));
+        LSBNativeMetalControlUnmap(firstReader);
+        LSBNativeMetalControlUnmap(secondReader);
+    }
+}
+
+static void testSpringBoardRegistrationIsolation(void) {
+    for (unsigned failure = 0; failure < 3; ++failure) {
+        LSBJob *launchd;
+        const LSBNativeMetalControl *reader;
+        LSBJob *first = queueNativeMetalSessionWithSpringBoard(&launchd, &reader, YES), *second = jobs[1];
+        mach_port_t firstPort = newServiceEndpoint(), secondPort = newServiceEndpoint(), service = newServiceEndpoint();
+        readyMetalHelper(first, firstPort, 900);
+        readyMetalHelper(second, secondPort, 903);
+        makeSessionLaunchdRunning(launchd);
+        launchd.indigo = [RecordedIndigoServer new];
+        launchd.framebuffer = [RecordedFramebufferServer new];
+        launchd.iosurface = [RecordedIOSurfaceServer new];
+        launchd.servicesPending = YES;
+        if (failure == 1) endpointErrors[5] = EACCES;
+        dispatch_semaphore_t entered = dispatch_semaphore_create(0), release = dispatch_semaphore_create(0);
+        endpointHook = ^(unsigned index) {
+            if (index != 5) return;
+            dispatch_semaphore_signal(entered);
+            assert(!dispatch_semaphore_wait(release, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+        };
+        registerDisplayServices(launchd, service);
+        assert(!dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
+        runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
+        assert(!launchd.servicesError && launchd.springBoardMetalPending && endpointCalls == 6);
+        assert(!strcmp(registeredEndpoints[3], "com.apple.metal.simulator") && registeredPorts[3] == findJob(launchd.publicMetalServiceIdentifier).nativeServicePort);
+        assert(!strcmp(registeredEndpoints[4], "com.apple.metal.simulator.backboardd") && registeredPorts[4] == firstPort);
+        assert(!strcmp(registeredEndpoints[5], "com.apple.metal.simulator.SpringBoard") && registeredPorts[5] == secondPort);
+        audit_token_t expected = launchd.audit;
+        assert(!memcmp(&registeredAudits[5], &expected, sizeof(expected)));
+        assert(registeredTimeouts[5] <= registeredTimeouts[4]);
+        // The blocked sixth RPC cannot hold back the existing owner, but must keep SpringBoard from receiving its plan.
+        LSBJob *backboard = startGraphicsOwner(launchd, "/usr/libexec/backboardd", 906);
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        setRequestProgram(request, "/System/Library/CoreServices/SpringBoard.app/SpringBoard");
+        enqueueSpawn(request, launchd);
+        LSBJob *springBoard = jobs.lastObject;
+        assert(springBoard.phase == JobQueued && !startingJob && !replyFor(object));
+        if (failure == 2) {
+            recordChildExit(second.identifier, SIGABRT);
+            assert(launchd.springBoardMetalError == EPIPE && !launchd.servicesError && !findJob(springBoard.identifier));
+            assert(hasRight(secondPort, MACH_PORT_TYPE_SEND)); // The in-flight worker owns a separate endpoint reference.
+            launchd.springBoardMetalPending = YES; // Observe the already-issued worker's late completion below.
+        }
+        dispatch_semaphore_signal(release);
+        runMainQueueUntil(^BOOL { return !launchd.springBoardMetalPending; });
+        assert(!launchd.servicesError && findJob(first.identifier) && findJob(backboard.identifier));
+        if (!failure) assert(!launchd.springBoardMetalError && startingJob == springBoard && springBoard.phase == JobStarting);
+        else {
+            int expectedError = failure == 1 ? EACCES : EPIPE;
+            assert(launchd.springBoardMetalError == expectedError && replyFor(object)->error == expectedError);
+            assert(!findJob(springBoard.identifier) && !startingJob);
+        }
+        if (failure == 2) assert(!hasRight(secondPort, MACH_PORT_TYPE_SEND));
+        finishJob(launchd, ECANCELED);
+        assert(!hasRight(firstPort, MACH_PORT_TYPE_SEND) && !hasRight(secondPort, MACH_PORT_TYPE_SEND));
+        assert(!mach_port_mod_refs(mach_task_self(), firstPort, MACH_PORT_RIGHT_RECEIVE, -1));
+        assert(!mach_port_mod_refs(mach_task_self(), secondPort, MACH_PORT_RIGHT_RECEIVE, -1));
+        assert(!mach_port_deallocate(mach_task_self(), service));
+        assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
+        LSBNativeMetalControlUnmap(reader);
+    }
+}
+
+static NSData *entitlementImage(NSData *der, BOOL hasSection) {
+    struct mach_header_64 header = {.magic = MH_MAGIC_64, .cputype = CPU_TYPE_ARM64, .filetype = MH_EXECUTE, .ncmds = 1,
+        .sizeofcmds = sizeof(struct segment_command_64) + sizeof(struct section_64)};
+    uint32_t offset = sizeof(header) + header.sizeofcmds;
+    struct segment_command_64 segment = {.cmd = LC_SEGMENT_64, .cmdsize = header.sizeofcmds, .segname = "__TEXT",
+        .vmaddr = 0x100000000, .vmsize = offset + der.length, .filesize = offset + der.length, .nsects = 1};
+    struct section_64 section = {.segname = "__TEXT", .addr = segment.vmaddr + offset, .size = der.length, .offset = offset};
+    strcpy(section.sectname, hasSection ? "__ents_der" : "__other");
+    NSMutableData *image = [NSMutableData dataWithBytes:&header length:sizeof(header)];
+    [image appendBytes:&segment length:sizeof(segment)];
+    [image appendBytes:&section length:sizeof(section)];
+    [image appendData:der];
+    return image;
+}
+
+static NSData *entitlementBlob(NSData *der) {
+    uint32_t size = (uint32_t)der.length + 8;
+    unsigned char header[] = {0xfa, 0xde, 0x71, 0x72, (unsigned char)(size >> 24), (unsigned char)(size >> 16),
+                              (unsigned char)(size >> 8), (unsigned char)size};
+    NSMutableData *blob = [NSMutableData dataWithBytes:header length:sizeof(header)];
+    [blob appendData:der];
+    return blob;
+}
+
+static RecordedReply *requestEntitlementsFormat(audit_token_t caller, audit_token_t target, unsigned operation) {
+    LSBReceivedMessage *request = messageFor(LSB_REQUEST_COPY_ENTITLEMENTS, caller.val[5], caller.val[7], 0);
+    request->audit = caller;
+    request->targetAudit = target;
+    request->entitlementOperation = operation;
+    unsigned object = ((TestMessageObject *)request->object)->identifier;
+    entitlementsReply = nil;
+    handleMessage(request);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && !reply->requestID && !reply->pid && !reply->deliveredPlan);
+    if (reply->error) assert(!entitlementsReply);
+    return reply;
+}
+
+static RecordedReply *requestEntitlements(audit_token_t caller, audit_token_t target) {
+    return requestEntitlementsFormat(caller, target, 16);
+}
+
+static NSDictionary *decodedXMLSnapshot(NSData *snapshot) {
+    assert(snapshot.length > 8);
+    const unsigned char *header = snapshot.bytes;
+    uint32_t size = (uint32_t)header[4] << 24 | (uint32_t)header[5] << 16 | (uint32_t)header[6] << 8 | header[7];
+    assert(header[0] == 0xfa && header[1] == 0xde && header[2] == 0x71 && header[3] == 0x71 && size == snapshot.length);
+    NSData *xml = [snapshot subdataWithRange:NSMakeRange(8, snapshot.length - 8)];
+    id result = [NSPropertyListSerialization propertyListWithData:xml options:NSPropertyListImmutable format:NULL error:NULL];
+    assert([result isKindOfClass:NSDictionary.class]);
+    return result;
+}
+
+static void testGuestEntitlementsSnapshotsAndAuthentication(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerEntitlements.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSString *bin = [runtimeRoot stringByAppendingPathComponent:@"bin"], *path = [bin stringByAppendingPathComponent:@"probe"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    assert([manager createDirectoryAtPath:bin withIntermediateDirectories:YES attributes:nil error:NULL]);
+    const unsigned char empty[] = {0x70, 5, 2, 1, 1, 0xb0, 0};
+    const unsigned char keyed[] = {0x70, 13, 2, 1, 1, 0xb0, 8, 0x30, 6, 0x0c, 1, 'a', 1, 1, 0xff};
+    NSData *firstDER = [NSData dataWithBytes:empty length:sizeof(empty)], *secondDER = [NSData dataWithBytes:keyed length:sizeof(keyed)];
+    NSData *firstBlob = entitlementBlob(firstDER), *secondBlob = entitlementBlob(secondDER);
+    const unsigned char hashBytes[LSB_GUEST_CDHASH_BYTES] = {1, 2, 3, 4}, secondHashBytes[LSB_GUEST_CDHASH_BYTES] = {5, 6, 7, 8};
+    NSData *firstHash = [NSData dataWithBytes:hashBytes length:sizeof(hashBytes)];
+    NSData *secondHash = [NSData dataWithBytes:secondHashBytes length:sizeof(secondHashBytes)];
+    codeDirectoryHash = firstHash;
+    assert([entitlementImage(firstDER, YES) writeToFile:path atomically:YES]);
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    setRequestProgram(request, "/bin/probe");
+    enqueueSpawn(request, nil);
+    LSBJob *first = startingJob;
+    checkInReplyHook = ^{
+        assert(first.phase == JobDispatched && !first.guestEntitlementsError && [first.guestEntitlements isEqualToData:firstBlob]);
+        assert(!first.guestXMLEntitlementsError && [decodedXMLSnapshot(first.guestXMLEntitlements) isEqual:@{}]);
+        assert(!first.guestCodeDirectoryHashError && [first.guestCodeDirectoryHash isEqualToData:firstHash]);
+        // Replace the file before the plan reply returns. The job's already-captured image metadata must remain immutable.
+        assert([entitlementImage(secondDER, YES) writeToFile:path atomically:YES]);
+        codeDirectoryHash = secondHash;
     };
-    registerDisplayServices(launchd, service);
-    assert(!dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
-    recordChildExit(helper.identifier, SIGABRT);
-    assert(launchd.servicesError == EPIPE && !launchd.servicesPending);
-    // A worker owns its own reference until the in-flight registration returns, even after the helper's reference is retired.
-    assert(hasRight(endpoint, MACH_PORT_TYPE_SEND));
-    launchd.servicesPending = YES; // Observe completion of that already-issued worker independently of the earlier death notification.
-    dispatch_semaphore_signal(release);
-    runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
-    assert(launchd.servicesError == EPIPE && endpointCalls == 2 && !hasRight(endpoint, MACH_PORT_TYPE_SEND));
-    assert(!mach_port_mod_refs(mach_task_self(), endpoint, MACH_PORT_RIGHT_RECEIVE, -1));
-    assert(!mach_port_deallocate(mach_task_self(), service));
-    assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
-    LSBNativeMetalControlUnmap(reader);
+    LSBReceivedMessage *checkin = messageFor(LSB_REQUEST_CHECKIN, getpid(), 1400, 0);
+    checkin->audit.val[1] = 501;
+    handleMessage(checkin);
+    checkInReplyHook = nil;
+    assert(requestEntitlements(first.audit, first.audit)->error == EACCES); // Not yet committed by READY.
+    handleMessage(messageFor(LSB_REQUEST_READY, first.pid, first.pidVersion, first.identifier));
+    assert(first.phase == JobRunning && !first.request);
+    assert(!requestEntitlements(first.audit, first.audit)->error && [entitlementsReply isEqualToData:firstBlob]);
+    assert(!requestEntitlementsFormat(first.audit, first.audit, 7)->error && [decodedXMLSnapshot(entitlementsReply) isEqual:@{}]);
+    assert(!requestEntitlementsFormat(first.audit, first.audit, 5)->error && [entitlementsReply isEqualToData:firstHash]);
+
+    request = spawnRequest(&fd, &object);
+    setRequestProgram(request, path.fileSystemRepresentation); // The loader also accepts this exact physical RuntimeRoot path.
+    enqueueSpawn(request, nil);
+    LSBJob *second = startingJob;
+    checkin = messageFor(LSB_REQUEST_CHECKIN, getpid(), 1401, 0);
+    checkin->audit.val[1] = 502;
+    handleMessage(checkin);
+    assert(second.phase == JobDispatched && [second.guestEntitlements isEqualToData:secondBlob]);
+    assert(!second.guestCodeDirectoryHashError && [second.guestCodeDirectoryHash isEqualToData:secondHash]);
+    assert(requestEntitlements(first.audit, second.audit)->error == ESRCH);
+    handleMessage(messageFor(LSB_REQUEST_READY, second.pid, second.pidVersion, second.identifier));
+    assert(second.phase == JobRunning && !second.request && !unlink(path.fileSystemRepresentation));
+    assert(!requestEntitlements(first.audit, second.audit)->error && [entitlementsReply isEqualToData:secondBlob]);
+    assert(!requestEntitlementsFormat(first.audit, second.audit, 7)->error && [decodedXMLSnapshot(entitlementsReply) isEqual:@{@"a": @YES}]);
+    assert(!requestEntitlements(second.audit, first.audit)->error && [entitlementsReply isEqualToData:firstBlob]);
+    assert(!requestEntitlementsFormat(first.audit, second.audit, 5)->error && [entitlementsReply isEqualToData:secondHash]);
+    assert(!requestEntitlementsFormat(second.audit, first.audit, 5)->error && [entitlementsReply isEqualToData:firstHash]);
+
+    audit_token_t caller = first.audit, target = second.audit;
+    assert(requestEntitlementsFormat(caller, target, 0)->error == EINVAL);
+    assert(requestEntitlementsFormat(caller, target, 17)->error == EINVAL);
+    for (unsigned word = 0; word < 8; ++word) {
+        audit_token_t changed = caller;
+        changed.val[word] ^= 1;
+        assert(requestEntitlements(changed, target)->error == EACCES);
+        assert(requestEntitlementsFormat(changed, target, 5)->error == EACCES);
+        changed = target;
+        changed.val[word] ^= 1;
+        assert(requestEntitlements(caller, changed)->error == ESRCH);
+        assert(requestEntitlementsFormat(caller, changed, 5)->error == ESRCH);
+    }
+    first.retiredForExec = YES;
+    assert(requestEntitlements(caller, target)->error == EACCES);
+    first.retiredForExec = NO;
+    first.finishing = YES;
+    assert(requestEntitlements(caller, target)->error == EACCES);
+    first.finishing = NO;
+    second.retiredForExec = YES;
+    assert(requestEntitlements(caller, target)->error == ESRCH);
+    second.retiredForExec = NO;
+    second.finishing = YES;
+    assert(requestEntitlements(caller, target)->error == ESRCH);
+    second.finishing = NO;
+    for (unsigned role = LSB_EXECUTION_NATIVE_METAL_PROBE; role <= LSB_EXECUTION_NATIVE_METAL_SERVICE; ++role) {
+        first.executionRole = role;
+        assert(requestEntitlements(caller, target)->error == EACCES);
+        first.executionRole = LSB_EXECUTION_SIMULATOR;
+        second.executionRole = role;
+        assert(requestEntitlements(caller, target)->error == ESRCH);
+        second.executionRole = LSB_EXECUTION_SIMULATOR;
+    }
+    second.guestEntitlementsError = ENOENT;
+    assert(requestEntitlements(caller, target)->error == ENOENT);
+    assert(!requestEntitlementsFormat(caller, target, 5)->error && [entitlementsReply isEqualToData:secondHash]);
+    second.guestEntitlementsError = EINVAL;
+    assert(requestEntitlements(caller, target)->error == EINVAL);
+    second.guestEntitlementsError = 0;
+    second.guestXMLEntitlementsError = EILSEQ;
+    assert(requestEntitlementsFormat(caller, target, 7)->error == EILSEQ);
+    assert(!requestEntitlements(caller, target)->error && [entitlementsReply isEqualToData:secondBlob]);
+    assert(!requestEntitlementsFormat(caller, target, 5)->error && [entitlementsReply isEqualToData:secondHash]);
+    second.guestCodeDirectoryHashError = ENOENT;
+    assert(requestEntitlementsFormat(caller, target, 5)->error == ENOENT);
+    assert(!requestEntitlements(caller, target)->error && [entitlementsReply isEqualToData:secondBlob]);
+    second.guestCodeDirectoryHashError = EINVAL;
+    assert(requestEntitlementsFormat(caller, target, 5)->error == EINVAL);
+    second.guestCodeDirectoryHashError = 0;
+    recordChildExit(second.identifier, 0);
+    LSBJob *reused = auditJob((pid_t)target.val[5], 9999, target.val[7] + 1, NO);
+    reused.guestEntitlements = secondBlob;
+    reused.guestEntitlementsError = 0;
+    reused.guestCodeDirectoryHash = firstHash;
+    reused.guestCodeDirectoryHashError = 0;
+    assert(requestEntitlements(caller, target)->error == ESRCH); // A reused native PID cannot recover retired metadata.
+    assert(requestEntitlementsFormat(caller, target, 5)->error == ESRCH);
+    assert(!requestEntitlementsFormat(caller, reused.audit, 5)->error && [entitlementsReply isEqualToData:firstHash]);
+    assert(!requestEntitlements(caller, reused.audit)->error && [entitlementsReply isEqualToData:secondBlob]);
+    audit_token_t unmanaged = {{0}};
+    unmanaged.val[5] = getpid() + 400;
+    unmanaged.val[7] = 1;
+    assert(requestEntitlements(caller, unmanaged)->error == ESRCH && requestEntitlements(unmanaged, caller)->error == EACCES);
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
+}
+
+static mach_port_urefs_t sendReferences(mach_port_t port) {
+    mach_port_urefs_t references = 0;
+    kern_return_t result = mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &references);
+    if (result == KERN_INVALID_NAME || result == KERN_INVALID_RIGHT) return 0; // The final owned reference was released.
+    assert(result == KERN_SUCCESS);
+    return references;
+}
+
+static void testPeerIdentityKernelValidation(void) {
+    resetBroker();
+    useRealTaskInfo = YES;
+    LSBPeerProcessIdentity identity = {0};
+    mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+    assert(task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&identity.audit, &count) == KERN_SUCCESS);
+    assert(proc_pidinfo(getpid(), LSB_PEER_SHORT_INFO_FLAVOR, 0, identity.shortInfo, sizeof(identity.shortInfo)) == sizeof(identity.shortInfo));
+    assert(task_name_for_pid(mach_task_self(), getpid(), &identity.taskName) == KERN_SUCCESS);
+    audit_token_t expected = identity.audit;
+    assert(!validatePeerTaskIdentity(&identity, &expected));
+    for (unsigned word = 0; word < 8; ++word) {
+        audit_token_t altered = expected;
+        altered.val[word] ^= 1;
+        assert(validatePeerTaskIdentity(&identity, &altered) == EACCES);
+    }
+    identity.shortInfo[0] ^= 1;
+    assert(validatePeerTaskIdentity(&identity, &expected) == EACCES);
+    identity.shortInfo[0] ^= 1;
+    mach_port_t taskName = identity.taskName, receive, once;
+    assert(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receive) == KERN_SUCCESS);
+    assert(mach_port_insert_right(mach_task_self(), receive, receive, MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS);
+    identity.taskName = receive;
+    assert(validatePeerTaskIdentity(&identity, &expected) == EACCES); // An ordinary receive/send port is not a task name.
+    mach_msg_type_name_t disposition;
+    assert(mach_port_extract_right(mach_task_self(), receive, MACH_MSG_TYPE_MAKE_SEND_ONCE, &once, &disposition) == KERN_SUCCESS);
+    identity.taskName = once;
+    assert(validatePeerTaskIdentity(&identity, &expected) == EACCES);
+    assert(mach_port_deallocate(mach_task_self(), once) == KERN_SUCCESS);
+    identity.taskName = MACH_PORT_NULL;
+    assert(validatePeerTaskIdentity(&identity, &expected) == EACCES);
+    identity.taskName = receive;
+    assert(mach_port_mod_refs(mach_task_self(), receive, MACH_PORT_RIGHT_RECEIVE, -1) == KERN_SUCCESS);
+    assert(validatePeerTaskIdentity(&identity, &expected) == EACCES); // Dead name must not enter the snapshot.
+    assert(mach_port_deallocate(mach_task_self(), receive) == KERN_SUCCESS);
+    identity.taskName = taskName;
+    LSBPeerProcessIdentityDispose(&identity);
+    useRealTaskInfo = NO;
+}
+
+static LSBJob *runIdentityJob(const char *path, pid_t nativePID, unsigned generation, unsigned char marker) {
+    int fd;
+    unsigned object;
+    reportedPID = nativePID;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    setRequestProgram(request, path);
+    enqueueSpawn(request, nil);
+    LSBJob *job = startingJob;
+    assert(job);
+    LSBReceivedMessage *checkin = messageFor(LSB_REQUEST_CHECKIN, nativePID, generation, 0);
+    memset(checkin->peerIdentity.shortInfo + sizeof(uint32_t), marker, LSB_PEER_SHORT_INFO_BYTES - sizeof(uint32_t));
+    checkInReplyHook = ^{
+        assert(!job.peerIdentityError && job.peerIdentity.shortInfo[LSB_PEER_SHORT_INFO_BYTES - 1] == marker);
+        assert(MACH_PORT_VALID(job.peerIdentity.taskName)); // Captured before the guest can make its first request.
+    };
+    handleMessage(checkin);
+    checkInReplyHook = nil;
+    assert(job.phase == JobDispatched && !job.peerIdentityError);
+    setRequestProgram(job.request, "/bin/replaced-after-snapshot");
+    handleMessage(messageFor(LSB_REQUEST_READY, nativePID, generation, job.identifier));
+    assert(job.phase == JobRunning && !job.request && !replyFor(object)->error);
+    return job;
+}
+
+static RecordedReply *requestProcessIdentity(audit_token_t caller, pid_t target) {
+    LSBPeerProcessIdentityDispose(&identityReply);
+    LSBReceivedMessage *request = messageFor(LSB_REQUEST_COPY_PROCESS_IDENTITY, caller.val[5], caller.val[7], 0);
+    request->audit = caller;
+    request->targetPID = target;
+    unsigned object = ((TestMessageObject *)request->object)->identifier;
+    handleMessage(request);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && (reply->error ? !MACH_PORT_VALID(identityReply.taskName) : MACH_PORT_VALID(identityReply.taskName)));
+    return reply;
+}
+
+static void testPeerIdentitySnapshotsAndAuthentication(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerPeerIdentity.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    for (NSString *path in @[@"usr/libexec/runningboardd", @"System/Library/CoreServices/SpringBoard.app/SpringBoard", @"bin/df"]) {
+        NSString *physical = [runtimeRoot stringByAppendingPathComponent:path];
+        assert([manager createDirectoryAtPath:physical.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
+        assert([[@"fixture" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:physical atomically:YES]);
+    }
+    NSString *alias = [[NSString stringWithUTF8String:temporary] stringByAppendingString:@"/RuntimeRoot/usr/libexec/runningboardd"];
+    LSBJob *caller = runIdentityJob(alias.fileSystemRepresentation, getpid() + 100, 1500, 0xa1);
+    LSBJob *target = runIdentityJob("/System/Library/CoreServices/SpringBoard.app/SpringBoard", getpid() + 101, 1501, 0xb2);
+    assert(!strcmp(caller.peerIdentity.executablePath, "/usr/libexec/runningboardd"));
+    assert(!requestProcessIdentity(caller.audit, target.pid)->error);
+    audit_token_t targetAudit = target.audit;
+    assert(!memcmp(&identityReply.audit, &targetAudit, sizeof(targetAudit)));
+    assert(identityReply.shortInfo[63] == 0xb2 && LSBPeerProcessIdentityPID(&identityReply) == (unsigned)target.pid);
+    assert(!strcmp(identityReply.executablePath, "/System/Library/CoreServices/SpringBoard.app/SpringBoard"));
+    assert(requestProcessIdentity(target.audit, caller.pid)->error == EACCES);
+    for (unsigned word = 0; word < 8; ++word) {
+        audit_token_t altered = caller.audit;
+        altered.val[word] ^= 1;
+        assert(requestProcessIdentity(altered, target.pid)->error == EACCES);
+    }
+    assert(requestProcessIdentity(caller.audit, -1)->error == EINVAL);
+    assert(requestProcessIdentity(caller.audit, getpid() + 200)->error == ESRCH);
+    for (unsigned condition = 0; condition < 5; ++condition) {
+        if (condition == 0) target.retiredForExec = YES;
+        if (condition == 1) target.finishing = YES;
+        if (condition == 2) target.phase = JobDispatched;
+        if (condition == 3) target.executionRole = LSB_EXECUTION_NATIVE_METAL_PROBE;
+        if (condition == 4) target.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+        assert(requestProcessIdentity(caller.audit, target.pid)->error == ESRCH);
+        target.retiredForExec = target.finishing = NO;
+        target.phase = JobRunning;
+        target.executionRole = LSB_EXECUTION_SIMULATOR;
+        if (condition == 0) caller.retiredForExec = YES;
+        if (condition == 1) caller.finishing = YES;
+        if (condition == 2) caller.phase = JobDispatched;
+        if (condition == 3) caller.executionRole = LSB_EXECUTION_NATIVE_METAL_PROBE;
+        if (condition == 4) caller.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+        assert(requestProcessIdentity(caller.audit, target.pid)->error == EACCES);
+        caller.retiredForExec = caller.finishing = NO;
+        caller.phase = JobRunning;
+        caller.executionRole = LSB_EXECUTION_SIMULATOR;
+    }
+    LSBPeerProcessIdentity original = caller.peerIdentity, altered = original;
+    strcpy(altered.executablePath, "/Plugins/runningboardd");
+    caller.peerIdentity = altered;
+    assert(requestProcessIdentity(caller.audit, target.pid)->error == EACCES);
+    caller.peerIdentity = original;
+    mismatchTaskAudit = YES;
+    assert(requestProcessIdentity(caller.audit, target.pid)->error == ESRCH);
+    mismatchTaskAudit = NO;
+    taskInfoError = KERN_INVALID_ARGUMENT;
+    assert(requestProcessIdentity(caller.audit, target.pid)->error == ESRCH);
+    taskInfoError = KERN_SUCCESS;
+    assert(!requestProcessIdentity(caller.audit, target.pid)->error);
+    mach_port_t name = target.peerIdentity.taskName;
+    mach_port_urefs_t before = sendReferences(name);
+    pid_t reusedPID = target.pid;
+    finishJob(target, 0);
+    assert(!MACH_PORT_VALID(target.peerIdentity.taskName) && sendReferences(name) == before - 1);
+    assert(MACH_PORT_VALID(identityReply.taskName)); // The copied reply retains its own reference after job retirement.
+    assert(requestProcessIdentity(caller.audit, reusedPID)->error == ESRCH);
+    LSBJob *replacement = runIdentityJob("/bin/df", reusedPID, 1502, 0xc3);
+    assert(!requestProcessIdentity(caller.audit, reusedPID)->error && identityReply.audit.val[7] == replacement.pidVersion);
+    assert(identityReply.shortInfo[63] == 0xc3 && !strcmp(identityReply.executablePath, "/bin/df"));
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
+}
+
+static void testPeerExecutablePathContainment(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerPeerPaths.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    NSString *bin = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec"];
+    assert([manager createDirectoryAtPath:bin withIntermediateDirectories:YES attributes:nil error:NULL]);
+    NSString *image = [bin stringByAppendingPathComponent:@"runningboardd"], *outside = [directory stringByAppendingPathComponent:@"outside"];
+    assert([[@"fixture" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:image atomically:YES]);
+    assert([[@"outside" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:outside atomically:YES]);
+    NSString *aliasRoot = [directory stringByAppendingPathComponent:@"AliasRoot"];
+    assert(!symlink(runtimeRoot.fileSystemRepresentation, aliasRoot.fileSystemRepresentation));
+    assert(!symlink(outside.fileSystemRepresentation, [bin stringByAppendingPathComponent:@"escape"].fileSystemRepresentation));
+    assert(!symlink(image.fileSystemRepresentation, [bin stringByAppendingPathComponent:@"inside"].fileSystemRepresentation));
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    char output[LSB_PATH_BYTES];
+    for (NSString *path in @[@"/usr/libexec/runningboardd", image, [aliasRoot stringByAppendingPathComponent:@"usr/libexec/runningboardd"],
+                            @"/usr/libexec/inside"]) {
+        setRequestProgram(request, path.fileSystemRepresentation);
+        assert(!copyGuestExecutablePath(&request->plan, output) && !strcmp(output, "/usr/libexec/runningboardd"));
+    }
+    const char *invalid[] = {"/usr/libexec/../libexec/runningboardd", "/usr//libexec/runningboardd",
+                            "/usr/./libexec/runningboardd", "/usr/libexec/runningboardd/"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        setRequestProgram(request, invalid[i]);
+        assert(copyGuestExecutablePath(&request->plan, output) == EINVAL && !output[0]);
+    }
+    for (NSString *path in @[@"/usr/libexec/escape", [bin stringByAppendingPathComponent:@"escape"]]) {
+        setRequestProgram(request, path.fileSystemRepresentation);
+        assert(copyGuestExecutablePath(&request->plan, output) == EACCES && !output[0]);
+    }
+    setRequestProgram(request, "/usr/libexec");
+    assert(copyGuestExecutablePath(&request->plan, output) == EINVAL && !output[0]);
+    setRequestProgram(request, "runningboardd");
+    assert(copyGuestExecutablePath(&request->plan, output) == ENOTSUP && !output[0]);
+    setRequestProgram(request, "/usr/libexec/missing");
+    assert(copyGuestExecutablePath(&request->plan, output) == ENOENT && !output[0]);
+    disposeMessage(request);
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
+}
+
+static void testPeerIdentityCheckInFailures(void) {
+    for (unsigned failure = 0; failure < 4; ++failure) {
+        resetBroker();
+        int fd;
+        unsigned object;
+        enqueueSpawn(spawnRequest(&fd, &object), nil);
+        LSBJob *job = startingJob;
+        LSBReceivedMessage *checkin = messageFor(LSB_REQUEST_CHECKIN, getpid(), 1510, 0);
+        mach_port_t name = checkin->peerIdentity.taskName;
+        mach_port_urefs_t before = sendReferences(name);
+        preserveCheckInIdentity = YES;
+        if (failure == 0) checkin->peerIdentity.audit.val[0] ^= 1;
+        if (failure == 1) checkin->peerIdentity.shortInfo[0] ^= 1;
+        if (failure == 2) mismatchTaskAudit = YES;
+        if (failure == 3) taskInfoError = KERN_INVALID_ARGUMENT;
+        handleMessage(checkin);
+        assert(!jobs.count && job.finishing && replyFor(object)->error == EACCES);
+        assert(!MACH_PORT_VALID(job.peerIdentity.taskName) && sendReferences(name) == before - 1);
+    }
+    resetBroker();
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    setRequestProgram(request, "/tmp/RuntimeRoot/../usr/libexec/runningboardd");
+    enqueueSpawn(request, nil);
+    LSBJob *job = startingJob;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 1511, 0));
+    assert(job.phase == JobDispatched && job.peerIdentityError == EINVAL && !MACH_PORT_VALID(job.peerIdentity.taskName));
+    resetBroker();
+    LSBJob *existing = auditJob(getpid() + 500, getpid(), 1512, NO);
+    existing.executed = YES;
+    enqueueSpawn(spawnRequest(&fd, &object), nil);
+    job = startingJob;
+    LSBReceivedMessage *collision = messageFor(LSB_REQUEST_CHECKIN, getpid(), 1513, 0);
+    mach_port_t name = collision->peerIdentity.taskName;
+    mach_port_urefs_t before = sendReferences(name);
+    mismatchTaskAudit = YES; // The PID collision must reject before snapshot validation or ownership transfer.
+    handleMessage(collision);
+    assert(replyFor(object)->error == EAGAIN && job.finishing && !MACH_PORT_VALID(job.peerIdentity.taskName));
+    assert(sendReferences(name) == before - 1 && findJob(existing.identifier) == existing);
+    resetBroker();
+}
+
+static void testGuestEntitlementsPathBoundaries(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerEntitlementsPath.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    assert([manager createDirectoryAtPath:runtimeRoot withIntermediateDirectories:YES attributes:nil error:NULL]);
+    const unsigned char payload[] = {0x70, 5, 2, 1, 1, 0xb0, 0};
+    NSData *der = [NSData dataWithBytes:payload length:sizeof(payload)], *snapshot = nil;
+    NSString *image = [runtimeRoot stringByAppendingPathComponent:@"probe"], *outside = [directory stringByAppendingPathComponent:@"outside"];
+    assert([entitlementImage(der, YES) writeToFile:image atomically:YES] && [entitlementImage(der, YES) writeToFile:outside atomically:YES]);
+    NSString *escape = [runtimeRoot stringByAppendingPathComponent:@"escape"];
+    assert(!symlink(outside.fileSystemRepresentation, escape.fileSystemRepresentation));
+    NSString *aliasRoot = [directory stringByAppendingPathComponent:@"AliasRoot"];
+    assert(!symlink(runtimeRoot.fileSystemRepresentation, aliasRoot.fileSystemRepresentation));
+    int fd;
+    unsigned object;
+    LSBReceivedMessage *request = spawnRequest(&fd, &object);
+    const char *badPaths[] = {"probe", "/missing", "/escape", "/../outside"};
+    const int expectedErrors[] = {ENOTSUP, ENOENT, EACCES, EINVAL};
+    for (unsigned i = 0; i < sizeof(expectedErrors) / sizeof(*expectedErrors); ++i) {
+        setRequestProgram(request, badPaths[i]);
+        snapshot = [NSData data];
+        assert(copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) == expectedErrors[i] && !snapshot);
+    }
+    NSString *temporaryAlias = [[NSString stringWithUTF8String:temporary] stringByAppendingString:@"/RuntimeRoot/probe"];
+    for (NSString *path in @[@"/probe", image, [aliasRoot stringByAppendingPathComponent:@"probe"], temporaryAlias]) {
+        setRequestProgram(request, path.fileSystemRepresentation);
+        assert(!copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) && [snapshot isEqualToData:entitlementBlob(der)]);
+    }
+    runtimeRoot = aliasRoot;
+    setRequestProgram(request, image.fileSystemRepresentation);
+    assert(!copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) && [snapshot isEqualToData:entitlementBlob(der)]);
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    setRequestProgram(request, escape.fileSystemRepresentation);
+    assert(copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) == EACCES && !snapshot);
+    setRequestProgram(request, "/probe");
+    const unsigned char hashBytes[LSB_GUEST_CDHASH_BYTES] = {0x51, 0x52};
+    codeDirectoryHash = [NSData dataWithBytes:hashBytes length:sizeof(hashBytes)];
+    afterCodeDirectoryRead = ^(int descriptor) {
+        char current[PATH_MAX];
+        assert(!fcntl(descriptor, F_GETPATH, current));
+        int writer = open(current, O_WRONLY | O_APPEND);
+        assert(writer >= 0 && write(writer, "changed", 7) == 7 && !close(writer));
+    };
+    NSData *hashSnapshot = nil;
+    int hashError = 0;
+    assert(copyGuestEntitlements(&request->plan, &snapshot, &hashSnapshot, &hashError) == EAGAIN);
+    assert(hashError == EAGAIN && !snapshot && !hashSnapshot);
+    afterCodeDirectoryRead = nil;
+    assert([entitlementImage(der, YES) writeToFile:image atomically:YES]);
+    LSBJob *native = [LSBJob new];
+    native.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+    native.request = request;
+    snapshotGuestEntitlements(native);
+    assert(native.guestEntitlementsError == EACCES && !native.guestEntitlements && !native.guestXMLEntitlements);
+    assert(!guestEntitlementErrorLogs); // Native helpers intentionally have no guest metadata.
+    native.executionRole = LSB_EXECUTION_SIMULATOR;
+    xmlConversionError = EILSEQ;
+    snapshotGuestEntitlements(native);
+    assert(!native.guestEntitlementsError && [native.guestEntitlements isEqualToData:entitlementBlob(der)]);
+    assert(native.guestXMLEntitlementsError == EILSEQ && !native.guestXMLEntitlements);
+    assert(guestEntitlementErrorLogs == 1);
+    xmlConversionError = 0;
+    native.request = NULL;
+    assert([entitlementImage(der, NO) writeToFile:image atomically:YES]);
+    assert(copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) == ENOENT && !snapshot);
+    const unsigned char malformed[] = {0x70, 0xff};
+    assert([entitlementImage([NSData dataWithBytes:malformed length:sizeof(malformed)], YES) writeToFile:image atomically:YES]);
+    assert(copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) == EINVAL && !snapshot);
+    assert(!unlink(image.fileSystemRepresentation) && !mkfifo(image.fileSystemRepresentation, 0600));
+    assert(copyGuestEntitlements(&request->plan, &snapshot, NULL, NULL) == EINVAL && !snapshot); // Opening a nonregular image must not block.
+    native.request = request;
+    for (unsigned i = 0; i < 20; ++i) snapshotGuestEntitlements(native);
+    assert(guestEntitlementErrorLogs == 13); // Twelve detailed failures and one suppression notice, never per-request log flooding.
+    setRequestProgram(request, "/RuntimeRoot//usr/libexec/xpcproxy_sim");
+    for (unsigned i = 0; i < 8; ++i) snapshotGuestEntitlements(native);
+    assert(guestProxySigningErrorLogs == 3 && guestEntitlementErrorLogs == 13);
+    assert(native.guestEntitlementsError == EINVAL && native.guestCodeDirectoryHashError == EINVAL); // Quotas never relax validation.
+    native.request = NULL;
+    disposeMessage(request);
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
 }
 
 static void testAuditResolutionSeesCommittedExecOnly(void) {
@@ -1863,6 +2835,18 @@ int main(void) {
         testNativeProbeAssertionLoss();
         testMetalEndpointRegistration();
         testMetalRegistrationCannotClearHelperDeath();
+        testHostSpringBoardMetalSelection();
+        testPublicMetalReadyFailureRevokesSession();
+        testPublicMetalLifetimeAndClientIndependence();
+        testSecondMetalHelperFailureIsIndependent();
+        testSeparateMetalOwners();
+        testSpringBoardRegistrationIsolation();
+        testGuestEntitlementsSnapshotsAndAuthentication();
+        testGuestEntitlementsPathBoundaries();
+        testPeerIdentityKernelValidation();
+        testPeerIdentitySnapshotsAndAuthentication();
+        testPeerExecutablePathContainment();
+        testPeerIdentityCheckInFailures();
         testMonitorFailureAndEarlyExit();
         testAuditedGenerationDisappearsBeforeBootstrap();
         testRunningBoardFallback();

@@ -2,6 +2,7 @@
 #include "PrivateXPC.h"
 #include "SingleThreadGuard.h"
 #include "ChildStatus.h"
+#include "GuestEntitlements.h"
 #if defined(LSB_XPC_WIRE_COMPATIBILITY)
 #include "../Guest/XPCWireCompatibility.h"
 #endif
@@ -20,6 +21,9 @@
 #endif
 
 #define LSB_TRANSPORT_VERSION 1
+
+// The simulator SDK omits libproc.h; the same native ABI is exported by both libSystem variants.
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int size);
 
 static int traceError(const char *stage, int error, unsigned detail) {
 #if defined(LSB_TRANSPORT_TRACE)
@@ -83,6 +87,59 @@ static void closeFDs(int fds[LSB_MAX_FDS]) {
 static bool sendRight(mach_port_t port) {
     mach_port_type_t type = 0;
     return MACH_PORT_VALID(port) && !mach_port_type(mach_task_self(), port, &type) && (type & MACH_PORT_TYPE_SEND);
+}
+
+static bool identityPIDMatches(const LSBPeerProcessIdentity *identity, pid_t pid) {
+    return pid > 0 && identity->audit.val[5] == (uint32_t)pid && LSBPeerProcessIdentityPID(identity) == (uint32_t)pid;
+}
+
+static bool taskNameMatchesAudit(mach_port_t task, const audit_token_t *audit) {
+    audit_token_t actual;
+    mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+    return sendRight(task) && task_info(task, TASK_AUDIT_TOKEN, (task_info_t)&actual, &count) == KERN_SUCCESS &&
+        count == TASK_AUDIT_TOKEN_COUNT && !memcmp(&actual, audit, sizeof(*audit));
+}
+
+static int captureSelfIdentity(LSBPeerProcessIdentity *identity) {
+    memset(identity, 0, sizeof(*identity));
+    pid_t pid = getpid();
+    int count = proc_pidinfo(pid, LSB_PEER_SHORT_INFO_FLAVOR, 0, identity->shortInfo, sizeof(identity->shortInfo));
+    if (count != sizeof(identity->shortInfo)) return count < 0 || !count ? (errno ? errno : EIO) : EPROTO;
+    audit_token_t audit;
+    mach_msg_type_number_t auditCount = TASK_AUDIT_TOKEN_COUNT;
+    if (task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&audit, &auditCount) || auditCount != TASK_AUDIT_TOKEN_COUNT) return EACCES;
+    identity->audit = audit;
+    if (!identityPIDMatches(identity, pid)) return EPROTO;
+    if (task_name_for_pid(mach_task_self(), pid, &identity->taskName) || !taskNameMatchesAudit(identity->taskName, &identity->audit)) {
+        LSBPeerProcessIdentityDispose(identity);
+        return EACCES;
+    }
+    return 0;
+}
+
+static int decodeIdentity(xpc_object_t dictionary, LSBPeerProcessIdentity *identity, pid_t pid, const audit_token_t *checkinAudit) {
+    const char *infoKey = checkinAudit ? "self-short-info" : "peer-short-info";
+    const char *portKey = checkinAudit ? "self-task-name" : "peer-task-name";
+    xpc_object_t info = xpc_dictionary_get_value(dictionary, infoKey), task = xpc_dictionary_get_value(dictionary, portKey);
+    if (!info || xpc_get_type(info) != XPC_TYPE_DATA || xpc_data_get_length(info) != sizeof(identity->shortInfo) ||
+        !task || xpc_get_type(task) != &_xpc_type_mach_send) return EPROTO;
+    if (checkinAudit) identity->audit = *checkinAudit;
+    else {
+        xpc_object_t audit = xpc_dictionary_get_value(dictionary, "peer-audit"), path = xpc_dictionary_get_value(dictionary, "peer-path");
+        if (!audit || xpc_get_type(audit) != XPC_TYPE_DATA || xpc_data_get_length(audit) != sizeof(identity->audit) ||
+            !path || xpc_get_type(path) != XPC_TYPE_STRING) return EPROTO;
+        size_t length = xpc_string_get_length(path);
+        const char *text = xpc_string_get_string_ptr(path);
+        if (!length || length >= sizeof(identity->executablePath) || text[0] != '/' || strlen(text) != length) return EPROTO;
+        memcpy(&identity->audit, xpc_data_get_bytes_ptr(audit), sizeof(identity->audit));
+        memcpy(identity->executablePath, text, length + 1);
+    }
+    memcpy(identity->shortInfo, xpc_data_get_bytes_ptr(info), sizeof(identity->shortInfo));
+    if (!identityPIDMatches(identity, pid)) return EPROTO;
+    identity->taskName = xpc_dictionary_copy_mach_send(dictionary, portKey);
+    if (!sendRight(identity->taskName)) return EPROTO;
+    // CHECKIN is independently authenticated by the broker. Replies must also bind the returned capability to the full identity.
+    return checkinAudit || taskNameMatchesAudit(identity->taskName, &identity->audit) ? 0 : EPROTO;
 }
 
 static int encodePorts(xpc_object_t dictionary, const LSBSpawnPorts *ports) {
@@ -328,8 +385,15 @@ int LSBTransportCheckIn(LSBBootstrapReply *result, int fds[LSB_MAX_FDS]) {
     initializeFDs(fds);
     xpc_object_t request = createRequest(LSB_REQUEST_CHECKIN, 0, 0);
     if (!request) return ENOMEM;
+    LSBPeerProcessIdentity self;
+    int error = captureSelfIdentity(&self);
+    if (!error) {
+        xpc_dictionary_set_data(request, "self-short-info", self.shortInfo, sizeof(self.shortInfo));
+        xpc_dictionary_set_mach_send(request, "self-task-name", self.taskName);
+    }
+    LSBPeerProcessIdentityDispose(&self);
     xpc_object_t reply = NULL;
-    int error = callBroker(request, &reply);
+    if (!error) error = callBroker(request, &reply);
     xpc_release(request);
     if (!error) {
         int remoteError = 0;
@@ -466,12 +530,96 @@ int LSBTransportResolveAuditPID(const audit_token_t *audit, pid_t *result) {
     return error;
 }
 
+static bool validCodeSigningData(const void *bytes, size_t size, unsigned operation) {
+    return operation == 5 ? bytes && size == LSB_GUEST_CDHASH_BYTES :
+                           LSBGuestEntitlementsHasValidBlobHeaderForOperation(bytes, size, operation);
+}
+
+static int copyCodeSigningData(const audit_token_t *target, unsigned operation, unsigned char **blob, size_t *size) {
+    if (blob) *blob = NULL;
+    if (size) *size = 0;
+    if (!target || !blob || !size || !target->val[5] || target->val[5] > INT_MAX) return EINVAL;
+    xpc_object_t request = createRequest(LSB_REQUEST_COPY_ENTITLEMENTS, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_dictionary_set_data(request, "target-audit", target, sizeof(*target));
+    xpc_dictionary_set_uint64(request, "operation", operation);
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        xpc_object_t data = error ? NULL : xpc_dictionary_get_value(reply, "entitlements");
+        // Exact shape excludes FD/port fields, even under an unexpected key. Error replies never carry entitlement data.
+        if (!error && (pid || requestID || xpc_dictionary_get_count(reply) != (remoteError ? 4u : 5u) ||
+                       (remoteError ? data != NULL : !data || xpc_get_type(data) != XPC_TYPE_DATA))) error = EPROTO;
+        if (!error && remoteError) error = remoteError;
+        if (!error) {
+            size_t length = xpc_data_get_length(data);
+            const void *bytes = xpc_data_get_bytes_ptr(data);
+            if (!validCodeSigningData(bytes, length, operation)) error = EPROTO;
+            else {
+                unsigned char *copy = malloc(length);
+                if (!copy) error = ENOMEM;
+                else { memcpy(copy, bytes, length); *blob = copy; *size = length; }
+            }
+        }
+    }
+    if (reply) xpc_release(reply);
+    return error;
+}
+
+int LSBTransportCopyEntitlements(const audit_token_t *target, unsigned operation, unsigned char **blob, size_t *size) {
+    if (blob) *blob = NULL;
+    if (size) *size = 0;
+    if (operation != 7 && operation != 16) return EINVAL;
+    return copyCodeSigningData(target, operation, blob, size);
+}
+
+int LSBTransportCopyCodeDirectoryHash(const audit_token_t *target, unsigned char hash[LSB_GUEST_CDHASH_BYTES]) {
+    if (!hash) return EINVAL;
+    memset(hash, 0, LSB_GUEST_CDHASH_BYTES);
+    unsigned char *bytes = NULL;
+    size_t size = 0;
+    int error = copyCodeSigningData(target, 5, &bytes, &size);
+    if (!error) memcpy(hash, bytes, LSB_GUEST_CDHASH_BYTES);
+    free(bytes);
+    return error;
+}
+
+int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *identity) {
+    if (identity) memset(identity, 0, sizeof(*identity));
+    if (!identity || nativePID <= 0) return EINVAL;
+    xpc_object_t request = createRequest(LSB_REQUEST_COPY_PROCESS_IDENTITY, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_dictionary_set_int64(request, "target-pid", nativePID);
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        if (!error && (requestID || pid != (remoteError ? 0 : nativePID) ||
+                       xpc_dictionary_get_count(reply) != (remoteError ? 4u : 8u))) error = EPROTO;
+        if (!error) error = remoteError;
+        if (!error) error = decodeIdentity(reply, identity, nativePID, NULL);
+    }
+    if (reply) xpc_release(reply);
+    if (error) LSBPeerProcessIdentityDispose(identity);
+    return error;
+}
+
 void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
     if (!message) return;
     if (message->object) xpc_release((xpc_object_t)message->object);
     message->object = NULL;
     closeFDs(message->fds);
     LSBSpawnPortsDispose(&message->ports);
+    LSBPeerProcessIdentityDispose(&message->peerIdentity);
     if (MACH_PORT_VALID(message->nativeServicePort)) mach_port_deallocate(mach_task_self(), message->nativeServicePort);
     message->nativeServicePort = MACH_PORT_NULL;
 }
@@ -533,6 +681,59 @@ int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_
     return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, false, -1, -1, MACH_PORT_NULL, NULL, 0, 0, LSB_EXECUTION_SIMULATOR);
 }
 
+int LSBTransportReplyEntitlements(LSBReceivedMessage *message, int error, const void *bytes, size_t size) {
+    if (!message || !message->object || error < 0 || message->kind != LSB_REQUEST_COPY_ENTITLEMENTS || message->requestID) return EINVAL;
+    int encodingError = (error ? bytes != NULL || size != 0 :
+        !validCodeSigningData(bytes, size, message->entitlementOperation)) ? EINVAL : 0;
+    if (encodingError) error = encodingError;
+    xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
+    if (!reply) {
+        xpc_release((xpc_object_t)message->object);
+        message->object = NULL;
+        return EPIPE;
+    }
+    xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
+    xpc_dictionary_set_uint64(reply, "request-id", 0);
+    xpc_dictionary_set_int64(reply, "error", error);
+    xpc_dictionary_set_int64(reply, "pid", 0);
+    if (!error) xpc_dictionary_set_data(reply, "entitlements", bytes, size);
+    int sendError = xpc_pipe_routine_reply(reply);
+    xpc_release(reply);
+    xpc_release((xpc_object_t)message->object);
+    message->object = NULL;
+    return sendError ? sendError : encodingError;
+}
+
+int LSBTransportReplyProcessIdentity(LSBReceivedMessage *message, int error, const LSBPeerProcessIdentity *identity) {
+    if (!message || !message->object || error < 0 || message->kind != LSB_REQUEST_COPY_PROCESS_IDENTITY || message->requestID) return EINVAL;
+    int encodingError = 0;
+    if (error ? identity != NULL : !identity || !identityPIDMatches(identity, message->targetPID) || !sendRight(identity->taskName) ||
+        identity->executablePath[0] != '/' || strnlen(identity->executablePath, sizeof(identity->executablePath)) >= sizeof(identity->executablePath))
+        encodingError = EINVAL;
+    if (encodingError) error = encodingError;
+    xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
+    if (!reply) {
+        xpc_release((xpc_object_t)message->object);
+        message->object = NULL;
+        return EPIPE;
+    }
+    xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
+    xpc_dictionary_set_uint64(reply, "request-id", 0);
+    xpc_dictionary_set_int64(reply, "error", error);
+    xpc_dictionary_set_int64(reply, "pid", error ? 0 : message->targetPID);
+    if (!error) {
+        xpc_dictionary_set_data(reply, "peer-audit", &identity->audit, sizeof(identity->audit));
+        xpc_dictionary_set_data(reply, "peer-short-info", identity->shortInfo, sizeof(identity->shortInfo));
+        xpc_dictionary_set_string(reply, "peer-path", identity->executablePath);
+        xpc_dictionary_set_mach_send(reply, "peer-task-name", identity->taskName);
+    }
+    int sendError = xpc_pipe_routine_reply(reply);
+    xpc_release(reply);
+    xpc_release((xpc_object_t)message->object);
+    message->object = NULL;
+    return sendError ? sendError : encodingError;
+}
+
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                                const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], int statusFD, int wakeFD) {
     return replyToMessage(message, error, pid, requestID, runtimeRoot, plan, fds, true, statusFD, wakeFD,
@@ -576,7 +777,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     uint64_t version = 0, kind = 0;
     int64_t childError = 0;
     if (!unsignedValue(request, "version", &version) || version != LSB_TRANSPORT_VERSION ||
-        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_RESOLVE_AUDIT_PID ||
+        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_COPY_PROCESS_IDENTITY ||
         !unsignedValue(request, "request-id", &message->requestID) || !signedValue(request, "error", &childError) ||
         childError < 0 || childError > INT_MAX) error = EPROTO;
     if (!error) {
@@ -608,7 +809,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
                 !signedValue(request, "signal", &signal) || signal < INT_MIN || signal > INT_MAX) error = EPROTO;
             else { message->targetPID = (pid_t)target; message->signalNumber = (int)signal; }
         }
-        if (!error && kind == LSB_REQUEST_RESOLVE_AUDIT_PID) {
+        if (!error && (kind == LSB_REQUEST_RESOLVE_AUDIT_PID || kind == LSB_REQUEST_COPY_ENTITLEMENTS)) {
             xpc_object_t target = xpc_dictionary_get_value(request, "target-audit");
             if (!target || xpc_get_type(target) != XPC_TYPE_DATA || xpc_data_get_length(target) != sizeof(message->targetAudit) ||
                 xpc_dictionary_get_value(request, "target-pid") || xpc_dictionary_get_value(request, "signal")) error = EPROTO;
@@ -617,6 +818,21 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
                 if (!message->targetAudit.val[5] || message->targetAudit.val[5] > INT_MAX) error = EPROTO;
             }
         } else if (!error && xpc_dictionary_get_value(request, "target-audit")) error = EPROTO;
+        if (!error && kind == LSB_REQUEST_COPY_ENTITLEMENTS) {
+            uint64_t operation = 0;
+            if (!unsignedValue(request, "operation", &operation) || (operation != 5 && operation != 7 && operation != 16) ||
+                xpc_dictionary_get_count(request) != 6) error = EPROTO;
+            else message->entitlementOperation = (uint32_t)operation;
+        } else if (!error && xpc_dictionary_get_value(request, "operation")) error = EPROTO;
+        if (!error && kind == LSB_REQUEST_CHECKIN) {
+            if (xpc_dictionary_get_count(request) != 6) error = EPROTO;
+            else error = decodeIdentity(request, &message->peerIdentity, (pid_t)message->audit.val[5], &message->audit);
+        } else if (!error && (xpc_dictionary_get_value(request, "self-short-info") || xpc_dictionary_get_value(request, "self-task-name"))) error = EPROTO;
+        if (!error && kind == LSB_REQUEST_COPY_PROCESS_IDENTITY) {
+            int64_t target = 0;
+            if (xpc_dictionary_get_count(request) != 5 || !signedValue(request, "target-pid", &target) || target <= 0 || target > INT_MAX) error = EPROTO;
+            else message->targetPID = (pid_t)target;
+        }
     }
     if (error) {
         (void)LSBTransportReply(message, error, 0, message->requestID, NULL, NULL, NULL);

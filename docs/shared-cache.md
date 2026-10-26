@@ -238,6 +238,219 @@ Relative metadata and file layout remained consistent. The recorded check is `tm
 For every new build, verify the complete declared VM span is free before permitting fixed mappings; the working base is not
 a general allocator or a guarantee for a different runtime.
 
+## SpringBoard closure offline build
+
+On 2026-10-26, an isolated matching **23A343** build combined the established 545-image cache set, SpringBoard's strong
+dependency closure, Sleepd's strong closure and the currently loose supporting-daemon libraries. The result contains
+**1,353 images**: 1,350 original runtime inputs and the three automatically supplied host support libraries. Every expected
+image is present. The builder completed in 8.73 seconds. The layout and signature checks below are offline evidence;
+the subsequent device trials are recorded separately. SpringBoard boot has not been established.
+
+The new base is **`0x108000000`**. The measured mappings are:
+
+| Region | Start | End | MiB | Initial / maximum protection |
+| --- | --- | --- | ---: | --- |
+| TEXT | `0x108000000` | `0x164594000` | 1477.578125 | `r-x` / `r-x` |
+| DATA_CONST | `0x164594000` | `0x16e018000` | 154.515625 | `r--` / `rw-` |
+| TPRO_CONST | `0x170018000` | `0x17001c000` | 0.015625 | `r--` / `rw-` |
+| DATA | `0x17001c000` | `0x1746c8000` | 70.671875 | `rw-` / `rw-` |
+| Read-only metadata | `0x1766c8000` | `0x17a4fc000` | 62.203125 | `r--` / `r--` |
+| LINKEDIT | `0x17a4fc000` | `0x186190000` | 188.578125 | `r--` / `r--` |
+
+The declared reservation ends at `0x186194000`, spanning **2017.578125 MiB**. All executable and writable mappings remain
+below `0x180000000`; the highest instruction-marked section ends at `0x1645900c0`. Only read-only LINKEDIT crosses the
+boundary, by approximately 97.58 MiB including the final reservation page. The earlier high-address execute-protection
+failure therefore does not by itself reject this layout: the crossing region requires no execute permission. The device
+trials below separately check mapping permissions and execution progress. The lower base leaves only
+128 MiB above the arm64 executable's 4 GiB minimum for native images and early allocations; ASLR collisions remain a
+separate question. Inspect the entire reservation before fixed mappings.
+
+### Reproducing the measured builder configuration
+
+The input builder is the original 23A343 runtime's `Contents/Resources/update_dyld_sim_shared_cache`, SHA-256
+`79e721958b8d733bd943cc550dee7336b9fcafa2e90619f16c36dd2931f396a3`. A new temporary copy received these exact arm64 changes;
+the source builder, runtime volume and existing cache were preserved:
+
+| File offset | Original word | Replacement word | Effect |
+| --- | --- | --- | --- |
+| `0x5ea5c` | `0xb26107e8` | `0xd2c00028` | Start the base at `0x100000000`. |
+| `0x5ea60` | `0xd2c00029` | `0xb2650108` | OR in `0x08000000`, selecting `0x108000000`. |
+| `0x5ea64` | `0x9a881129` | `0xd2c00029` | Retain the simulator builder's 4 GiB layout limit. |
+| `0x12b4` | `0x52800028` | `0x52802028` | Set the adjacent local-build and optimize-for-size bytes to `1,1`. |
+
+The final change replaces `mov w8,#1` with `mov w8,#0x101`; the following halfword store writes
+`BuildOptions_v3.isLocallyBuiltCache` and `optimizeForSize`. Apple's
+[option routing](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/cache_builder/mrm_shared_cache_builder.cpp)
+selects `LocalSymbolsMode::strip` when optimize-for-size is enabled. The simulator CLI normally disables it and keeps
+locals. The local 23A343 instructions were independently disassembled to verify the field store and base selection;
+the public source alone was not assumed to have identical instruction offsets.
+
+The supported builder pass removes local nlist symbols while retaining runtime exports and metadata. The resulting cache
+has zero local symbols, 821,761 globals and 501,761 undefined entries. All 1,353 images retain export tries and function
+starts; 1,121 images retain ObjC classlist sections. Retained symbol strings occupy 41 MiB after deduplication. Matching
+original images remain available on the Mac for symbolication; local names are no longer carried in the mapped cache.
+There was no post-build deletion of runtime tables or manual relocation of the resulting cache.
+
+The exact selected input paths and read-only staging methods are retained in
+`tmp/springboard-stage/full-cache-108-strip/stage-manifest.json`. Preparation used
+`tmp/springboard-stage/prepare-full-cache.py`; `run-full-cache.py` recorded this command against the prepared input tree:
+
+```sh
+WORK="$PWD/tmp/springboard-stage/full-cache-108-strip"
+"$WORK/update_dyld_sim_shared_cache" -root "$WORK/root" -cache_dir "$WORK/unsigned" \
+  -iOS -arch arm64 -force -verbose -time-passes -stats
+```
+
+Use a fresh output directory when recreating the experiment. The general `Tools/patch-ios26-cache-base.py` still targets
+`0x120000000`; it was not changed by this local experiment. The temporary builder is ad-hoc signed for execution on the
+Mac. Its 4 GiB build limit is not a guarantee of available device VA. The existing patched 23A343 dyld_sim already reads
+the cache base and cleanup bounds from the header, so it requires no additional base-specific instruction change.
+
+### Offline signing checks
+
+`Tools/sign-dyld-cache.py` signed the output with the established identity, identifier and team. Strict `codesign`
+verification, CMS verification and all **125,028 contiguous 16 KiB page hashes** passed. The signature is CodeDirectory
+v`0x20400`, without scatter entries, entitlements or executable-segment flags. Its executable extent matches the TEXT
+mapping; only the header's signature-capacity field differs from the unsigned payload.
+
+The signed file is **2,064,482,304 bytes**, SHA-256
+`2cee215fdafbb5493f8b03ecf7585ad0799e86dfe4382487b551e7876167da87`, CDHash
+`bda9c46dd282b45baf49a819a03b4c5c0c186cfc`. The matching copied/resigned dyld_sim retains MH_DYLINKER and the previous iOS
+platform-compatibility changes; its executable payload is unchanged, with SHA-256
+`44cb8380b2db3801b88a7327abb27bec6252ada8a9ccc813f8f29afbbd4d919f` after signing.
+
+Evidence under `tmp/springboard-stage/full-cache-108-strip/` includes `build.log`, `validation.json`, `sign-result.json`,
+`cache-strict-verify.log`, `dyld-sign-result.json` and `delivery-manifest.json`. The signed outputs and manifests are retained;
+redundant unsigned and compressed cache files can be removed after validation. These offline results must remain separate
+from later device activation and runtime evidence.
+
+### First phone mapping failure
+
+The first hardware-breakpoint-only LLDB trial used host **85367** and df/LiveProcess **85368**, with the signed cache hash
+above. It reached an executable TEXT mapping at `[0x108000000, 0x164594000)`, then failed while mapping DATA_CONST.
+The cache's read-only DATA_CONST mapping, `[0x164594000, 0x16e018000)`, replaced the still-active native main stack.
+With `sp=0x16b9187b0`, the app callback at `pc=0x1044fae04` executed `str x0, [sp, #0x50]`, faulting on the now-read-only
+address **`0x16b918800`**. LLDB reported `EXC_BAD_ACCESS (code=2)` and the overwritten stack could no longer unwind normally.
+
+This failure identifies a live-stack collision, not an execute-protection rejection. The stopped process was killed after
+the capture. Mapping had not reached the high read-only LINKEDIT region, so this run establishes neither complete cache
+mapping nor acceptance of the portion above `0x180000000`. It motivated the guarded stack handoff described below.
+Evidence: `tmp/lsd-services/lldb-full-cache-first-failure.txt`.
+
+### Guarded main stack and completed cache mapping
+
+`LiveSimBooter/DyldSimLoader.cpp` now reads the cache's declared reservation before destructive handoff. It validates the
+arm64 header, mapping-table extent, reservation alignment and arithmetic, and checks the reservation against the resident
+loader's segments, guest executable segments, mapped dyld_sim, static startup vectors and static launch descriptor.
+The captured native main-thread bounds must contain the current frame. These are checks of the named surviving regions,
+not a general proof that every native heap allocation is outside the cache.
+
+When the native main stack overlaps the reservation, the loader reserves a replacement stack of at least **8 MiB**, with
+one inaccessible page at each end. The `0x400000000` address is a non-fixed mmap hint: it cannot overwrite an existing
+mapping, and the returned reservation must lie at or above `0x300000000`, outside the cache including both guards.
+Failure before handoff releases the reservation. A non-overlapping native stack retains the existing handoff path.
+
+The startup vectors and launch descriptor live in app-local static storage. The rebuilt `main_stack` apple entry names
+the selected usable stack bounds and sets both pthread allocation fields to zero. After the host-cache/TSD/debugger
+handoff, a one-way arm64 bridge installs the new SP, clears FP/LR, and branches to a fresh C frame. It cannot return through
+the overwritten native frames. It calls dyld_sim, invokes the returned `start_sim`, and uses a raw exit if that entry
+returns; no host cleanup follows a successful detach.
+
+The normal loader suite passed **1,030 checks**, and the handoff suite passed **882 checks**, including a real assembly
+stack-switch child that makes its entire original stack `PROT_NONE` before invoking the returned entry and exiting 42.
+The loader also passed ASan/UBSan, and the handoff suite passed UBSan. Evidence is under `tmp/main-stack/`: `loader-tests.log`,
+`handoff-tests.log`, `loader-asan.log` and `handoff-ubsan.log`. These local checks are separate from the device observation.
+
+The next hardware-only LLDB trial, native **85385**, completed cache loading and reached a Foundation initializer.
+The observed memory regions were:
+
+| Region | Start | End | Protection |
+| --- | --- | --- | --- |
+| Cache TEXT | `0x108000000` | `0x164594000` | `r-x`, zero dirty pages |
+| Cache LINKEDIT | `0x17a4fc000` | `0x186190000` | `r--`, zero dirty pages |
+| Low stack guard | `0x400000000` | `0x400004000` | `---` |
+| Usable stack | `0x400004000` | `0x400804000` | `rw-` |
+| High stack guard | `0x400804000` | `0x400808000` | `---` |
+
+This establishes that the read-only LINKEDIT mapping can cross `0x180000000` for this signed cache while its code remains
+executable below the boundary. At the stop, SP was `0x4007fecd0` on the new stack. The immediate failure was an explicit
+BRK at `0x1629c8064` in `libsystem_featureflags.dylib`, called during Foundation initialization. Disassembling its preceding
+instructions identifies the exact message as **`No SIMULATOR_ROOT`**. The adjacent cold path at `0x1629c8084` checks
+`SIMULATOR_SHARED_RESOURCES_DIRECTORY`; that was not the observed stop. The direct df test lacked `SIMULATOR_ROOT`, while
+the selected launchd configuration already supplies both variables. This run did not establish a successful df exit or
+complete service startup. Evidence: `tmp/lsd-services/lldb-full-cache-mapped.txt`, `lldb-featureflags-failure.txt` and
+`console-full-cache-guarded-df.log`.
+
+### Successful df execution with the full cache
+
+The next normal launch supplied both `SIMULATOR_ROOT` and `SIMULATOR_SHARED_RESOURCES_DIRECTORY`. Under host **85402**,
+df/LiveProcess **85403** used the same full cache and guarded stack, printed the complete filesystem table, and exited
+successfully: the broker recorded **`wait-status=0x0`**. Its stack diagnostic confirms the usable top `0x400804000`, size
+`0x800000`, and cache reservation `0x108000000-0x186194000` before host-cache detachment.
+
+The `malloc: nano zone abandoned due to inability to reserve vm space` warning remained, but did not prevent allocation,
+table output or exit 0. The concurrent filtered amfid/TXM capture contained no matching events. Evidence is
+`tmp/lsd-services/console-full-cache-df-final.log` and `security.log`. The console's later signal 15 applies to the host
+app's shutdown, after the child's recorded successful exit.
+
+This verifies a complete df launch and exit with the signed 1,353-image cache, including its read-only region above
+`0x180000000` and relocated main stack. Complete service startup and SpringBoard boot remain separate, pending tests.
+
+### Reserving the gaps between cache mappings
+
+The larger service run exposed another address-layout requirement. Mapping only the cache's file-backed regions left
+two 32 MiB holes free: `[0x16e018000, 0x170018000)` and `[0x1746c8000, 0x1766c8000)`. LLDB found ordinary loose images in
+those holes, including CoreRoutine at `0x174a90000` and Sleep at `0x175e04000`; both gap starts reported executable
+`__TEXT` mappings. These images were inside the cache's declared broad range even though their bytes came from loose
+files. Evidence is `tmp/lsd-services/lldb-springboard-range-calls.txt`.
+
+This violates an Objective-C runtime assumption: Apple's
+[shared-cache address classifier](https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-private.h)
+uses one start/end interval, and `classInSharedCache` checks both the class and its read-only metadata against that
+interval. It does not ask whether each address belongs to an individual cache mapping. Ordinary image metadata in a
+cache hole can therefore receive cached-image treatment. The complete cache address span must remain exclusive, including
+regions without file-backed cache contents.
+
+`LSBDyldSimLaunch` now carries the validated cache base and size. After the host-cache/debugger handoff and any required
+stack switch, `LSBRunDyldSimOnPreparedStack` reserves the complete span with the app-local
+`lsb::mmap(PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE)`. This occurs before entering dyld_sim. The
+[private mapper](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/SharedCacheRuntime.cpp)
+then replaces individual cache segments using fixed mappings and leaves the gaps owned. The matching 23A343 disassembly
+confirms this behavior: mapping flags are `0x12`, and whole-range cleanup on failure replaces the span with inaccessible
+memory rather than releasing it. The last dynamic-data page is mapped separately.
+
+Preflight additionally verifies that prepared TLS, helper-table and simulator process-info storage belongs to the
+already-validated resident image, and rejects overlap with the page-rounded native `TASK_DYLD_INFO` metadata range that
+the debugger fallback may preserve. Reservation failure or an unexpected returned address emits one bounded local
+stderr diagnostic, then exits through the raw syscall with status 126. No host cleanup or return through old frames is
+permitted after this overwrite.
+
+Focused tests passed **1,044 loader checks** and **1,074 handoff checks**, with ASan/UBSan for the loader and UBSan for the
+handoff. The real assembly-switch child reserves its original stack as the cache span, replaces two endpoint segments,
+checks that the intervening gap remains `PROT_NONE`, and confirms a normal hinted allocation cannot occupy it. Failure
+tests cover rejected/incorrect mmap results, malformed ranges and stderr failure. Evidence is in `tmp/main-stack/`
+`loader-reservation-tests.log`, `loader-reservation-asan.log`, `handoff-reservation-tests.log`,
+`handoff-reservation-ubsan.log` and `handoff-reservation-arm64e.s`.
+
+In the first phone run with reservation enabled, host **97445** saw backboardd **97466** register `CAWindowServer` at
+1290×2796 and establish three native Metal connections without the preceding `featureProfile` exception. Sleepd **97469**
+remained alive without its preceding initializer exception. LaunchServices probe **97463** received status `0x80` from
+peer **97467** and exited 0. SpringBoard **97465** reached its constructor stop; the loose CoreRoutine class reported at
+`0x1079bb050` was now outside the cache, compared with `0x174b2f050` before reservation. These initial results support the
+range-collision diagnosis; they do not establish complete service or SpringBoard boot. Direct LLDB verification of the
+reserved gaps followed in the same SpringBoard process. Evidence is
+`tmp/lsd-services/console-springboard-reservation.log` and `reservation-initial-guests.log`.
+
+LLDB then confirmed inaccessible regions at `[0x16e018000, 0x170000000)` and `[0x1746c8000, 0x1766c8000)`. Cache TEXT still
+reported `r-x`, and LINKEDIT through `0x186190000` remained `r--`, both with zero dirty pages. The loose CoreRoutine header
+was at `0x10791c000` and Sleep at `0x300bfc000`, outside the cache reservation. These reads directly verify that the tested
+gap starts no longer contain loose-image TEXT. The recorded first inaccessible region ends at `0x170000000`; it is not a
+measurement of the final `0x18000` bytes before TPRO_CONST. Evidence is `tmp/lsd-services/lldb-reserved-cache-mappings.txt`.
+
+After resuming SpringBoard, its hardware exception breakpoint did not fire and the process exited with status **255**.
+The earlier SpringBoardUI guard exception did not recur, but SpringBoard did not boot. The reason for this later exit
+remained under investigation; the appended output is `tmp/lsd-services/springboard-reservation-after-resume.log`.
+
 ## iOS 27 relocation limits
 
 The later [minimum iOS 26 comparison](ios26-base-comparison.md) builds the same 217-image stock dependency closure at

@@ -1,4 +1,7 @@
 #include "ProcessIdentity.h"
+#ifdef LSB_GUEST_RUNTIME
+#include "PeerProcessCompatibility.h"
+#endif
 #include "ChildWait.h"
 #include <limits.h>
 #include <dlfcn.h>
@@ -14,14 +17,20 @@
 static _Atomic(pid_t) guestPID, parentPID;
 static _Atomic(bool) parentKnown;
 static char nativeNotifydPath[PATH_MAX];
+static char nativeBaseBoardPath[PATH_MAX];
+static char nativeRunningBoardServicesPath[PATH_MAX];
+static char nativeFrontBoardPath[PATH_MAX];
+static const char baseBoardInstallPath[] = "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
+static const char runningBoardServicesInstallPath[] =
+    "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
+static const char frontBoardInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard";
 
-static void configureNativeNotifydIdentity(void) {
-    nativeNotifydPath[0] = '\0';
-    const char *enabled = getenv("LSB_SIMULATE_NOTIFICATION_SHM"), *root = getenv("DYLD_ROOT_PATH");
-    if (!enabled || strcmp(enabled, "1") || !root || root[0] != '/') return;
-    static const char suffix[] = "/usr/sbin/notifyd";
-    size_t length = strnlen(root, sizeof(nativeNotifydPath));
-    if (length < 2 || length > sizeof(nativeNotifydPath) - sizeof(suffix) || root[length - 1] == '/' || strchr(root, ':')) return;
+static void configureNativeImagePath(char path[PATH_MAX], const char *suffix) {
+    path[0] = '\0';
+    const char *root = getenv("DYLD_ROOT_PATH");
+    if (!root || root[0] != '/') return;
+    size_t length = strnlen(root, PATH_MAX), suffixSize = strlen(suffix) + 1;
+    if (length < 2 || suffixSize > PATH_MAX || length > PATH_MAX - suffixSize || root[length - 1] == '/' || strchr(root, ':')) return;
     // Launchd configuration supplies a canonical host path. Reject aliases and root lists without doing filesystem work in dyld callbacks.
     for (const char *component = root + 1; *component;) {
         const char *end = strchr(component, '/');
@@ -29,8 +38,14 @@ static void configureNativeNotifydIdentity(void) {
         if (!size || (size == 1 && component[0] == '.') || (size == 2 && component[0] == '.' && component[1] == '.')) return;
         component += size + (end != NULL);
     }
-    memcpy(nativeNotifydPath, root, length);
-    memcpy(nativeNotifydPath + length, suffix, sizeof(suffix));
+    memcpy(path, root, length);
+    memcpy(path + length, suffix, suffixSize);
+}
+
+static void configureNativeNotifydIdentity(void) {
+    nativeNotifydPath[0] = '\0';
+    const char *enabled = getenv("LSB_SIMULATE_NOTIFICATION_SHM");
+    if (enabled && !strcmp(enabled, "1")) configureNativeImagePath(nativeNotifydPath, "/usr/sbin/notifyd");
 }
 
 typedef struct { _Atomic(uintptr_t) image, begin, end; } NativeIdentityRange;
@@ -48,7 +63,14 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
     const char *leaf = path ? strrchr(path, '/') : NULL;
     if (!image || image->magic != MH_MAGIC_64 || !leaf) return;
     bool notifyd = nativeNotifydPath[0] && !strcmp(path, nativeNotifydPath);
-    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd) return;
+    // BaseBoard's versioned PID, sandbox and task-handle APIs compare getpid() with genuine kernel audit identities.
+    bool baseBoard = !strcmp(path, baseBoardInstallPath) || (nativeBaseBoardPath[0] && !strcmp(path, nativeBaseBoardPath));
+    // RunningBoardServices queries the caller's native sandbox before connecting and exchanges kernel process identities.
+    bool runningBoard = !strcmp(path, runningBoardServicesInstallPath) ||
+        (nativeRunningBoardServicesPath[0] && !strcmp(path, nativeRunningBoardServicesPath));
+    // FrontBoard keys its workspace/process dictionaries with RBS native handles and permits repeated registration only for native self.
+    bool frontBoard = !strcmp(path, frontBoardInstallPath) || (nativeFrontBoardPath[0] && !strcmp(path, nativeFrontBoardPath));
+    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard) return;
     const struct mach_header_64 *header = (const struct mach_header_64 *)image;
     const unsigned char *command = (const unsigned char *)(header + 1), *end = command + header->sizeofcmds;
     forgetNativeIdentityImage(image);
@@ -117,6 +139,9 @@ static pid_t environmentPID(const char *key) {
 
 __attribute__((constructor)) static void initializeIdentity(void) {
     configureNativeNotifydIdentity();
+    configureNativeImagePath(nativeBaseBoardPath, baseBoardInstallPath);
+    configureNativeImagePath(nativeRunningBoardServicesPath, runningBoardServicesInstallPath);
+    configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);
@@ -142,8 +167,16 @@ __attribute__((noinline)) pid_t LSBGetPID(void) {
 }
 
 kern_return_t LSBTaskNameForPID(mach_port_name_t target, int pid, mach_port_name_t *task) {
+#ifdef LSB_GUEST_RUNTIME
+    uintptr_t caller = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
     if (target == mach_task_self() && pid > 0 && pid == LSBGuestPID()) pid = LSBNativePID();
-    return task_name_for_pid(target, pid, task);
+    kern_return_t result = task_name_for_pid(target, pid, task);
+#ifdef LSB_GUEST_RUNTIME
+    return LSBPeerProcessTaskName(caller, target, pid, task, result);
+#else
+    return result;
+#endif
 }
 
 pid_t LSBGuestParentPID(void) {
@@ -155,7 +188,7 @@ pid_t LSBGuestParentPID(void) {
 }
 
 #ifndef LSB_PROCESS_IDENTITY_TESTING
-// libxpc compares getpid() against kernel audit tokens. Opted-in notifyd publishes its PID to sibling clients' native PROC watches.
+// libxpc, BaseBoard, RunningBoardServices and FrontBoard use kernel identities. Opted-in notifyd publishes its native PID to sibling PROC watches.
 // Only direct calls from those images retain native identity; other guest code sees the stable logical PID.
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } interpositions[] = {
     {(const void *)&LSBGetPID, (const void *)&getpid},

@@ -121,6 +121,148 @@ static void testNotifydCallerIdentity(void) {
     configureNativeNotifydIdentity();
 }
 
+static void testBaseBoardCallerIdentity(void) {
+    struct { struct mach_header_64 header; struct segment_command_64 text, data; } image = {0};
+    image.header = (struct mach_header_64){.magic = MH_MAGIC_64, .ncmds = 2, .sizeofcmds = sizeof(image.text) + sizeof(image.data)};
+    image.text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(image.text), .vmaddr = 0x1000,
+                                           .vmsize = 0x100, .initprot = VM_PROT_READ | VM_PROT_EXECUTE};
+    image.data = image.text;
+    image.data.vmaddr = 0x2000;
+    image.data.initprot = VM_PROT_READ | VM_PROT_WRITE;
+    const struct mach_header *header = (const struct mach_header *)&image;
+    const char *physical = "/private/var/mobile/Group/RuntimeRoot/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
+    assert(!setenv("DYLD_ROOT_PATH", "/private/var/mobile/Group/RuntimeRoot", 1));
+    configureNativeImagePath(nativeBaseBoardPath, baseBoardInstallPath);
+    assert(!strcmp(nativeBaseBoardPath, physical));
+    const char *accepted[] = {baseBoardInstallPath, physical};
+    for (unsigned i = 0; i < sizeof(accepted) / sizeof(accepted[0]); ++i) {
+        rememberNativeIdentityImage(header, 0x4000, accepted[i]);
+        assert(!callerNeedsNativeIdentity(0x4fff) && callerNeedsNativeIdentity(0x5000) && callerNeedsNativeIdentity(0x50ff));
+        assert(!callerNeedsNativeIdentity(0x5100) && !callerNeedsNativeIdentity(0x6000));
+        assert(LSBGetPID() == 123 && LSBGuestPID() == 123); // Ordinary callers retain the logical process identity.
+        forgetNativeIdentityImage(header);
+        assert(!callerNeedsNativeIdentity(0x5000));
+    }
+    const char *unrelated[] = {"/Plugins/BaseBoard", "/System/Library/Frameworks/BaseBoard.framework/BaseBoard",
+        "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoardHelper",
+        "/System/Library/PrivateFrameworks/Other.framework/BaseBoard", "/System/Library/PrivateFrameworks/BaseBoard.framework/../BaseBoard",
+        "/private/var/mobile/Group/RuntimeRoot-other/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard",
+        "/OtherRoot/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard"};
+    for (unsigned i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); ++i) {
+        rememberNativeIdentityImage(header, 0, unrelated[i]);
+        assert(!callerNeedsNativeIdentity(0x1000));
+    }
+    const char *invalidRoots[] = {"/", "relative", "/RuntimeRoot/", "/RuntimeRoot:/OtherRoot", "/RuntimeRoot/../Other", "/Runtime//Root"};
+    for (unsigned i = 0; i < sizeof(invalidRoots) / sizeof(invalidRoots[0]); ++i) {
+        assert(!setenv("DYLD_ROOT_PATH", invalidRoots[i], 1));
+        configureNativeImagePath(nativeBaseBoardPath, baseBoardInstallPath);
+        assert(!nativeBaseBoardPath[0]);
+        rememberNativeIdentityImage(header, 0, physical);
+        assert(!callerNeedsNativeIdentity(0x1000));
+        rememberNativeIdentityImage(header, 0, baseBoardInstallPath); // A cached install path needs no physical-root alias.
+        assert(callerNeedsNativeIdentity(0x1000));
+        forgetNativeIdentityImage(header);
+    }
+    assert(!unsetenv("DYLD_ROOT_PATH"));
+    configureNativeImagePath(nativeBaseBoardPath, baseBoardInstallPath);
+    assert(!nativeBaseBoardPath[0]);
+}
+
+static void testRunningBoardServicesCallerIdentity(void) {
+    struct { struct mach_header_64 header; struct segment_command_64 text, data; } image = {0};
+    image.header = (struct mach_header_64){.magic = MH_MAGIC_64, .ncmds = 2, .sizeofcmds = sizeof(image.text) + sizeof(image.data)};
+    image.text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(image.text), .vmaddr = 0x1000,
+                                           .vmsize = 0x100, .initprot = VM_PROT_READ | VM_PROT_EXECUTE};
+    image.data = image.text;
+    image.data.vmaddr = 0x2000;
+    image.data.initprot = VM_PROT_READ | VM_PROT_WRITE;
+    const struct mach_header *header = (const struct mach_header *)&image;
+    const char *physical =
+        "/private/var/mobile/Group/RuntimeRoot/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
+    assert(!setenv("DYLD_ROOT_PATH", "/private/var/mobile/Group/RuntimeRoot", 1));
+    initializeIdentity();
+    assert(!strcmp(nativeRunningBoardServicesPath, physical));
+    const char *accepted[] = {runningBoardServicesInstallPath, physical};
+    for (unsigned i = 0; i < sizeof(accepted) / sizeof(accepted[0]); ++i) {
+        rememberNativeIdentityImage(header, 0x4000, accepted[i]);
+        assert(!callerNeedsNativeIdentity(0x4fff) && callerNeedsNativeIdentity(0x5000) && callerNeedsNativeIdentity(0x50ff));
+        assert(!callerNeedsNativeIdentity(0x5100) && !callerNeedsNativeIdentity(0x6000));
+        assert(LSBGetPID() == 123 && LSBGuestPID() == 123 && LSBNativePID() == getpid());
+        forgetNativeIdentityImage(header);
+        assert(!callerNeedsNativeIdentity(0x5000));
+    }
+    const char *unrelated[] = {"/Plugins/RunningBoardServices",
+        "/System/Library/Frameworks/RunningBoardServices.framework/RunningBoardServices",
+        "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServicesHelper",
+        "/System/Library/PrivateFrameworks/Other.framework/RunningBoardServices",
+        "/System/Library/PrivateFrameworks/RunningBoardServices.framework/../RunningBoardServices",
+        "/private/var/mobile/Group/RuntimeRoot-other/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices",
+        "/OtherRoot/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices"};
+    for (unsigned i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); ++i) {
+        rememberNativeIdentityImage(header, 0, unrelated[i]);
+        assert(!callerNeedsNativeIdentity(0x1000));
+    }
+    const char *invalidRoots[] = {"/", "relative", "/RuntimeRoot/", "/RuntimeRoot:/OtherRoot", "/RuntimeRoot/../Other", "/Runtime//Root"};
+    for (unsigned i = 0; i < sizeof(invalidRoots) / sizeof(invalidRoots[0]); ++i) {
+        assert(!setenv("DYLD_ROOT_PATH", invalidRoots[i], 1));
+        configureNativeImagePath(nativeRunningBoardServicesPath, runningBoardServicesInstallPath);
+        assert(!nativeRunningBoardServicesPath[0]);
+        rememberNativeIdentityImage(header, 0, physical);
+        assert(!callerNeedsNativeIdentity(0x1000));
+        rememberNativeIdentityImage(header, 0, runningBoardServicesInstallPath);
+        assert(callerNeedsNativeIdentity(0x1000));
+        forgetNativeIdentityImage(header);
+    }
+    assert(!unsetenv("DYLD_ROOT_PATH"));
+    configureNativeImagePath(nativeRunningBoardServicesPath, runningBoardServicesInstallPath);
+    assert(!nativeRunningBoardServicesPath[0]);
+}
+
+static void testFrontBoardCallerIdentity(void) {
+    struct { struct mach_header_64 header; struct segment_command_64 text, data; } image = {0};
+    image.header = (struct mach_header_64){.magic = MH_MAGIC_64, .ncmds = 2, .sizeofcmds = sizeof(image.text) + sizeof(image.data)};
+    image.text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(image.text), .vmaddr = 0x1000,
+                                           .vmsize = 0x100, .initprot = VM_PROT_READ | VM_PROT_EXECUTE};
+    image.data = image.text;
+    image.data.vmaddr = 0x2000;
+    image.data.initprot = VM_PROT_READ | VM_PROT_WRITE;
+    const struct mach_header *header = (const struct mach_header *)&image;
+    const char *physical = "/private/Group/RuntimeRoot/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard";
+    assert(!setenv("DYLD_ROOT_PATH", "/private/Group/RuntimeRoot", 1));
+    initializeIdentity();
+    assert(!strcmp(nativeFrontBoardPath, physical));
+    const char *accepted[] = {frontBoardInstallPath, physical};
+    for (unsigned i = 0; i < sizeof(accepted) / sizeof(*accepted); ++i) {
+        rememberNativeIdentityImage(header, 0x4000, accepted[i]);
+        assert(!callerNeedsNativeIdentity(0x4fff) && callerNeedsNativeIdentity(0x5000) && callerNeedsNativeIdentity(0x50ff));
+        assert(!callerNeedsNativeIdentity(0x5100) && !callerNeedsNativeIdentity(0x6000));
+        assert(LSBGetPID() == 123 && LSBGuestPID() == 123 && LSBNativePID() == getpid());
+        forgetNativeIdentityImage(header);
+        assert(!callerNeedsNativeIdentity(0x5000));
+    }
+    const char *unrelated[] = {"/Plugins/FrontBoard", "/System/Library/Frameworks/FrontBoard.framework/FrontBoard",
+        "/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoardHelper", "/System/Library/PrivateFrameworks/Other.framework/FrontBoard",
+        "/private/Group/RuntimeRoot-other/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard",
+        "/OtherRoot/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard"};
+    for (unsigned i = 0; i < sizeof(unrelated) / sizeof(*unrelated); ++i) {
+        rememberNativeIdentityImage(header, 0, unrelated[i]);
+        assert(!callerNeedsNativeIdentity(0x1000));
+    }
+    const char *invalidRoots[] = {"/", "relative", "/RuntimeRoot/", "/RuntimeRoot:/OtherRoot", "/RuntimeRoot/../Other", "/Runtime//Root"};
+    for (unsigned i = 0; i < sizeof(invalidRoots) / sizeof(*invalidRoots); ++i) {
+        assert(!setenv("DYLD_ROOT_PATH", invalidRoots[i], 1));
+        configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
+        assert(!nativeFrontBoardPath[0]);
+        rememberNativeIdentityImage(header, 0, physical);
+        assert(!callerNeedsNativeIdentity(0x1000));
+        rememberNativeIdentityImage(header, 0, frontBoardInstallPath);
+        assert(callerNeedsNativeIdentity(0x1000));
+        forgetNativeIdentityImage(header);
+    }
+    assert(!unsetenv("DYLD_ROOT_PATH"));
+    configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
+}
+
 int main(void) {
     unsetenv("LSB_GUEST_PID");
     unsetenv("LSB_GUEST_PPID");
@@ -132,6 +274,9 @@ int main(void) {
     assert(LSBGuestPID() == 123 && LSBGuestParentPID() == 456 && LSBNativePID() == getpid());
     testNativeCallerRanges();
     testNotifydCallerIdentity();
+    testBaseBoardCallerIdentity();
+    testRunningBoardServicesCallerIdentity();
+    testFrontBoardCallerIdentity();
     testTaskNameSelfTranslation();
     setenv("LSB_GUEST_PPID", "0", 1);
     initializeIdentity();

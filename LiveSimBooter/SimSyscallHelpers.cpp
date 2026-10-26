@@ -63,10 +63,17 @@ dyld_all_image_infos *getProcessInfo() { return sActiveProcessInfo; }
 
 // Keep ABI slots for disabled tracing and publish debugger state without depending on host libraries.
 void coreSymbolicationNotification(void *, uint64_t, const char *, const mach_header *) {}
+void debuggerLog(const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    lsb::vlog(format, arguments);
+    va_end(arguments);
+}
 void publishDebuggerSnapshot(uint64_t state = 0) {
-    if (lsb::publishCompactImageInfo(sActiveProcessInfo, state)) {
-        static constexpr char message[] = "[dyld_sim] Cannot publish debugger image snapshot.\n";
-        lsb::write(2, message, sizeof(message) - 1);
+    int error = lsb::publishCompactImageInfo(sActiveProcessInfo, state);
+    if (error) {
+        debuggerLog("[dyld_sim] Cannot publish debugger image snapshot: error=%d array images=%u capacity=%zu.\n",
+                    error, sActiveProcessInfo->infoArrayCount, lsb::kCompactImageInfoMaxImages);
         lsb::exitProcess(126);
     }
 }

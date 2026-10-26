@@ -1,6 +1,9 @@
 #include "ProcessEvents.h"
 #include "ChildWait.h"
 #include "ProcessIdentity.h"
+#ifdef LSB_GUEST_RUNTIME
+#include "PeerProcessCompatibility.h"
+#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -214,7 +217,7 @@ void LSBDispatchRelease(dispatch_object_t object) {
     free(destroy);
 }
 
-int LSBProcPIDInfo(int pid, int flavor, uint64_t arg, void *buffer, int bufferSize) {
+static int processPIDInfo(int pid, int flavor, uint64_t arg, void *buffer, int bufferSize) {
     // os_log/firehose queries its unique kernel identity with getpid(). A SETEXEC guest still sees the retired
     // logical PID, so translate self before consulting the child ledger. Leave the kernel's identity payload intact.
     if (pid > 0 && pid == LSBGuestPID()) return proc_pidinfo(LSBNativePID(), flavor, arg, buffer, bufferSize);
@@ -233,6 +236,19 @@ int LSBProcPIDInfo(int pid, int flavor, uint64_t arg, void *buffer, int bufferSi
         errno = savedErrno;
     }
     return result;
+}
+
+int LSBProcPIDInfo(int pid, int flavor, uint64_t arg, void *buffer, int bufferSize) {
+#ifdef LSB_GUEST_RUNTIME
+    uintptr_t caller = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+    int result = processPIDInfo(pid, flavor, arg, buffer, bufferSize);
+#ifdef LSB_GUEST_RUNTIME
+    if (!LSBPeerProcessCallerEnabled(caller)) return result;
+    return LSBPeerProcessPIDInfo(caller, pid, flavor, arg, buffer, bufferSize, result, errno);
+#else
+    return result;
+#endif
 }
 
 #ifndef LSB_PROCESS_EVENTS_TESTING

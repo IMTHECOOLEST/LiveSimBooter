@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 enum { ControlMagic = 0x4c53424d, ReadAttempts = 8, ReservedWords = (LSB_NATIVE_METAL_CONTROL_SIZE - 64) / 4 };
+enum { AuthorizationRevoked = 0, AuthorizationDedicated = 1, AuthorizationPublic = 2 };
 struct LSBNativeMetalControl {
     _Atomic(uint32_t) magic, version, size, reservedHeader;
     _Atomic(uint64_t) sequence;
@@ -55,7 +56,7 @@ int LSBNativeMetalControlValidate(const LSBNativeMetalControl *control, size_t s
     return 0;
 }
 
-int LSBNativeMetalControlPublish(LSBNativeMetalControl *control, const audit_token_t *audit) {
+static int publish(LSBNativeMetalControl *control, const audit_token_t *audit, uint32_t authorization) {
     int error = LSBNativeMetalControlValidate(control, LSB_NATIVE_METAL_CONTROL_SIZE);
     if (error) return error;
     if (audit && (!audit->val[5] || audit->val[5] > INT_MAX)) return EINVAL;
@@ -64,11 +65,19 @@ int LSBNativeMetalControlPublish(LSBNativeMetalControl *control, const audit_tok
     if ((sequence & 1) || !atomic_compare_exchange_strong(&control->sequence, &sequence, sequence + 1)) return EBUSY;
     // SC operations give all sequence and payload accesses a single order. Atomic payload words avoid C11 data races even on rejected reads.
     bool exhausted = sequence == UINT64_MAX - 1;
-    atomic_store(&control->authorized, audit && !exhausted ? 1u : 0u);
+    atomic_store(&control->authorized, !exhausted ? authorization : AuthorizationRevoked);
     for (unsigned i = 0; i < 8; ++i) atomic_store(&control->audit[i], audit && !exhausted ? audit->val[i] : 0);
     if (exhausted) return EOVERFLOW; // Leave sequence permanently odd/MAX; no wraparound can make an old observation appear current.
     atomic_store(&control->sequence, sequence + 2);
     return 0;
+}
+
+int LSBNativeMetalControlPublish(LSBNativeMetalControl *control, const audit_token_t *audit) {
+    return publish(control, audit, audit ? AuthorizationDedicated : AuthorizationRevoked);
+}
+
+int LSBNativeMetalControlPublishPublic(LSBNativeMetalControl *control) {
+    return publish(control, NULL, AuthorizationPublic);
 }
 
 int LSBNativeMetalControlRead(const LSBNativeMetalControl *control, LSBNativeMetalAuthorization *authorization) {
@@ -84,10 +93,12 @@ int LSBNativeMetalControlRead(const LSBNativeMetalControl *control, LSBNativeMet
         audit_token_t audit = {{0}};
         for (unsigned i = 0; i < 8; ++i) audit.val[i] = atomic_load(&control->audit[i]);
         if (atomic_load(&control->sequence) != sequence) continue;
-        if (authorized > 1 || (authorized && (!audit.val[5] || audit.val[5] > INT_MAX))) return EPROTO;
-        if (!authorized) for (unsigned i = 0; i < 8; ++i) if (audit.val[i]) return EPROTO;
+        if (authorized > AuthorizationPublic ||
+            (authorized == AuthorizationDedicated && (!audit.val[5] || audit.val[5] > INT_MAX))) return EPROTO;
+        if (authorized != AuthorizationDedicated) for (unsigned i = 0; i < 8; ++i) if (audit.val[i]) return EPROTO;
         authorization->generation = sequence / 2;
         authorization->authorized = authorized != 0;
+        authorization->publicAccess = authorized == AuthorizationPublic;
         authorization->audit = audit;
         return 0;
     }

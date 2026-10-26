@@ -1,11 +1,13 @@
 #include "../ProcessSupport/SpawnTransport.h"
 #include "../ProcessSupport/PrivateXPC.h"
 #include "../ProcessSupport/ChildStatus.h"
+#include "../ProcessSupport/GuestEntitlements.h"
 #if defined(LSB_XPC_WIRE_TESTING)
 #include "../Guest/XPCWireCompatibility.h"
 #endif
 
 #include <assert.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -22,9 +24,9 @@
 extern char **environ;
 extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_port_t *, uint32_t);
 static unsigned openDescriptorCount(void);
-enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedRoleCount = 11, MalformedRoleRequestCount = 6,
+enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedRoleCount = 11, MalformedRoleRequestCount = 8,
        MalformedBootstrapCount = 14 + MalformedPortsCount + MalformedIdentityCount + MalformedRoleCount,
-       MalformedKillCount = 14, MalformedAuditCount = 16, PortRoundTripCount = 7 };
+       MalformedKillCount = 14, MalformedAuditCount = 16, MalformedEntitlementCount = 25, PortRoundTripCount = 7 };
 static volatile sig_atomic_t childSignals;
 static volatile sig_atomic_t signalAcknowledgementFD = -1;
 
@@ -164,7 +166,7 @@ static void testMalformedPorts(const LSBSpawnPlan *plan, int fd, mach_port_t sen
 
 static void testRoleRequestInjection(const LSBSpawnPlan *plan, int fd, unsigned variant) {
     static const uint32_t kinds[] = { LSB_REQUEST_SPAWN, LSB_REQUEST_EXEC, LSB_REQUEST_CHECKIN,
-                                      LSB_REQUEST_READY, LSB_REQUEST_KILL, LSB_REQUEST_RESOLVE_AUDIT_PID };
+        LSB_REQUEST_READY, LSB_REQUEST_KILL, LSB_REQUEST_RESOLVE_AUDIT_PID, LSB_REQUEST_COPY_ENTITLEMENTS, LSB_REQUEST_COPY_PROCESS_IDENTITY };
     assert(variant < sizeof(kinds) / sizeof(kinds[0]));
     mach_port_t port;
     assert(!LSBTestCopyBrokerPort(&port));
@@ -187,10 +189,12 @@ static void testRoleRequestInjection(const LSBSpawnPlan *plan, int fd, unsigned 
         xpc_dictionary_set_int64(request, "target-pid", 4242);
         xpc_dictionary_set_int64(request, "signal", 0);
     }
-    if (kinds[variant] == LSB_REQUEST_RESOLVE_AUDIT_PID) {
+    if (kinds[variant] == LSB_REQUEST_RESOLVE_AUDIT_PID || kinds[variant] == LSB_REQUEST_COPY_ENTITLEMENTS) {
         audit_token_t audit = {{0, 0, 0, 0, 0, 4242, 0, 1}};
         xpc_dictionary_set_data(request, "target-audit", &audit, sizeof(audit));
     }
+    if (kinds[variant] == LSB_REQUEST_COPY_ENTITLEMENTS) xpc_dictionary_set_uint64(request, "operation", 16);
+    if (kinds[variant] == LSB_REQUEST_COPY_PROCESS_IDENTITY) xpc_dictionary_set_int64(request, "target-pid", 4242);
     if (variant % 2) xpc_dictionary_set_uint64(request, "bootstrap-version", LSB_BOOTSTRAP_VERSION);
     else xpc_dictionary_set_uint64(request, "execution-role", LSB_EXECUTION_NATIVE_METAL_PROBE);
     xpc_object_t reply = NULL;
@@ -445,15 +449,262 @@ static void auditResolutionHost(mach_port_t port, pid_t child) {
     }
 }
 
-static void testMalformedAudit(unsigned variant) {
+enum {
+    EntitlementSmall, EntitlementLarge, EntitlementMaximum, EntitlementMissing, EntitlementDenied, EntitlementUnknown,
+    EntitlementBadEncoding, EntitlementErrorPayload, EntitlementMissingData, EntitlementWrongType, EntitlementShortHeader,
+    EntitlementTooLarge, EntitlementWrongMagic, EntitlementWrongFormat, EntitlementTruncated, EntitlementExtraBytes, EntitlementNoPayload,
+    EntitlementWrongVersion, EntitlementWrongError, EntitlementNegativeError, EntitlementWrongPID, EntitlementWrongID,
+    EntitlementFD, EntitlementPort, EntitlementUnknownFD, EntitlementUnknownPort, EntitlementDataFD, EntitlementDataPort,
+    EntitlementReplyCount
+};
+
+static unsigned char *entitlementBlob(size_t size, unsigned operation) {
+    unsigned char *bytes = malloc(size);
+    assert(bytes && size >= 8);
+    memset(bytes, 0x5a, size);
+    uint32_t header[] = {htonl(operation == 7 ? LSB_GUEST_ENTITLEMENTS_XML_MAGIC : LSB_GUEST_ENTITLEMENTS_DER_MAGIC), htonl((uint32_t)size)};
+    memcpy(bytes, header, sizeof(header));
+    return bytes; // Synthetic opaque payload; the host reader separately validates DER syntax.
+}
+
+static void entitlementClient(unsigned operation) {
+    size_t maximum = operation == 7 ? LSB_GUEST_ENTITLEMENTS_MAX_XML_BLOB_SIZE : LSB_GUEST_ENTITLEMENTS_MAX_BLOB_SIZE;
+    audit_token_t target = ownerAudit(), original = target;
+    unsigned char *bytes = (unsigned char *)1;
+    size_t size = 1;
+    assert(LSBTransportCopyEntitlements(NULL, operation, &bytes, &size) == EINVAL && !bytes && !size);
+    assert(LSBTransportCopyEntitlements(&target, operation, NULL, &size) == EINVAL && !size);
+    assert(LSBTransportCopyEntitlements(&target, operation, &bytes, NULL) == EINVAL && !bytes);
+    assert(LSBTransportCopyEntitlements(&target, 0, &bytes, &size) == EINVAL && !bytes && !size);
+    assert(LSBTransportCopyEntitlements(&target, 5, &bytes, &size) == EINVAL && !bytes && !size);
+    assert(LSBTransportCopyEntitlements(&target, UINT_MAX, &bytes, &size) == EINVAL && !bytes && !size);
+    target.val[5] = 0;
+    assert(LSBTransportCopyEntitlements(&target, operation, &bytes, &size) == EINVAL && !bytes && !size);
+    target.val[5] = UINT32_MAX;
+    assert(LSBTransportCopyEntitlements(&target, operation, &bytes, &size) == EINVAL && !bytes && !size);
+    target = original;
+    unsigned char *saved = NULL;
+    mach_port_t broker;
+    assert(!LSBTransportCopyBrokerPort(&broker));
+    for (unsigned variant = 0; variant < EntitlementReplyCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        mach_port_urefs_t portReferences, remainingReferences;
+        assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &portReferences));
+        int expected = variant <= EntitlementMaximum ? 0 : variant == EntitlementMissing ? ENOENT :
+            variant == EntitlementDenied ? EACCES : variant == EntitlementUnknown ? ESRCH : variant == EntitlementBadEncoding ? EINVAL : EPROTO;
+        bytes = (unsigned char *)1;
+        size = 1;
+        int result = LSBTransportCopyEntitlements(&target, operation, &bytes, &size);
+        if (result != expected) fprintf(stderr, "Entitlement reply variant %u: got %d, expected %d\n", variant, result, expected);
+        assert(result == expected);
+        assert(!memcmp(&target, &original, sizeof(target)));
+        if (!expected) {
+            size_t length = variant == EntitlementSmall ? 16 : variant == EntitlementLarge ? 33 * 1024 : maximum;
+            assert(bytes && size == length && LSBGuestEntitlementsHasValidBlobHeaderForOperation(bytes, size, operation));
+            for (size_t index = 8; index < size; ++index) assert(bytes[index] == 0x5a);
+            if (!variant) { saved = bytes; saved[8] = 0xa5; }
+            else free(bytes);
+        } else assert(!bytes && !size);
+        assert(saved && saved[8] == 0xa5); // A returned copy survives subsequent replies and their XPC object destruction.
+        assert(openDescriptorCount() == before);
+        assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &remainingReferences) && remainingReferences == portReferences);
+        assert(!LSBRequireSingleThread());
+    }
+    assert(!mach_port_deallocate(mach_task_self(), broker));
+    free(saved);
+}
+
+static void entitlementHost(mach_port_t port, pid_t child, unsigned operation) {
+    size_t maximum = operation == 7 ? LSB_GUEST_ENTITLEMENTS_MAX_XML_BLOB_SIZE : LSB_GUEST_ENTITLEMENTS_MAX_BLOB_SIZE;
+    audit_token_t target = ownerAudit();
+    for (unsigned variant = 0; variant < EntitlementReplyCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        LSBReceivedMessage message;
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_COPY_ENTITLEMENTS);
+        assert(message.entitlementOperation == operation);
+        assert(!message.requestID && !message.error && message.audit.val[5] == (unsigned)child);
+        assert(!memcmp(&message.targetAudit, &target, sizeof(target)) && memcmp(&message.audit, &target, sizeof(target)));
+        for (unsigned index = 0; index < LSB_MAX_FDS; ++index) assert(message.fds[index] == -1);
+        assert(!message.nativeServicePort && !message.ports.registeredPresent && !message.ports.bootstrapPresent);
+        size_t size = variant == EntitlementLarge ? 33 * 1024 : variant == EntitlementMaximum ? maximum :
+            variant == EntitlementTooLarge ? maximum + 1 : 16;
+        unsigned char *bytes = entitlementBlob(size, operation);
+        if (variant <= EntitlementMaximum) {
+            void *object = message.object;
+            assert(LSBTransportReplyEntitlements(&message, -1, bytes, size) == EINVAL && message.object == object);
+            assert(!LSBTransportReplyEntitlements(&message, 0, bytes, size) && !message.object);
+            memset(bytes, 0xcc, size); // Reply storage must not borrow the host's mutable source after the call.
+        } else if (variant <= EntitlementBadEncoding) {
+            int error = variant == EntitlementMissing ? ENOENT : variant == EntitlementDenied ? EACCES : ESRCH;
+            if (variant == EntitlementBadEncoding) {
+                bytes[0] = 0;
+                assert(LSBTransportReplyEntitlements(&message, 0, bytes, size) == EINVAL && !message.object);
+            } else assert(!LSBTransportReplyEntitlements(&message, error, NULL, 0) && !message.object);
+        } else {
+            xpc_object_t reply = xpc_dictionary_create_reply(message.object);
+            assert(reply);
+            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "request-id", 0);
+            xpc_dictionary_set_int64(reply, "error", 0);
+            xpc_dictionary_set_int64(reply, "pid", 0);
+            if (variant == EntitlementWrongMagic) bytes[0] = 0;
+            if (variant == EntitlementWrongFormat) {
+                uint32_t magic = htonl(operation == 7 ? LSB_GUEST_ENTITLEMENTS_DER_MAGIC : LSB_GUEST_ENTITLEMENTS_XML_MAGIC);
+                memcpy(bytes, &magic, 4);
+            }
+            if (variant == EntitlementTruncated) --size;
+            if (variant == EntitlementExtraBytes) { uint32_t length = htonl((uint32_t)size - 1); memcpy(bytes + 4, &length, 4); }
+            if (variant == EntitlementNoPayload) { size = 8; uint32_t length = htonl(8); memcpy(bytes + 4, &length, 4); }
+            xpc_dictionary_set_data(reply, "entitlements", bytes, variant == EntitlementShortHeader ? 7 : size);
+            switch (variant) {
+                case EntitlementErrorPayload: xpc_dictionary_set_int64(reply, "error", ESRCH); break;
+                case EntitlementMissingData: xpc_dictionary_set_value(reply, "entitlements", NULL); break;
+                case EntitlementWrongType: xpc_dictionary_set_string(reply, "entitlements", "not data"); break;
+                case EntitlementWrongVersion: xpc_dictionary_set_uint64(reply, "version", 2); break;
+                case EntitlementWrongError: xpc_dictionary_set_uint64(reply, "error", EACCES); break;
+                case EntitlementNegativeError: xpc_dictionary_set_int64(reply, "error", -1); break;
+                case EntitlementWrongPID: xpc_dictionary_set_int64(reply, "pid", 4242); break;
+                case EntitlementWrongID: xpc_dictionary_set_uint64(reply, "request-id", 1); break;
+                case EntitlementFD: case EntitlementUnknownFD: case EntitlementDataFD: {
+                    const char *key = variant == EntitlementFD ? "fds" : variant == EntitlementUnknownFD ? "unexpected-fd" : "entitlements";
+                    xpc_object_t descriptor = xpc_fd_create(STDERR_FILENO);
+                    assert(descriptor);
+                    xpc_dictionary_set_value(reply, key, descriptor);
+                    xpc_release(descriptor);
+                    break;
+                }
+                case EntitlementPort: case EntitlementUnknownPort: case EntitlementDataPort:
+                    xpc_dictionary_set_mach_send(reply, variant == EntitlementPort ? "bootstrap-port" :
+                        variant == EntitlementUnknownPort ? "unexpected-right" : "entitlements", port);
+                    break;
+                default: break;
+            }
+            assert(!xpc_pipe_routine_reply(reply));
+            xpc_release(reply);
+        }
+        free(bytes);
+        LSBTransportDisposeMessage(&message);
+        assert(openDescriptorCount() == before);
+    }
+}
+
+enum {
+    CodeHashFirst, CodeHashSecond, CodeHashMissing, CodeHashDenied, CodeHashUnknown, CodeHashInvalidReplySize,
+    CodeHashShort, CodeHashLong, CodeHashMissingData, CodeHashWrongType, CodeHashErrorPayload,
+    CodeHashFD, CodeHashPort, CodeHashUnknownFD, CodeHashUnknownPort, CodeHashDataFD, CodeHashDataPort,
+    CodeHashWrongPID, CodeHashWrongID, CodeHashReplyCount
+};
+
+static void codeHashClient(void) {
+    audit_token_t target = ownerAudit();
+    unsigned char storage[LSB_GUEST_CDHASH_BYTES + 2], saved[LSB_GUEST_CDHASH_BYTES];
+    unsigned char *hash = storage + 1;
+    memset(storage, 0xa5, sizeof(storage));
+    assert(LSBTransportCopyCodeDirectoryHash(NULL, hash) == EINVAL);
+    for (unsigned i = 0; i < LSB_GUEST_CDHASH_BYTES; ++i) assert(!hash[i]);
+    assert(LSBTransportCopyCodeDirectoryHash(&target, NULL) == EINVAL);
+    target.val[5] = 0;
+    assert(LSBTransportCopyCodeDirectoryHash(&target, hash) == EINVAL);
+    target.val[5] = UINT32_MAX;
+    assert(LSBTransportCopyCodeDirectoryHash(&target, hash) == EINVAL);
+    mach_port_t broker;
+    assert(!LSBTransportCopyBrokerPort(&broker));
+    for (unsigned variant = 0; variant < CodeHashReplyCount; ++variant) {
+        target = ownerAudit();
+        if (variant == CodeHashSecond) { target.val[5] = 4243; target.val[7] = 99; }
+        audit_token_t original = target;
+        memset(hash, 0xa5, LSB_GUEST_CDHASH_BYTES);
+        unsigned before = openDescriptorCount();
+        mach_port_urefs_t references, remaining;
+        assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &references));
+        int expected = variant <= CodeHashSecond ? 0 : variant == CodeHashMissing ? ENOENT :
+            variant == CodeHashDenied ? EACCES : variant == CodeHashUnknown ? ESRCH : variant == CodeHashInvalidReplySize ? EINVAL : EPROTO;
+        int error = LSBTransportCopyCodeDirectoryHash(&target, hash);
+        if (error != expected) fprintf(stderr, "Code hash reply variant %u: got %d, expected %d\n", variant, error, expected);
+        assert(error == expected && !memcmp(&target, &original, sizeof(target)));
+        assert(storage[0] == 0xa5 && storage[sizeof(storage) - 1] == 0xa5);
+        for (unsigned i = 0; i < LSB_GUEST_CDHASH_BYTES; ++i)
+            assert(hash[i] == (error ? 0 : (variant == CodeHashFirst ? 0x30 : 0x80) + i));
+        if (!variant) memcpy(saved, hash, sizeof(saved));
+        for (unsigned i = 0; i < sizeof(saved); ++i) assert(saved[i] == 0x30 + i);
+        assert(openDescriptorCount() == before);
+        assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &remaining) && remaining == references);
+        assert(!LSBRequireSingleThread());
+    }
+    assert(!mach_port_deallocate(mach_task_self(), broker));
+}
+
+static void codeHashHost(mach_port_t port, pid_t child) {
+    for (unsigned variant = 0; variant < CodeHashReplyCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        LSBReceivedMessage message;
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_COPY_ENTITLEMENTS);
+        assert(message.entitlementOperation == 5 && !message.requestID && !message.error);
+        audit_token_t target = ownerAudit();
+        if (variant == CodeHashSecond) { target.val[5] = 4243; target.val[7] = 99; }
+        assert(message.audit.val[5] == (unsigned)child && !memcmp(&message.targetAudit, &target, sizeof(target)));
+        assert(memcmp(&message.audit, &target, sizeof(target)));
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        assert(!message.nativeServicePort && !message.ports.registeredPresent && !message.ports.bootstrapPresent);
+        unsigned char bytes[LSB_GUEST_CDHASH_BYTES + 1];
+        for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = (variant == CodeHashFirst ? 0x30 : 0x80) + i;
+        if (variant <= CodeHashSecond) {
+            void *object = message.object;
+            assert(LSBTransportReplyEntitlements(&message, -1, bytes, LSB_GUEST_CDHASH_BYTES) == EINVAL && message.object == object);
+            assert(!LSBTransportReplyEntitlements(&message, 0, bytes, LSB_GUEST_CDHASH_BYTES) && !message.object);
+            memset(bytes, 0xcc, sizeof(bytes)); // The sent reply must own an independent byte copy.
+        } else if (variant <= CodeHashInvalidReplySize) {
+            if (variant == CodeHashInvalidReplySize)
+                assert(LSBTransportReplyEntitlements(&message, 0, bytes, LSB_GUEST_CDHASH_BYTES - 1) == EINVAL && !message.object);
+            else {
+                int error = variant == CodeHashMissing ? ENOENT : variant == CodeHashDenied ? EACCES : ESRCH;
+                assert(!LSBTransportReplyEntitlements(&message, error, NULL, 0) && !message.object);
+            }
+        } else {
+            xpc_object_t reply = xpc_dictionary_create_reply(message.object);
+            assert(reply);
+            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "request-id", variant == CodeHashWrongID ? 77 : 0);
+            xpc_dictionary_set_int64(reply, "error", variant == CodeHashErrorPayload ? EACCES : 0);
+            xpc_dictionary_set_int64(reply, "pid", variant == CodeHashWrongPID ? 4242 : 0);
+            size_t size = variant == CodeHashShort ? LSB_GUEST_CDHASH_BYTES - 1 :
+                variant == CodeHashLong ? LSB_GUEST_CDHASH_BYTES + 1 : LSB_GUEST_CDHASH_BYTES;
+            xpc_dictionary_set_data(reply, "entitlements", bytes, size);
+            switch (variant) {
+                case CodeHashMissingData: xpc_dictionary_set_value(reply, "entitlements", NULL); break;
+                case CodeHashWrongType: xpc_dictionary_set_string(reply, "entitlements", "not data"); break;
+                case CodeHashFD: case CodeHashUnknownFD: case CodeHashDataFD: {
+                    const char *key = variant == CodeHashFD ? "fds" : variant == CodeHashUnknownFD ? "unexpected-fd" : "entitlements";
+                    xpc_object_t descriptor = xpc_fd_create(STDERR_FILENO);
+                    assert(descriptor);
+                    xpc_dictionary_set_value(reply, key, descriptor);
+                    xpc_release(descriptor);
+                    break;
+                }
+                case CodeHashPort: case CodeHashUnknownPort: case CodeHashDataPort:
+                    xpc_dictionary_set_mach_send(reply, variant == CodeHashPort ? "bootstrap-port" :
+                        variant == CodeHashUnknownPort ? "unexpected-right" : "entitlements", port);
+                    break;
+                default: break;
+            }
+            assert(!xpc_pipe_routine_reply(reply));
+            xpc_release(reply);
+        }
+        LSBTransportDisposeMessage(&message);
+        assert(openDescriptorCount() == before);
+    }
+}
+
+static void testMalformedAudit(unsigned variant, uint32_t kind) {
     mach_port_t port;
     assert(!LSBTestCopyBrokerPort(&port));
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
     assert(pipe && request);
     xpc_dictionary_set_uint64(request, "version", 1);
-    xpc_dictionary_set_uint64(request, "kind", variant == 15 ? LSB_REQUEST_CHECKIN : LSB_REQUEST_RESOLVE_AUDIT_PID);
+    xpc_dictionary_set_uint64(request, "kind", variant == 15 ? LSB_REQUEST_CHECKIN : kind);
     xpc_dictionary_set_uint64(request, "request-id", variant == 6 ? 77 : 0);
     xpc_dictionary_set_int64(request, "error", variant == 7 ? EACCES : 0);
+    if (kind == LSB_REQUEST_COPY_ENTITLEMENTS) xpc_dictionary_set_uint64(request, "operation", 16);
     audit_token_t target = ownerAudit();
     if (variant == 4) target.val[5] = 0;
     if (variant == 5) target.val[5] = (uint32_t)INT_MAX + 1;
@@ -479,7 +730,21 @@ static void testMalformedAudit(unsigned variant) {
     if (variant == 11) xpc_dictionary_set_mach_send(request, "bootstrap-port", port);
     if (variant == 12) xpc_dictionary_set_int64(request, "target-pid", 4242);
     if (variant == 13) xpc_dictionary_set_int64(request, "signal", 0);
-    if (variant == 14) xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_RESOLVE_AUDIT_PID + 1);
+    if (variant == 14) xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_COPY_PROCESS_IDENTITY + 1);
+    if (variant == 16) xpc_dictionary_set_mach_send(request, "native-service-port", port);
+    if (variant == 17) xpc_dictionary_set_mach_send(request, "unexpected-right", port);
+    if (variant == 18) {
+        xpc_object_t descriptor = xpc_fd_create(STDERR_FILENO);
+        assert(descriptor);
+        xpc_dictionary_set_value(request, "unexpected-fd", descriptor);
+        xpc_release(descriptor);
+    }
+    if (variant == 19) xpc_dictionary_set_data(request, "entitlements", "unexpected", 10);
+    if (variant == 20) xpc_dictionary_set_value(request, "operation", NULL);
+    if (variant == 21) xpc_dictionary_set_int64(request, "operation", 16);
+    if (variant == 22) xpc_dictionary_set_uint64(request, "operation", 0);
+    if (variant == 23) xpc_dictionary_set_uint64(request, "operation", 8);
+    if (variant == 24) xpc_dictionary_set_uint64(request, "operation", UINT64_MAX);
     xpc_object_t reply = NULL;
     assert(!xpc_pipe_routine(pipe, request, &reply));
     assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO);
@@ -611,6 +876,9 @@ static int client(void) {
     assert(!sigaction(SIGCHLD, &previousAction, NULL));
     signalAcknowledgementFD = -1;
     auditResolutionClient();
+    entitlementClient(16);
+    entitlementClient(7);
+    codeHashClient();
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportCheckIn(&reply, received) == EPROTO);
@@ -633,7 +901,8 @@ static int client(void) {
     assert(LSBTransportSpawn(&plan, fds, &pid) == EPROTO && pid == 0);
     for (unsigned variant = 0; variant < 5; ++variant) testMalformedRequest(&plan, variant);
     for (unsigned variant = 0; variant < MalformedKillCount; ++variant) testMalformedKill(variant);
-    for (unsigned variant = 0; variant < MalformedAuditCount; ++variant) testMalformedAudit(variant);
+    for (unsigned variant = 0; variant < MalformedAuditCount; ++variant) testMalformedAudit(variant, LSB_REQUEST_RESOLVE_AUDIT_PID);
+    for (unsigned variant = 0; variant < MalformedEntitlementCount; ++variant) testMalformedAudit(variant, LSB_REQUEST_COPY_ENTITLEMENTS);
     assert(LSBTransportReady(77, ENOEXEC) == ENOEXEC);
     assert(!LSBRequireSingleThread());
     close(fd);
@@ -947,6 +1216,9 @@ static int host(const char *executable) {
         LSBTransportDisposeMessage(&message);
     }
     auditResolutionHost(port, child);
+    entitlementHost(port, child, 16);
+    entitlementHost(port, child, 7);
+    codeHashHost(port, child);
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
         unsigned before = openDescriptorCount();
@@ -986,6 +1258,13 @@ static int host(const char *executable) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
         for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        assert(openDescriptorCount() == before);
+    }
+    for (unsigned variant = 0; variant < MalformedEntitlementCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && message.object == NULL);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        assert(!message.nativeServicePort && !message.ports.registeredPresent && !message.ports.bootstrapPresent);
         assert(openDescriptorCount() == before);
     }
     assert(!LSBTransportReceive(port, &message) && message.error == ENOEXEC);

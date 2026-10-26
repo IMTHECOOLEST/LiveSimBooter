@@ -276,7 +276,7 @@ static void testSnapshots(bool modern, const char *exportPath) {
     checkSnapshot(info, 0x30, true, images[2].imageFilePath);
     images[2].imageFilePath = "/RuntimeRoot/bin/df";
     check(lsb::publishCompactImageInfo(nullptr) == EINVAL, "null metadata rejected");
-    info.infoArrayCount = 1025; expectFailure(info, E2BIG); info.infoArrayCount = 3;
+    info.infoArrayCount = kMaxImages + 1; expectFailure(info, E2BIG); info.infoArrayCount = 3;
     info.infoArray = nullptr; expectFailure(info, EINVAL); info.infoArray = images;
     cachedFixture.header.magic = MH_MAGIC_64; cachedFixture.header.ncmds = 3; cachedFixture.header.flags = MH_DYLIB_IN_CACHE;
     cachedFixture.header.sizeofcmds = sizeof(uuid_command) + 2 * sizeof(segment_command_64);
@@ -326,11 +326,100 @@ static void testSnapshots(bool modern, const char *exportPath) {
         std::fclose(output);
     }
 }
+
+static void testImageCapacity(bool modern) {
+    sEncoding = ArchiveEncoding::unconfigured; sTimestamp = sInitializationState = 0; sActiveBuffer = 0;
+    auto native = nativeArchive(modern);
+    check(lsb::configureCompactImageInfo(native.data(), native.size()) == 0, "configure large-image snapshot encoding");
+    constexpr size_t stride = 4096;
+    static_assert(sizeof(mach_header_64) + sizeof(uuid_command) + kMaxSegments * sizeof(segment_command_64) <= stride);
+    void *allocation = nullptr;
+    check(posix_memalign(&allocation, stride, stride * (kMaxImages + 1)) == 0, "allocate distinct packed-cache image headers");
+    std::memset(allocation, 0, stride * (kMaxImages + 1));
+    std::vector<dyld_image_info> images(kMaxImages + 1);
+    std::string path(PATH_MAX - 3, 'a');
+    path += "\xc3\xa9"; // One non-ASCII scalar makes the long ASCII prefix use the larger UTF-16 plist representation too.
+    for (size_t index = 0; index < images.size(); ++index) {
+        auto header = reinterpret_cast<mach_header_64 *>(static_cast<uint8_t *>(allocation) + index * stride);
+        header->magic = MH_MAGIC_64; header->flags = MH_DYLIB_IN_CACHE;
+        header->ncmds = 2; header->sizeofcmds = sizeof(uuid_command) + sizeof(segment_command_64);
+        auto uuid = reinterpret_cast<uuid_command *>(header + 1);
+        uuid->cmd = LC_UUID; uuid->cmdsize = sizeof(*uuid);
+        uuid->uuid[0] = index & 255; uuid->uuid[1] = (index >> 8) & 255;
+        auto segments = reinterpret_cast<segment_command_64 *>(uuid + 1);
+        for (size_t segmentIndex = 0; segmentIndex < kMaxSegments; ++segmentIndex) {
+            auto &segment = segments[segmentIndex];
+            segment.cmd = LC_SEGMENT_64; segment.cmdsize = sizeof(segment);
+            std::memset(segment.segname, 's', sizeof(segment.segname));
+            segment.segname[14] = '\xc3'; segment.segname[15] = '\xa9';
+            segment.vmaddr = 0x180000000 + segmentIndex * 0x10000;
+            segment.vmsize = segment.filesize = stride; segment.fileoff = segmentIndex * stride; segment.initprot = 5;
+        }
+        images[index] = {reinterpret_cast<const mach_header *>(header), "/usr/lib/capacity-test.dylib", 0};
+    }
+    alignas(16) dyld_all_image_infos info = {};
+    info.infoArray = images.data(); info.platform = PLATFORM_IOSSIMULATOR; info.processDetachedFromSharedRegion = true;
+    for (size_t count : {size_t(1025), size_t(1353), kMaxImages}) {
+        size_t segmentsPerImage = count == kMaxImages ? kMaxSegments : 1;
+        if (count == kMaxImages) {
+            for (auto &image : images) {
+                auto header = const_cast<mach_header *>(image.imageLoadAddress);
+                header->ncmds = 1 + kMaxSegments;
+                header->sizeofcmds = sizeof(uuid_command) + kMaxSegments * sizeof(segment_command_64);
+                image.imageFilePath = path.c_str();
+            }
+        }
+        info.infoArrayCount = count - 1; info.initialImageCount = count;
+        info.dyldImageLoadAddress = images[count - 1].imageLoadAddress; info.dyldPath = images[count - 1].imageFilePath;
+        check(lsb::publishCompactImageInfo(&info, 0x40) == 0, "publish more than 1024 images through exact capacity including separate dyld");
+        auto bytes = currentBytes(info);
+        size_t headerSize = modern ? kModernHeaderSize : kLegacyHeaderSize;
+        size_t plistSize = little(bytes.data() + (modern ? 34 : 42), 4);
+        check(bytes.size() < kBufferSize && bytes.size() < kMaxNativeArchiveSize, "maximum supported image metadata fits bounded archive storage");
+        if (modern) check(referenceCRC(bytes.data(), bytes.size() - 4) == little(bytes.data() + bytes.size() - 4, 4), "large archive CRC32C validates");
+        else check(referenceChecksum(bytes.data() + headerSize, plistSize) == little(bytes.data() + 34, 4), "large archive POSIX checksum validates");
+        CFDataRef encoded = CFDataCreate(kCFAllocatorDefault, bytes.data() + headerSize, plistSize);
+        CFErrorRef error = nullptr;
+        CFPropertyListRef decoded = CFPropertyListCreateWithData(kCFAllocatorDefault, encoded, kCFPropertyListImmutable, nullptr, &error);
+        check(decoded && !error && CFGetTypeID(decoded) == CFDictionaryGetTypeID(), "CoreFoundation independently decodes large-image archive");
+        auto decodedImages = static_cast<CFArrayRef>(value(static_cast<CFDictionaryRef>(decoded), CFSTR("imgs")));
+        check(CFArrayGetCount(decodedImages) == static_cast<CFIndex>(count), "all images including dyld survive large snapshot");
+        for (size_t index = 0; index < count; ++index) {
+            auto image = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(decodedImages, index));
+            check(number(image, CFSTR("addr")) == reinterpret_cast<uintptr_t>(images[index].imageLoadAddress), "large snapshot preserves each distinct image");
+            auto segments = static_cast<CFArrayRef>(value(image, CFSTR("segs")));
+            check(CFArrayGetCount(segments) == static_cast<CFIndex>(segmentsPerImage), "maximum segment count survives serialization");
+            char actualPath[PATH_MAX];
+            check(CFStringGetCString(static_cast<CFStringRef>(value(image, CFSTR("file"))), actualPath, sizeof(actualPath), kCFStringEncodingUTF8) &&
+                  std::strcmp(actualPath, images[index].imageFilePath) == 0, "maximum UTF-16 path survives the independent decoder");
+        }
+        CFRelease(decoded); CFRelease(encoded);
+        if (count == kMaxImages) std::printf("Capacity archive (%s): %zu images, %zu segments each, %zu bytes.\n",
+                                            modern ? "CRC32C" : "POSIX", count, segmentsPerImage, bytes.size());
+    }
+    info.infoArrayCount = kMaxImages;
+    check(lsb::publishCompactImageInfo(&info) == 0, "dyld already in an exact-capacity array is not counted twice");
+    info.dyldImageLoadAddress = images[kMaxImages].imageLoadAddress;
+    expectFailure(info, E2BIG, 0x50);
+    check(sInitializationState == 0x40, "overflow does not advance initialization state");
+    info.dyldImageLoadAddress = images[kMaxImages - 1].imageLoadAddress;
+    info.infoArrayCount = kMaxImages + 1;
+    expectFailure(info, E2BIG);
+    info.infoArrayCount = kMaxImages;
+    check(lsb::publishCompactImageInfo(&info) == 0, "valid publication recovers after image-capacity failures");
+    std::free(allocation);
+}
+
 int main(int argc, char **argv) {
     check(crc32c(reinterpret_cast<const uint8_t *>("123456789"), 9) == 0xe3069283, "standard CRC32C check value");
     check(crc32c(nullptr, 0) == 0, "empty CRC32C check value");
     testEncodingSelection();
     testSnapshots(false, argc == 3 ? argv[2] : nullptr);
     testSnapshots(true, argc >= 2 ? argv[1] : nullptr);
+    testImageCapacity(false);
+    testImageCapacity(true);
+    std::printf("Compact image static storage: buffers=%zu metadata=%zu total=%zu bytes.\n", sizeof(sBuffers),
+                sizeof(sImages) + sizeof(sObjectOffsets) + sizeof(sImageObjects),
+                sizeof(sBuffers) + sizeof(sImages) + sizeof(sObjectOffsets) + sizeof(sImageObjects));
     std::printf("Compact image metadata: %u checks passed\n", checks);
 }

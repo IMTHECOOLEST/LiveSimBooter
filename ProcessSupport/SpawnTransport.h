@@ -3,6 +3,8 @@
 
 #include "SpawnPlan.h"
 #include "SpawnPorts.h"
+#include "PeerProcessIdentity.h"
+#include "GuestCodeSignature.h"
 #include <mach/mach.h>
 
 #define LSB_BROKER_PORT_ENV "LSB_BROKER_PORT"
@@ -13,7 +15,7 @@ enum LSBExecutionRole { LSB_EXECUTION_SIMULATOR = 0, LSB_EXECUTION_NATIVE_METAL_
 
 enum LSBRequestKind {
     LSB_REQUEST_SPAWN = 1, LSB_REQUEST_CHECKIN = 2, LSB_REQUEST_READY = 3, LSB_REQUEST_KILL = 4, LSB_REQUEST_EXEC = 5,
-    LSB_REQUEST_RESOLVE_AUDIT_PID = 6
+    LSB_REQUEST_RESOLVE_AUDIT_PID = 6, LSB_REQUEST_COPY_ENTITLEMENTS = 7, LSB_REQUEST_COPY_PROCESS_IDENTITY = 8
 };
 typedef struct {
     uint64_t requestID;
@@ -42,7 +44,9 @@ typedef struct {
     int error;
     pid_t targetPID;
     int signalNumber;
+    uint32_t entitlementOperation; // COPY_ENTITLEMENTS: csops operation 5 (CDHash), 7 (generated XML) or 16 (original DER).
     audit_token_t targetAudit;
+    LSBPeerProcessIdentity peerIdentity; // CHECKIN owns its taskName; audit comes from the kernel and path remains empty.
     mach_port_t nativeServicePort; // Owned send reference, allowed only on a native service READY request.
     LSBSpawnPlan plan;
     int fds[LSB_MAX_FDS];
@@ -75,12 +79,23 @@ int LSBTransportKill(pid_t targetPID, int signalNumber);
 // Unmanaged native identities retain their native PID unless they alias a known managed identity. Never changes the audit token.
 // Returns an errno value and clears *pid on failure; rejected or retired identities must not fall back to their native PID.
 int LSBTransportResolveAuditPID(const audit_token_t *audit, pid_t *pid);
+// Copies the exact managed target's entitlement blob for csops operation 7 (XML) or 16 (DER), including its big-endian header.
+// On success the caller owns malloc storage and must free it; both outputs are cleared on failure. The broker authenticates both identities.
+int LSBTransportCopyEntitlements(const audit_token_t *target, unsigned operation, unsigned char **blob, size_t *size);
+// Copies the immutable signed guest CodeDirectory's actual 20-byte digest. Clears hash on failure; same full-audit authentication.
+int LSBTransportCopyCodeDirectoryHash(const audit_token_t *target, unsigned char hash[LSB_GUEST_CDHASH_BYTES]);
+// Exact native PID, restricted by the broker to managed peers. Clears the output on failure; dispose the owned task-name right on success.
+int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *identity);
 // Receive retains the request for a later reply; audit comes from the kernel, never the message payload.
 // On failure, sends an error reply when possible and disposes the malformed message, imported FDs and copied send references.
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message);
 // Replies and releases the request object. Imported FDs and registered ports remain owned by message until DisposeMessage is called.
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]);
+// COPY_ENTITLEMENTS only. Success borrows a bounded blob matching the requested operation; errors carry no bytes. Releases the request.
+int LSBTransportReplyEntitlements(LSBReceivedMessage *message, int error, const void *bytes, size_t size);
+// COPY_PROCESS_IDENTITY only. Borrows identity and copies its task-name right; errors carry no identity. Releases the request object.
+int LSBTransportReplyProcessIdentity(LSBReceivedMessage *message, int error, const LSBPeerProcessIdentity *identity);
 // Bootstrap additionally copies a shared status-file FD and nonblocking wake-pipe read FD; caller retains ownership.
 // A successful CheckIn returns these in reply.statusFD/wakeFD. The caller must close them separately from the plan FDs.
 int LSBTransportReplyBootstrap(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *runtimeRoot,

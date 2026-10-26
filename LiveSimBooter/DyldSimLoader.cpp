@@ -27,6 +27,7 @@
 // Modified 2026-10-24: refresh ptr_munge in writable startup data and prepare debugger metadata before host-cache removal.
 // Modified 2026-10-25: replace consumed main_stack metadata with validated native stack bounds for simulator pthread teardown.
 // Modified 2026-10-25: own startup vectors and writable strings in bounded app-image storage that cache mappings cannot replace.
+// Modified 2026-10-26: reject resident-image collisions and relocate the main stack when the cache overlaps its native range.
 // Mapping sequence based on Apple's prepareSim(), dyldMain.cpp:300-469 at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp
 
@@ -40,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <libkern/OSByteOrder.h>
 #include <mach/mach.h>
@@ -108,6 +110,149 @@ bool captureMainStack(uintptr_t &top, size_t &size, std::string &error) {
     size = pthread_get_stacksize_np(thread);
     if (!mainStackContains(top, size, reinterpret_cast<uintptr_t>(__builtin_frame_address(0))))
         return fail(error, "Native main-thread stack bounds do not contain the current stack");
+    return true;
+}
+
+// This stable prefix ends at sharedRegionSize; newer cache headers append fields beyond it.
+struct CacheReservationHeader {
+    char magic[16];
+    uint32_t mappingOffset, mappingCount;
+    uint8_t metadataBeforeSharedRegion[200];
+    uint64_t sharedRegionStart, sharedRegionSize;
+};
+static_assert(offsetof(CacheReservationHeader, sharedRegionStart) == 224 && offsetof(CacheReservationHeader, sharedRegionSize) == 232);
+static_assert(sizeof(CacheReservationHeader) == 240);
+struct CacheReservation { uintptr_t address = 0; size_t size = 0; };
+
+bool rangesOverlap(uintptr_t first, size_t firstSize, uintptr_t second, size_t secondSize) {
+    if (!firstSize || !secondSize) return false;
+    if (firstSize > UINTPTR_MAX - first || secondSize > UINTPTR_MAX - second) return true;
+    return first < second + secondSize && second < first + firstSize;
+}
+
+bool parseCacheReservation(const CacheReservationHeader &header, uint64_t fileSize, CacheReservation &cache, std::string &error) {
+    cache = {};
+    if (fileSize < sizeof(header) || memcmp(header.magic, "dyld_v1   arm64", sizeof(header.magic)))
+        return fail(error, "Simulator cache has a truncated or unsupported arm64 header");
+    if (header.mappingOffset < sizeof(header) || !header.mappingCount ||
+        !contains(fileSize, header.mappingOffset, uint64_t(header.mappingCount) * 32))
+        return fail(error, "Simulator cache mapping table is invalid or truncated");
+    if (!header.sharedRegionStart || !header.sharedRegionSize || (header.sharedRegionStart & 4095) || (header.sharedRegionSize & 4095) ||
+        header.sharedRegionSize > UINTPTR_MAX - header.sharedRegionStart)
+        return fail(error, "Simulator cache reservation is empty, unaligned or overflows the address space");
+    cache = {static_cast<uintptr_t>(header.sharedRegionStart), static_cast<size_t>(header.sharedRegionSize)};
+    return true;
+}
+
+bool readCacheReservation(const char *path, CacheReservation &cache, std::string &error) {
+    cache = {};
+    FileMapping file;
+    file.fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (file.fd < 0) return errno == ENOENT ? true : systemFailure(error, "open simulator cache");
+    struct stat info = {};
+    if (fstat(file.fd, &info)) return systemFailure(error, "stat simulator cache");
+    if (!S_ISREG(info.st_mode) || info.st_size < static_cast<off_t>(sizeof(CacheReservationHeader)))
+        return fail(error, "Simulator cache is not a regular file with a complete reservation header");
+    CacheReservationHeader header = {};
+    size_t count = 0;
+    while (count < sizeof(header)) {
+        ssize_t amount = pread(file.fd, reinterpret_cast<uint8_t *>(&header) + count, sizeof(header) - count, count);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount < 0) return systemFailure(error, "read simulator cache header");
+        if (!amount) return fail(error, "Simulator cache header was truncated while reading");
+        count += static_cast<size_t>(amount);
+    }
+    return parseCacheReservation(header, info.st_size, cache, error);
+}
+
+struct GuardedMainStack {
+    void *mapping = MAP_FAILED;
+    size_t mappingSize = 0, size = 0;
+    uintptr_t top = 0;
+    ~GuardedMainStack() { if (mapping != MAP_FAILED) munmap(mapping, mappingSize); }
+    GuardedMainStack() = default;
+    GuardedMainStack(const GuardedMainStack &) = delete;
+    GuardedMainStack &operator=(const GuardedMainStack &) = delete;
+};
+
+bool prepareMainStack(const CacheReservation &cache, uintptr_t &top, size_t &size, GuardedMainStack &stack, std::string &error) {
+    if (!size || size >= top) return fail(error, "Invalid native main-stack bounds");
+    if (!rangesOverlap(top - size, size, cache.address, cache.size)) return true;
+    size_t pageSize = static_cast<size_t>(getpagesize());
+    size_t wanted = std::max(size, size_t(8 * 1024 * 1024));
+    if (!pageSize || (pageSize & (pageSize - 1)) || wanted > SIZE_MAX - 3 * pageSize)
+        return fail(error, "Simulator main-stack allocation size overflows");
+    stack.size = (wanted + pageSize - 1) & ~(pageSize - 1);
+    stack.mappingSize = stack.size + 2 * pageSize;
+    // A hint is never allowed to replace an existing mapping, including another thread's stack or executable image.
+    stack.mapping = mmap(reinterpret_cast<void *>(0x400000000ULL), stack.mappingSize, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (stack.mapping == MAP_FAILED) return systemFailure(error, "reserve simulator main stack");
+    uintptr_t base = reinterpret_cast<uintptr_t>(stack.mapping);
+    if (base < 0x300000000ULL || stack.mappingSize > UINTPTR_MAX - base || rangesOverlap(base, stack.mappingSize, cache.address, cache.size))
+        return fail(error, "Simulator main-stack allocation is not outside the cache in the high address range");
+    if (mprotect(reinterpret_cast<void *>(base + pageSize), stack.size, PROT_READ | PROT_WRITE))
+        return systemFailure(error, "protect simulator main stack");
+    stack.top = base + pageSize + stack.size;
+    top = stack.top;
+    size = stack.size;
+    return true;
+}
+
+// Inspect only already loaded, trusted Mach-O headers. __PAGEZERO reserves address space but contains no surviving code/data.
+bool imageOutsideCache(const mach_header *header, const CacheReservation &cache, std::string &error) {
+    if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 16 * 1024 * 1024)
+        return fail(error, "Cannot validate the resident image against the simulator cache");
+    const uint8_t *commands = reinterpret_cast<const uint8_t *>(header) + sizeof(mach_header_64);
+    size_t offset = 0;
+    uintptr_t preferredHeader = UINTPTR_MAX;
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        if (!contains(header->sizeofcmds, offset, sizeof(load_command))) return fail(error, "Invalid resident image load commands");
+        auto command = read<load_command>(commands + offset);
+        if (command.cmdsize < sizeof(command) || !contains(header->sizeofcmds, offset, command.cmdsize))
+            return fail(error, "Invalid resident image load-command size");
+        if (command.cmd == LC_SEGMENT_64) {
+            if (command.cmdsize < sizeof(segment_command_64)) return fail(error, "Truncated resident image segment");
+            auto segment = read<segment_command_64>(commands + offset);
+            if (!segment.fileoff && segment.filesize >= sizeof(mach_header_64)) preferredHeader = segment.vmaddr;
+        }
+        offset += command.cmdsize;
+    }
+    uintptr_t address = reinterpret_cast<uintptr_t>(header);
+    if (preferredHeader == UINTPTR_MAX || preferredHeader > address) return fail(error, "Invalid resident image header address");
+    uintptr_t slide = address - preferredHeader;
+    offset = 0;
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        auto command = read<load_command>(commands + offset);
+        if (command.cmd == LC_SEGMENT_64) {
+            auto segment = read<segment_command_64>(commands + offset);
+            if (segment.vmsize && strncmp(segment.segname, "__PAGEZERO", sizeof(segment.segname))) {
+                if (segment.vmaddr > UINTPTR_MAX - slide ||
+                    rangesOverlap(segment.vmaddr + slide, segment.vmsize, cache.address, cache.size))
+                    return fail(error, "Simulator cache overlaps a resident executable image");
+            }
+        }
+        offset += command.cmdsize;
+    }
+    return true;
+}
+
+bool storageInResidentImage(const void *storage, const void *residentHeader, std::string &error) {
+    Dl_info image = {};
+    if (!storage || !dladdr(storage, &image) || image.dli_fbase != residentHeader)
+        return fail(error, "Simulator handoff storage is not in the validated resident image");
+    return true;
+}
+
+bool debuggerMetadataOutsideCache(const task_dyld_info_data_t &info, size_t pageSize, const CacheReservation &cache, std::string &error) {
+    if (info.all_image_info_format != TASK_DYLD_ALL_IMAGE_INFO_64 || !info.all_image_info_addr ||
+        info.all_image_info_size < sizeof(dyld_all_image_infos) || !pageSize || (pageSize & (pageSize - 1)))
+        return fail(error, "Invalid native debugger metadata bounds");
+    uintptr_t address = info.all_image_info_addr, mask = pageSize - 1;
+    if (info.all_image_info_size > UINTPTR_MAX - address || address + info.all_image_info_size > UINTPTR_MAX - mask)
+        return fail(error, "Native debugger metadata bounds overflow");
+    uintptr_t base = address & ~mask, end = (address + info.all_image_info_size + mask) & ~mask;
+    if (rangesOverlap(base, end - base, cache.address, cache.size))
+        return fail(error, "Simulator cache overlaps the registered native debugger metadata pages");
     return true;
 }
 
@@ -471,6 +616,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
                    int argc, const char *const argv[], const char *const envp[], const char *const apple[]) {
     if (!image || !image->entry || !executable || !executablePath || !dyldPath || !rootPath || argc < 1 || !argv) return 1;
     static bool entered = false;
+    static LSBDyldSimLaunch launch = {};
     if (entered) { fprintf(stderr, "dyld_sim can only be entered once per process\n"); return 1; }
     uintptr_t stackTop = 0;
     size_t stackSize = 0;
@@ -479,6 +625,33 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         fprintf(stderr, "Cannot prepare simulator main stack: %s\n", stackError.c_str());
         return 1;
     }
+    CacheReservation cache;
+    GuardedMainStack relocatedStack;
+    Dl_info resident = {};
+    std::string cachePath = std::string(rootPath) + "/System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64";
+    if (!readCacheReservation(cachePath.c_str(), cache, stackError)) {
+        fprintf(stderr, "Cannot prepare simulator cache reservation: %s\n", stackError.c_str());
+        return 1;
+    }
+    if (cache.size) {
+        bool safe = dladdr(reinterpret_cast<const void *>(&LSBEnterDyldSim), &resident) && resident.dli_fbase;
+        safe = safe && !rangesOverlap(reinterpret_cast<uintptr_t>(&startupStorage), sizeof(startupStorage), cache.address, cache.size) &&
+               !rangesOverlap(reinterpret_cast<uintptr_t>(&launch), sizeof(launch), cache.address, cache.size) &&
+               !rangesOverlap(reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache.address, cache.size);
+        if (!safe || !imageOutsideCache(static_cast<const mach_header *>(resident.dli_fbase), cache, stackError) ||
+            !imageOutsideCache(executable, cache, stackError)) {
+            fprintf(stderr, "Cannot use simulator cache: %s\n", stackError.empty() ? "reservation overlaps loader storage or images" : stackError.c_str());
+            return 1;
+        }
+    }
+    if (!prepareMainStack(cache, stackTop, stackSize, relocatedStack, stackError)) {
+        fprintf(stderr, "Cannot prepare simulator main stack: %s\n", stackError.c_str());
+        return 1;
+    }
+    if (relocatedStack.top)
+        fprintf(stderr, "Relocated simulator main stack: top 0x%llx, size 0x%llx; cache reservation 0x%llx-0x%llx\n",
+                static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize),
+                static_cast<unsigned long long>(cache.address), static_cast<unsigned long long>(cache.address + cache.size));
     if (!LSBInitializeSimProcessInfo(image->header, dyldPath)) {
         fprintf(stderr, "Cannot initialize simulator process info: %s\n", strerror(*LSBGetSimSyscallHelpers()->errnoAddress()));
         return 1;
@@ -506,13 +679,31 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         fprintf(stderr, "Cannot prepare simulator main thread: %s\n", strerror(threadError));
         return 1;
     }
+    const SimSyscallHelpers *helpers = LSBGetSimSyscallHelpers();
+    if (cache.size) {
+        size_t pageSize = static_cast<size_t>(getpagesize());
+        task_dyld_info_data_t nativeInfo = {};
+        mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+        kern_return_t result = task_info(mach_task_self(), TASK_DYLD_INFO, reinterpret_cast<task_info_t>(&nativeInfo), &count);
+        // TLS, the helper table and simulator/debugger snapshots are static members of the already checked app image.
+        // The kernel-registered native metadata pages can survive at their old address when publication is unavailable.
+        bool valid = result == KERN_SUCCESS && count >= TASK_DYLD_INFO_COUNT && pageSize && !(pageSize & (pageSize - 1)) &&
+                     !(cache.address & (pageSize - 1)) && !(cache.size & (pageSize - 1)) && helpers && helpers->getProcessInfo;
+        if (!valid || !storageInResidentImage(reinterpret_cast<const void *>(thread.simulatorTSD), resident.dli_fbase, stackError) ||
+            !storageInResidentImage(helpers, resident.dli_fbase, stackError) ||
+            !storageInResidentImage(helpers->getProcessInfo(), resident.dli_fbase, stackError) ||
+            !debuggerMetadataOutsideCache(nativeInfo, pageSize, cache, stackError)) {
+            fprintf(stderr, "Cannot preserve simulator handoff storage: %s\n", stackError.empty() ? "invalid metadata or cache alignment" : stackError.c_str());
+            return 1;
+        }
+    }
     int debuggerError = LSBPrepareHostDebugger(executable, executablePath);
     if (debuggerError) {
         fprintf(stderr, "Cannot prepare debugger image metadata: %s\n", strerror(debuggerError));
         return 1;
     }
-    const SimSyscallHelpers *helpers = LSBGetSimSyscallHelpers();
-    LSBDyldSimLaunch launch = {entry, argc, startup.argv, startup.envp, startup.apple, executable, image->header, image->slide, helpers, thread};
+    launch = {entry, argc, startup.argv, startup.envp, startup.apple, executable, image->header, image->slide, helpers, thread,
+              relocatedStack.top, cache.address, cache.size};
     entered = true;
     fprintf(stderr, "Detaching host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n", reinterpret_cast<void *>(image->entry), image->header,
             static_cast<unsigned long long>(image->slide));

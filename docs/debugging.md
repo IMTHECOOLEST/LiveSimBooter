@@ -40,6 +40,32 @@ File transfer does not establish signature acceptance; capture the next launch.
 
 ## Capture AMFI and TXM
 
+### USB SSH and incremental transfers
+
+The current iOS 26.1 phone exposes SSH on device port 2222. Forward it over USB with a loopback-only listener:
+
+```sh
+iproxy -l -u 00008130-00021D122680011C 2223:2222
+```
+
+Use `ssh -p 2223 root@127.0.0.1` for commands and `rsync` over that same SSH connection for payloads. Both the Mac and
+phone have protocol-29-compatible openrsync. The 2026-10-26 trial deployed the production shim through this route and
+verified its SHA-256; a checksum synchronization of the exact 1,826-file signed SpringBoard payload had no remaining
+file differences. The local source tree must contain the signed executable, not its original unsigned input.
+
+For a new payload, select an inactive directory inside the app group's `Library`, then use:
+
+```sh
+rsync -rlpc --partial --itemize-changes -e 'ssh -p 2223' local-payload/ root@127.0.0.1:/verified/app-group/Library/TransferTrial/incoming/
+```
+
+The trailing slash copies the directory contents. Keep existing RuntimeRoot files until transfer and manifest hash
+verification finish, then activate with the relevant guest processes stopped. Do not add `--delete` to a partial runtime
+payload. A cache already transferred to the phone can be activated by a local rename; it need not be downloaded and uploaded again.
+Evidence is in `tmp/lsd-services/rsync-usb-shim-deploy.log` and `rsync-usb-springboard-final.log`.
+
+### Log stream
+
 The test device exposes SSH on port 2222. Start capture before launch in a separate terminal and stop it after the process exits.
 The SSH options below match this test setup and do not record its host key in the Mac's known-hosts file.
 
@@ -117,9 +143,26 @@ not a required constant. `target create` must point at the executable matching t
 
 ```text
 settings set -g target.require-hardware-breakpoint true
+settings set -g target.parallel-module-load false
+settings set -g target.memory-module-load-level partial
 target create --arch arm64 tmp/device-build/Build/Products/Debug-iphoneos/LiveSimBooter.app/LiveSimBooter
 device select 25FDAD7E-026E-51E2-9C23-60AD659ABFCE
 device process attach -p PID
+```
+
+**Wait for LLDB's asynchronous `Process PID stopped` notification before entering any further command.** An early `(lldb)`
+prompt does not establish that attach has completed. Do not queue `bt`, `image list`, expressions, or even Python
+`GetState()` polling during this interval. In the 2026-10-26 lsd investigation, entering Python while attachment was still
+initializing caused `ScriptInterpreterPythonImpl::EnterSession` to select a frame, create the Objective-C runtime and block
+in `AppleObjCRuntime::GetObjCVersion` on a module mutex. This was a debugger-side lock stall, not a guest crash.
+The sample is `tmp/lsd-services/lldb-attach-sample.txt`.
+
+Set serial module loading and partial in-memory module loading before creating/attaching the target, as above. They reduce
+module-loading contention but do not make it safe to issue commands before the stopped notification. Keep the global
+hardware-breakpoint requirement as well, including for debugger-created internal breakpoints. Once attachment reports the
+process stopped, ordinary inspection and the Python value API below may be used. For example:
+
+```text
 breakpoint set -n 'lsb::mmap' -c 'location == (void*)0x120000000'
 breakpoint set -H -a 0x129d4ff78
 continue
@@ -197,8 +240,15 @@ edits. Keep the global hardware-breakpoint setting enabled before attach:
 
 ```text
 settings set -g target.require-hardware-breakpoint true
+settings set -g target.parallel-module-load false
+settings set -g target.memory-module-load-level partial
 device select CURRENT_COREDEVICE_IDENTIFIER
 device process attach -p CURRENT_SIMULATOR_PID
+```
+
+Wait for `Process CURRENT_SIMULATOR_PID stopped`, then inspect:
+
+```text
 image list -o -f
 breakpoint set -H -n LSBKill
 breakpoint set -H -n LSBTransportKill
@@ -210,6 +260,27 @@ breakpoints automatically. The native-cache range was inaccessible, and the rebu
 TEXT with zero dirty pages. The [multiprocess results](multiprocess.md#ios-26-automatic-image-discovery-2026-10-25) record the
 process IDs, completion checks, and transcript. Keep the cached runtime and local shim/probe symbols matched when repeating
 the test; image count alone does not verify that every dependency came from the cache.
+
+### Larger SpringBoard image snapshots
+
+The SpringBoard closure exceeded the original **1,024-image** compact snapshot limit. Native SpringBoard **97190** failed
+with `Cannot publish debugger image snapshot` before its debug constructor. `kCompactImageInfoMaxImages` is now **2,048**
+distinct images, including dyld_sim; the serialization buffers and object-reference tables derive their limits from that
+one constant. Overflow still returns `E2BIG` without replacing the previous valid snapshot or advancing its initialization
+state. This limit controls debugger metadata publication, independently of the cache's mapped size.
+
+Focused tests cover 1,025, 1,353 and 2,048 images in both native archive formats, including 32 segments per image, long
+Unicode paths, independent CoreFoundation decoding, checksum validation, and recovery after overflow. The worst tested
+archives occupy 15,337,882 bytes (POSIX) and 15,337,914 bytes (CRC32C). The two snapshot buffers plus metadata reserve
+36,610,816 bytes of static storage; that is a storage bound, not a measurement of resident dirty pages.
+
+After installing the larger-capacity build, native SpringBoard **97287** passed snapshot publication and reached the
+temporary `springboard-debug` constructor stop before main. This verifies progress past the metadata limit, not SpringBoard
+boot or full image-discovery correctness. Evidence is `tmp/lsd-services/springboard-capacity-guest.log` and
+`console-springboard-capacity.log`. The full `bash Tests/run.sh` suite passed with native IOSurface/Metal access after the
+stack and capacity changes, including **74,434** compact metadata checks; evidence is `tests-integrated.log` in the same
+directory. The initial sandbox-only run failed at `IOSurfaceLock` and is preserved separately as
+`tests-integrated-sandbox.log`.
 
 ## Internal breakpoint investigation
 
@@ -280,3 +351,51 @@ rejections. Keep those two observations separate when comparing future runs.
 
 For a host `dlopen` diagnostic only, add `--probe-dlopen-dyld-sim` after the bundle identifier. It prints the handle and
 `dlerror()`, then exits before custom mapping or cache removal. Its result is not a substitute for testing the custom loader.
+
+## SpringBoard attach over Wi-Fi
+
+On 2026-10-26, LLDB itself overflowed its stack while attaching to SpringBoard's simulator images. Its Objective-C runtime
+initialization attempted `CanJIT`, memory allocation and frame unwinding, which recursively initialized the same runtime.
+Set this before attaching to avoid that observed recursion while retaining ordinary stack unwinding:
+
+```text
+settings set -g target.process.disable-language-runtime-unwindplans true
+```
+
+With this setting, the hardware-only Wi-Fi attach to native SpringBoard PID 2555 completed. Its main thread was in
+`mach_msg`, CoreFoundation, GraphicsServices and `UIApplicationMain`, above `SBSystemAppMain` and `start_sim`.
+LLDB recognized TextInputUI and both SpringBoard images; detach resumed the guest normally. Loading the large image set
+from process memory still took several minutes, and Objective-C expression support was not validated. This workaround
+does not change the app or simulator binaries. Evidence: [successful transcript](../tmp/lsd-services/lldb-wifi-textinputui-mainloop.txt)
+and [debugger crash analysis](../tmp/lsd-services/lldb-runtime-recursion.md).
+
+A later Siri-shader investigation encountered two CoreDevice device-selection timeouts. Direct attachment to SpringBoard
+**3374** through an SSH-forwarded research debugserver connected, but initial simulator-image preloading continued for more
+than ten minutes. The [Mac LLDB sample](../tmp/siri-shaders-stage/lldb-ssh-connect.sample.txt) records this image-loading path;
+the trial obtained no shader breakpoint values or shader-creation result. A connected remote debugger is not equivalent
+to a completed, usable initial image load.
+
+That owned trial was cleaned up: host **3351** was terminated, remote debugserver **3401** stopped, and LLDB exited.
+The production shim from `tmp/lsd-services/libLiveSimSpawn-extensionkit-cdhash.dylib` was restored as RuntimeRoot's
+`usr/lib/libLiveSimSpawn.dylib`, with SHA-256
+`7c5379a864d9e4338a338e3eecfe99a1e0882525672fd55a635e9d2e05d817c9` verified. See the
+[restoration log](../tmp/siri-shaders-stage/restore-production-wifi.log). Subsequent host **3450** runs used the production
+shim; their standalone Siri resource inspection and continuing SpringBoard assertion are recorded in
+[SpringBoard services](springboard-services.md#feature-flag-gate-isolation).
+
+The later scoped diagnostic in SpringBoard **3722** captured the actual Metal error without waiting for LLDB's image
+preload. It preserved the original method arguments/results and exposed the NSError discarded by a NULL error argument:
+the default library loaded, but `siriChipVert` specialization failed because MTLCompilerService lookup returned error
+**3, "No such process"** (`MTLLibraryErrorDomain` code 3). This observation came from the temporary diagnostic wrappers,
+not the unsuccessful **3374** shader-breakpoint attempt. See the
+[captured error](../tmp/siri-metal-diagnostic/guest-wifi.log) and [scope/ownership checks](../tmp/siri-metal-diagnostic/README.md).
+
+The following production run used the compiler-registration fix without the diagnostic wrappers.
+Host **3884** / SpringBoard **3908** launched compiler processes **3925** and **3928**, passed the previous shader assertion,
+then failed at required loading of the missing **AutoFillUI.framework** executable. The
+[production guest log](../tmp/siri-metal-diagnostic/guest-production-fix-wifi.log) includes older appended output: evaluate
+the section beginning `pid=3908`. The [host console](../tmp/siri-metal-diagnostic/console-production-fix-wifi.log) records
+both compiler launches. After the separate AutoFillUI executable deployment, host **3976** / SpringBoard **3998** displayed
+the populated home screen with remaining icon/widget gaps; see the [screenshot](../tmp/autofillui-stage/springboard-wifi.png).
+App-registration totals, checksum-skipped resource publication and the latest rendering limits are recorded in
+[SpringBoard services](springboard-services.md#stock-application-population-and-registration).

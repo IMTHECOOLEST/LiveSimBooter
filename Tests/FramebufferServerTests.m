@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static uint32_t u32(const void *bytes) { uint32_t value; memcpy(&value, bytes, 4); return value; }
@@ -567,9 +568,11 @@ static void stockClientTests(void) {
     activeChain = chain;
     IOSurfaceRef surface = createSurface();
     dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+    dispatch_semaphore_t allowCallbackReturn = dispatch_semaphore_create(0);
+    dispatch_queue_t callbackQueue = dispatch_queue_create("LSB.FramebufferTests.Callback", DISPATCH_QUEUE_SERIAL);
     CGRect rectangle = CGRectMake(0, 0, 1290, 2796);
     assert(SFBSwapchainSwapBegin(chain, 0));
-    SFBSwapchainSwapSetCallback(chain, (void *)123, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+    SFBSwapchainSwapSetCallback(chain, (void *)123, callbackQueue,
         ^(CFErrorRef callbackError, CFTypeRef callbackChain, uint64_t desired, uint64_t completedAt, void *context) {
             assert(!callbackError && callbackChain == chain && !desired && completedAt > 0);
             assert(context == (void *)123);
@@ -585,11 +588,13 @@ static void stockClientTests(void) {
     CGRect partial = CGRectMake(597, 1350, 96, 96);
     dispatch_sync(dispatch_get_main_queue(), ^{ expectedRectangle = partial; });
     assert(SFBSwapchainSwapBegin(chain, 0));
-    SFBSwapchainSwapSetCallback(chain, (void *)789, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+    SFBSwapchainSwapSetCallback(chain, (void *)789, callbackQueue,
         ^(CFErrorRef callbackError, CFTypeRef callbackChain, uint64_t desired, uint64_t completedAt, void *context) {
             assert(!callbackError && callbackChain == chain && !desired && completedAt > 0);
             assert(context == (void *)789 && atomic_load(&presented) == 2);
             dispatch_semaphore_signal(completed);
+            // Stock __SFBSwapchainInvokeCallback retains the chain until after this callback returns.
+            assert(!dispatch_semaphore_wait(allowCallbackReturn, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)));
         });
     assert(SFBSwapchainSwapAddSurface(chain, surface, partial, partial, 0, 0, &failure));
     if (!SFBSwapchainSwapSubmit(chain, &failure)) { CFShow(failure); abort(); }
@@ -600,14 +605,31 @@ static void stockClientTests(void) {
     CFRelease(chain);
     activeChain = NULL;
     chain = SFBDisplayCreateSwapchain(display, CGSizeMake(1290, 2796), 2, (__bridge CFDictionaryRef)options, &failure);
-    assert(chain); // Releasing the first client object must free its server-side slot through message ID 13.
+    assert(!chain && failure && CFEqual(CFErrorGetDomain(failure), kCFErrorDomainPOSIX) && CFErrorGetCode(failure) == ENOSPC);
+    CFRelease(failure);
+    failure = NULL;
+    dispatch_semaphore_signal(allowCallbackReturn);
+    dispatch_sync(callbackQueue, ^{}); // Signal delivery alone does not mean the stock callback has released its retained chain.
+    // Deallocation sends ID 13 asynchronously. Wait for that observable teardown, never accepting other errors or a permanent slot leak.
+    struct timespec started, now;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &started));
+    do {
+        chain = SFBDisplayCreateSwapchain(display, CGSizeMake(1290, 2796), 2, (__bridge CFDictionaryRef)options, &failure);
+        if (chain) break;
+        assert(failure && CFEqual(CFErrorGetDomain(failure), kCFErrorDomainPOSIX) && CFErrorGetCode(failure) == ENOSPC);
+        CFRelease(failure);
+        failure = NULL;
+        assert(!clock_gettime(CLOCK_MONOTONIC, &now));
+        assert((double)(now.tv_sec - started.tv_sec) + (now.tv_nsec - started.tv_nsec) / 1e9 < 2.0);
+        usleep(1000);
+    } while (!chain);
     activeChain = chain;
     mach_timebase_info_data_t timebase;
     assert(!mach_timebase_info(&timebase));
     uint64_t target = mach_absolute_time() + (uint64_t)((__uint128_t)100000000 * timebase.denom / timebase.numer);
     earliestCopy = target;
     assert(SFBSwapchainSwapBegin(chain, target));
-    SFBSwapchainSwapSetCallback(chain, (void *)456, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+    SFBSwapchainSwapSetCallback(chain, (void *)456, callbackQueue,
         ^(CFErrorRef callbackError, CFTypeRef callbackChain, uint64_t desired, uint64_t completedAt, void *context) {
             assert(!callbackError && callbackChain == chain && desired <= target && target - desired <= 1 && completedAt >= target);
             assert(context == (void *)456 && atomic_load(&presented) == 3);
@@ -617,6 +639,7 @@ static void stockClientTests(void) {
     if (!SFBSwapchainSwapSubmit(chain, &failure)) { CFShow(failure); abort(); }
     assert(mach_absolute_time() >= target && SFBSwapchainAcquireSurfaceFence(chain, surface, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)));
     assert(!dispatch_semaphore_wait(completed, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)));
+    dispatch_sync(callbackQueue, ^{});
     CFRelease(surface);
     CFRelease(chain);
     CFRelease(displays);
