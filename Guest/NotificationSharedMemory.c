@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -12,12 +13,32 @@
 #include <unistd.h>
 
 static const char objectFile[] = "notification-center.shm";
+#define WORKSPACE_OBJECT_FILE_CAPACITY 64
 
-static bool virtualObject(const char *name) {
+static bool workspaceObjectFile(const char *name, char file[WORKSPACE_OBJECT_FILE_CAPACITY]) {
+    // iOS 26 FrontBoard's __pathForIdentifierAndBuffer uses /FBW1: and /FBW2: with identifierForName's first 25 characters.
+    if (!name || (strncmp(name, "/FBW1:", 6) && strncmp(name, "/FBW2:", 6))) return false;
+    const char *identifier = name + 6;
+    size_t length = strnlen(identifier, 26);
+    if (!length || length > 25) return false;
+    for (size_t index = 0; index < length; ++index) {
+        unsigned char character = (unsigned char)identifier[index];
+        if (!((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') || character == '.' || character == '_' || character == '-')) return false;
+    }
+    snprintf(file, WORKSPACE_OBJECT_FILE_CAPACITY, "frontboard-workspace-%c-%s.shm", name[4], identifier);
+    return true;
+}
+
+static const char *virtualObject(const char *name, char file[WORKSPACE_OBJECT_FILE_CAPACITY]) {
     // Check the name before getenv: unrelated early libSystem initialization must not consult environment state.
-    if (!name || (strcmp(name, "apple.shm.notification_center") && strcmp(name, "/apple.shm.notification_center"))) return false;
+    if (!name) return NULL;
+    const char *selected;
+    if (!strcmp(name, "apple.shm.notification_center") || !strcmp(name, "/apple.shm.notification_center")) selected = objectFile;
+    else if (workspaceObjectFile(name, file)) selected = file;
+    else return NULL;
     const char *enabled = getenv(LSB_NOTIFICATION_SHM_ENABLE_ENV);
-    return enabled && !strcmp(enabled, "1");
+    return enabled && !strcmp(enabled, "1") ? selected : NULL;
 }
 
 static int ownedDirectory(int descriptor) {
@@ -59,7 +80,9 @@ int LSBNotificationShmOpen(const char *name, int flags, ...) {
         mode = (mode_t)va_arg(arguments, int);
         va_end(arguments);
     }
-    if (!virtualObject(name)) return flags & O_CREAT ? shm_open(name, flags, mode) : shm_open(name, flags);
+    char file[WORKSPACE_OBJECT_FILE_CAPACITY];
+    const char *selected = virtualObject(name, file);
+    if (!selected) return flags & O_CREAT ? shm_open(name, flags, mode) : shm_open(name, flags);
     int access = flags & O_ACCMODE;
     if ((access != O_RDONLY && access != O_RDWR) || (flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC))) {
         errno = EINVAL; return -1;
@@ -68,7 +91,7 @@ int LSBNotificationShmOpen(const char *name, int flags, ...) {
     int directory = openObjectDirectory();
     if (directory < 0) return -1;
     // Defer truncation until after validation, and use nonblocking open so a substituted FIFO cannot hang startup.
-    int descriptor = openat(directory, objectFile, (flags & ~O_TRUNC) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode);
+    int descriptor = openat(directory, selected, (flags & ~O_TRUNC) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode);
     int error = descriptor < 0 ? errno : 0;
     close(directory);
     if (!error) {
@@ -85,15 +108,42 @@ int LSBNotificationShmOpen(const char *name, int flags, ...) {
 }
 
 int LSBNotificationShmUnlink(const char *name) {
-    if (!virtualObject(name)) return shm_unlink(name);
+    char file[WORKSPACE_OBJECT_FILE_CAPACITY];
+    const char *selected = virtualObject(name, file);
+    if (!selected) return shm_unlink(name);
     int directory = openObjectDirectory();
     if (directory < 0) return -1;
     struct stat status;
-    int error = fstatat(directory, objectFile, &status, AT_SYMLINK_NOFOLLOW) ? errno : ownedObject(&status);
-    if (!error && unlinkat(directory, objectFile, 0)) error = errno;
+    int error = fstatat(directory, selected, &status, AT_SYMLINK_NOFOLLOW) ? errno : ownedObject(&status);
+    if (!error && unlinkat(directory, selected, 0)) error = errno;
     close(directory);
     if (error) { errno = error; return -1; }
     return 0;
+}
+
+bool LSBNotificationShmAllowsSandbox(const char *name, const char *operation) {
+    int savedError = errno;
+    bool allowed = false;
+    char file[WORKSPACE_OBJECT_FILE_CAPACITY];
+    if (!operation || !workspaceObjectFile(name, file) || !virtualObject(name, file)) goto done;
+    bool read = !strcmp(operation, "ipc-posix-shm-read-data");
+    bool create = !strcmp(operation, "ipc-posix-shm-write-create");
+    if (!read && !create && strcmp(operation, "ipc-posix-shm-write-unlink")) goto done;
+    int directory = openObjectDirectory();
+    if (directory < 0) goto done;
+    // This predicts access to our backing files, not access to the native POSIX SHM namespace. An absent object is valid at preflight.
+    if (!faccessat(directory, ".", X_OK | (read ? 0 : W_OK), AT_EACCESS)) {
+        struct stat status;
+        if (fstatat(directory, file, &status, AT_SYMLINK_NOFOLLOW)) allowed = errno == ENOENT;
+        else if (!ownedObject(&status)) {
+            allowed = !read && !create;
+            if (!allowed) allowed = !faccessat(directory, file, read ? R_OK : W_OK, AT_EACCESS | AT_SYMLINK_NOFOLLOW);
+        }
+    }
+    close(directory);
+done:
+    errno = savedError;
+    return allowed;
 }
 
 #ifndef LSB_NOTIFICATION_SHM_TESTING

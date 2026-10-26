@@ -11,9 +11,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Keep the initial service selection bounded independently of slots needed later for apps, helpers and adopted children.
 // Backboardd and cfprefsd are always direct launchd children alongside the selected services.
-enum { BaselineLaunchdChildren = 2, MaximumSelectedServices = LSB_CHILD_STATUS_CAPACITY - BaselineLaunchdChildren };
-_Static_assert(LSB_CHILD_STATUS_CAPACITY > BaselineLaunchdChildren, "selected services need available child-ledger slots");
+enum { BaselineLaunchdChildren = 2, MaximumSelectedServices = 14 };
+_Static_assert(BaselineLaunchdChildren + MaximumSelectedServices < LSB_CHILD_STATUS_CAPACITY, "leave child-ledger slots for dynamic jobs");
 
 static int openDirectory(int parent, const char *name) {
     if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
@@ -299,6 +300,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"DYLD_FALLBACK_LIBRARY_PATH": [root stringByAppendingPathComponent:@"usr/lib"],
             @"DYLD_FALLBACK_FRAMEWORK_PATH": [root stringByAppendingPathComponent:@"System/Library/Frameworks"],
             @"SIMULATOR_ROOT": root, @"IPHONE_SIMULATOR_ROOT": root, @"SIMULATOR_ARCHS": @"arm64",
+            @"SIMULATOR_CAPABILITIES": [root stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"],
             // CoreSimulator 1171.7 formats this boot's Unix timestamp as %lu. SimulatorHID persists it as its generation key.
             @"SIMULATOR_BOOT_TIME": [NSString stringWithFormat:@"%lu", (unsigned long)NSDate.date.timeIntervalSince1970],
             // Initial iPhone 15 Pro Max profile: CoreSimulator's profile.plist maps iPhone16,2 to productClass D84.

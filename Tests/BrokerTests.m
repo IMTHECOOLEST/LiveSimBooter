@@ -40,7 +40,8 @@ typedef struct {
 
 typedef struct { unsigned identifier; int retainedFD; } TestMessageObject;
 
-static RecordedReply replies[128];
+// Each launch may record SPAWN, CHECKIN and READY replies while capacity/reuse tests run a full batch.
+static RecordedReply replies[4 * BrokerJobCapacity];
 static unsigned replyCount, disposedMessages, submittedLaunches, releasedLaunches, objectSequence;
 static uint32_t submittedLaunchOptions;
 static pid_t reportedPID;
@@ -101,8 +102,14 @@ static void handleMessage(LSBReceivedMessage *message) {
         message->peerIdentity.audit = message->audit;
         memcpy(message->peerIdentity.shortInfo, &message->audit.val[5], sizeof(uint32_t));
     }
-    if (message->kind == LSB_REQUEST_COPY_PROCESS_IDENTITY)
-        for (LSBJob *job in jobs) if (job.pid == message->targetPID) { testTaskAudit = job.audit; break; }
+    if (message->kind == LSB_REQUEST_COPY_PROCESS_IDENTITY || message->kind == LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID) {
+        LSBJob *sender = nil;
+        for (LSBJob *job in jobs) if (job.pid == (pid_t)message->audit.val[5] && job.pidVersion == message->audit.val[7]) { sender = job; break; }
+        BOOL logical = message->kind == LSB_REQUEST_COPY_PROCESS_IDENTITY && sender.simulatorLaunchd;
+        for (LSBJob *job in jobs) if (logical ? job.guestPID == message->targetPID && job.parentIdentifier == sender.identifier : job.pid == message->targetPID) {
+            testTaskAudit = job.audit; break;
+        }
+    }
     brokerHandleMessage(message);
 }
 
@@ -236,7 +243,7 @@ int LSBSignalExtension(uint64_t requestID, int signal) {
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) { (void)port; (void)message; return ENOSYS; }
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
-    assert(message && message->object && replyCount < 128);
+    assert(message && message->object && replyCount < sizeof(replies) / sizeof(replies[0]));
     int sendError = message->kind == LSB_REQUEST_READY ? readySendError : 0;
     if (plan) {
         assert(root && !strcmp(root, runtimeRoot.fileSystemRepresentation) && fds);
@@ -1129,7 +1136,7 @@ static LSBJob *managedJob(LSBJob *parent, pid_t identity) {
 }
 
 static void testGlobalJobCapacity(void) {
-    assert(BrokerJobCapacity == 2 * LSB_CHILD_STATUS_CAPACITY + 3);
+    assert(BrokerJobCapacity == 2 * LSB_CHILD_STATUS_CAPACITY + 4);
     for (unsigned replacing = 0; replacing < 2; ++replacing) {
         resetBroker();
         for (unsigned index = 0; index < BrokerJobCapacity - 1; ++index) managedJob(nil, 6000 + index);
@@ -1194,7 +1201,8 @@ static void testFullLaunchdBatchFitsExecOverlap(void) {
     LSBJob *launchd = managedJob(nil, 6700);
     launchd.simulatorLaunchd = YES;
     managedJob(nil, 6701); // Host-owned native Metal helpers occupy physical jobs, not launchd child-ledger slots.
-    managedJob(nil, 6750);
+    managedJob(nil, 6800);
+    managedJob(nil, 6801);
     NSMutableArray<LSBJob *> *proxies = [NSMutableArray array];
     for (unsigned i = 0; i < LSB_CHILD_STATUS_CAPACITY; ++i) [proxies addObject:managedJob(launchd, 6702 + i)];
     int fds[LSB_CHILD_STATUS_CAPACITY];
@@ -2397,6 +2405,17 @@ static RecordedReply *requestProcessIdentity(audit_token_t caller, pid_t target)
     return reply;
 }
 
+static RecordedReply *requestNativeChildPID(audit_token_t caller, pid_t target) {
+    LSBReceivedMessage *request = messageFor(LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID, caller.val[5], caller.val[7], 0);
+    request->audit = caller;
+    request->targetPID = target;
+    unsigned object = ((TestMessageObject *)request->object)->identifier;
+    handleMessage(request);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && !reply->requestID && !reply->deliveredPlan && (reply->error ? reply->pid == 0 : reply->pid > 0));
+    return reply;
+}
+
 static void testPeerIdentitySnapshotsAndAuthentication(void) {
     resetBroker();
     char temporary[] = "/tmp/LSBBrokerPeerIdentity.XXXXXX", canonical[PATH_MAX];
@@ -2468,6 +2487,200 @@ static void testPeerIdentitySnapshotsAndAuthentication(void) {
     LSBJob *replacement = runIdentityJob("/bin/df", reusedPID, 1502, 0xc3);
     assert(!requestProcessIdentity(caller.audit, reusedPID)->error && identityReply.audit.val[7] == replacement.pidVersion);
     assert(identityReply.shortInfo[63] == 0xc3 && !strcmp(identityReply.executablePath, "/bin/df"));
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
+}
+
+static void testLaunchdChildIdentityAndSignals(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerLaunchdIdentity.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    for (NSString *path in @[@"sbin/launchd_sim", @"bin/df"]) {
+        NSString *physical = [runtimeRoot stringByAppendingPathComponent:path];
+        assert([manager createDirectoryAtPath:physical.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
+        assert([[@"fixture" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:physical atomically:YES]);
+    }
+    LSBJob *caller = runIdentityJob("/sbin/launchd_sim", getpid() + 100, 1700, 0xa1);
+    caller.simulatorLaunchd = YES;
+    LSBJob *child = runIdentityJob("/bin/df", getpid() + 101, 1701, 0xb2);
+    child.guestPID = getpid() + 201;
+    child.parentIdentifier = caller.identifier;
+    // The retired proxy's logical PID can be an unrelated native process now. Only the owned guest child may be returned.
+    LSBJob *unrelated = runIdentityJob("/bin/df", child.guestPID, 1702, 0xc3);
+    assert(!requestProcessIdentity(caller.audit, child.guestPID)->error);
+    assert(identityReply.audit.val[5] == (unsigned)child.pid && identityReply.audit.val[7] == child.pidVersion);
+    assert(identityReply.shortInfo[63] == 0xb2);
+    assert(requestProcessIdentity(caller.audit, child.pid)->error == ESRCH); // This launchd RPC accepts only logical child IDs.
+    assert(requestProcessIdentity(caller.audit, caller.guestPID)->error == ESRCH);
+    assert(!requestKill(caller, child.guestPID, SIGTERM)->error && signaledAudit.val[5] == (unsigned)child.pid);
+    assert(!requestKill(caller, child.pid, SIGSTOP)->error && lastSignal == SIGSTOP && signaledAudit.val[7] == child.pidVersion);
+    unsigned before = deliveredSignals;
+    unrelated.guestPID = getpid() + 202;
+    assert(requestKill(caller, unrelated.guestPID, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    assert(requestProcessIdentity(caller.audit, unrelated.guestPID)->error == ESRCH);
+    child.parentIdentifier = unrelated.identifier;
+    assert(requestProcessIdentity(caller.audit, child.guestPID)->error == ESRCH);
+    assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    child.parentIdentifier = caller.identifier;
+    for (unsigned condition = 0; condition < 4; ++condition) {
+        if (condition == 0) child.retiredForExec = YES;
+        if (condition == 1) child.finishing = YES;
+        if (condition == 2) child.phase = JobDispatched;
+        if (condition == 3) child.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+        assert(requestProcessIdentity(caller.audit, child.guestPID)->error == ESRCH);
+        assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+        child.retiredForExec = child.finishing = NO;
+        child.phase = JobRunning;
+        child.executionRole = LSB_EXECUTION_SIMULATOR;
+    }
+    caller.simulatorLaunchd = NO;
+    assert(requestProcessIdentity(caller.audit, child.guestPID)->error == EACCES);
+    assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    assert(!requestKill(caller, child.guestPID, 0)->error); // Ordinary parents retain their existing logical child permission.
+    caller.simulatorLaunchd = YES;
+    LSBPeerProcessIdentity original = caller.peerIdentity, spoof = original;
+    strcpy(spoof.executablePath, "/Plugins/launchd_sim");
+    caller.peerIdentity = spoof;
+    assert(requestProcessIdentity(caller.audit, child.guestPID)->error == EACCES);
+    assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    caller.peerIdentity = original;
+    for (unsigned word = 0; word < 8; ++word) {
+        audit_token_t forged = caller.audit;
+        forged.val[word] ^= 1;
+        assert(requestProcessIdentity(forged, child.guestPID)->error == EACCES);
+        LSBReceivedMessage *request = messageFor(LSB_REQUEST_KILL, forged.val[5], forged.val[7], 0);
+        request->audit = forged; request->targetPID = child.pid; request->signalNumber = SIGTERM;
+        unsigned object = ((TestMessageObject *)request->object)->identifier;
+        handleMessage(request);
+        assert(replyFor(object)->error == EACCES && deliveredSignals == before);
+    }
+    // Even an impossible/inconsistent ledger with overlapping logical/native aliases must fail closed.
+    unrelated.parentIdentifier = caller.identifier;
+    unrelated.guestPID = child.pid;
+    assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    unrelated.parentIdentifier = 0;
+    mismatchTaskAudit = YES;
+    assert(requestProcessIdentity(caller.audit, child.guestPID)->error == ESRCH);
+    mismatchTaskAudit = NO;
+    identityCheckError = ESRCH;
+    assert(requestKill(caller, child.pid, SIGTERM)->error == ESRCH && deliveredSignals == before);
+    identityCheckError = 0;
+    assert(!requestKill(caller, child.pid, SIGCONT)->error && deliveredSignals == before + 1 && lastSignal == SIGCONT);
+    assert(child.phase == JobRunning && !child.finishing); // A successful signal never synthesizes a wait status or retires the job.
+    resetBroker();
+    assert([manager removeItemAtPath:directory error:NULL]);
+}
+
+static void testLaunchdNativeChildPIDResolution(void) {
+    resetBroker();
+    char temporary[] = "/tmp/LSBBrokerNativeChild.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    NSFileManager *manager = NSFileManager.defaultManager;
+    for (NSString *path in @[@"sbin/launchd_sim", @"bin/df", @"usr/libexec/runningboardd"]) {
+        NSString *physical = [runtimeRoot stringByAppendingPathComponent:path];
+        assert([manager createDirectoryAtPath:physical.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL]);
+        assert([[@"fixture" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:physical atomically:YES]);
+    }
+    LSBJob *caller = runIdentityJob("/sbin/launchd_sim", getpid() + 100, 1800, 0xa1);
+    caller.simulatorLaunchd = YES;
+    LSBJob *child = runIdentityJob("/bin/df", getpid() + 101, 1801, 0xb2);
+    child.parentIdentifier = caller.identifier;
+    assert(requestNativeChildPID(caller.audit, child.pid)->pid == child.pid); // Before exec the two identities may be equal.
+    child.guestPID = getpid() + 201;
+    LSBPeerProcessIdentity nativeIdentity = child.peerIdentity;
+    mach_port_urefs_t references = sendReferences(nativeIdentity.taskName);
+    assert(requestNativeChildPID(caller.audit, child.pid)->pid == child.guestPID);
+    LSBPeerProcessIdentity after = child.peerIdentity;
+    assert(!memcmp(&after, &nativeIdentity, sizeof(after)) && sendReferences(after.taskName) == references);
+    assert(requestNativeChildPID(caller.audit, child.guestPID)->error == ESRCH); // No implicit logical-ID fallback.
+    assert(requestNativeChildPID(caller.audit, caller.pid)->error == ESRCH);
+    assert(requestNativeChildPID(caller.audit, -1)->error == EINVAL);
+    assert(requestNativeChildPID(caller.audit, 0)->error == EINVAL);
+
+    LSBJob *unrelated = runIdentityJob("/bin/df", child.guestPID, 1802, 0xc3);
+    unrelated.guestPID = getpid() + 202;
+    assert(requestNativeChildPID(caller.audit, unrelated.pid)->error == ESRCH);
+    unrelated.parentIdentifier = caller.identifier;
+    assert(requestNativeChildPID(caller.audit, unrelated.pid)->pid == unrelated.guestPID); // Exact native match wins over another job's logical alias.
+    unrelated.parentIdentifier = 0;
+    child.parentIdentifier = unrelated.identifier;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH);
+    child.parentIdentifier = caller.identifier;
+    for (unsigned condition = 0; condition < 6; ++condition) {
+        if (condition == 0) child.retiredForExec = YES;
+        if (condition == 1) child.finishing = YES;
+        if (condition == 2) child.phase = JobDispatched;
+        if (condition == 3) child.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+        if (condition == 4) child.peerIdentityError = EIO;
+        if (condition == 5) child.guestPID = 0;
+        assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH);
+        child.retiredForExec = child.finishing = NO;
+        child.phase = JobRunning;
+        child.executionRole = LSB_EXECUTION_SIMULATOR;
+        child.peerIdentityError = 0;
+        child.guestPID = getpid() + 201;
+    }
+    for (unsigned condition = 0; condition < 6; ++condition) {
+        if (condition == 0) caller.retiredForExec = YES;
+        if (condition == 1) caller.finishing = YES;
+        if (condition == 2) caller.phase = JobDispatched;
+        if (condition == 3) caller.executionRole = LSB_EXECUTION_NATIVE_METAL_PROBE;
+        if (condition == 4) caller.peerIdentityError = EIO;
+        if (condition == 5) caller.simulatorLaunchd = NO;
+        assert(requestNativeChildPID(caller.audit, child.pid)->error == EACCES);
+        caller.retiredForExec = caller.finishing = NO;
+        caller.phase = JobRunning;
+        caller.executionRole = LSB_EXECUTION_SIMULATOR;
+        caller.peerIdentityError = 0;
+        caller.simulatorLaunchd = YES;
+    }
+    LSBPeerProcessIdentity originalCaller = caller.peerIdentity, wrongPath = originalCaller;
+    strcpy(wrongPath.executablePath, "/Plugins/launchd_sim");
+    caller.peerIdentity = wrongPath;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == EACCES);
+    caller.peerIdentity = originalCaller;
+    for (unsigned word = 0; word < 8; ++word) {
+        audit_token_t forged = caller.audit;
+        forged.val[word] ^= 1;
+        assert(requestNativeChildPID(forged, child.pid)->error == EACCES);
+    }
+    LSBJob *rbs = runIdentityJob("/usr/libexec/runningboardd", getpid() + 103, 1803, 0xd4);
+    assert(requestNativeChildPID(rbs.audit, child.pid)->error == EACCES); // Kind-8 peer inspection does not grant logical namespace access.
+    mismatchTaskAudit = YES;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH);
+    mismatchTaskAudit = NO;
+    taskInfoError = KERN_INVALID_ARGUMENT;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH);
+    taskInfoError = KERN_SUCCESS;
+    ++child.pidVersion;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH);
+    --child.pidVersion;
+    unrelated.parentIdentifier = caller.identifier;
+    pid_t unrelatedPID = unrelated.pid;
+    unrelated.pid = child.pid;
+    assert(requestNativeChildPID(caller.audit, child.pid)->error == ESRCH); // Inconsistent duplicate native identity is never selected arbitrarily.
+    unrelated.pid = unrelatedPID;
+    unrelated.parentIdentifier = 0;
+
+    pid_t retiredPID = child.pid, stablePID = child.guestPID;
+    child.retiredForExec = YES;
+    LSBJob *replacement = runIdentityJob("/bin/df", getpid() + 104, 1804, 0xe5);
+    replacement.parentIdentifier = caller.identifier;
+    replacement.guestPID = stablePID;
+    assert(requestNativeChildPID(caller.audit, retiredPID)->error == ESRCH);
+    assert(requestNativeChildPID(caller.audit, replacement.pid)->pid == stablePID);
+    finishJob(child, 0);
+    LSBJob *reused = runIdentityJob("/bin/df", retiredPID, 1805, 0xf6);
+    assert(requestNativeChildPID(caller.audit, retiredPID)->error == ESRCH); // Reused but unowned native identity remains unowned.
+    reused.parentIdentifier = caller.identifier;
+    assert(requestNativeChildPID(caller.audit, retiredPID)->pid == reused.guestPID && reused.guestPID != stablePID);
+    finishJob(replacement, 0);
+    assert(requestNativeChildPID(caller.audit, getpid() + 104)->error == ESRCH);
     resetBroker();
     assert([manager removeItemAtPath:directory error:NULL]);
 }
@@ -2845,6 +3058,8 @@ int main(void) {
         testGuestEntitlementsPathBoundaries();
         testPeerIdentityKernelValidation();
         testPeerIdentitySnapshotsAndAuthentication();
+        testLaunchdChildIdentityAndSignals();
+        testLaunchdNativeChildPIDResolution();
         testPeerExecutablePathContainment();
         testPeerIdentityCheckInFailures();
         testMonitorFailureAndEarlyExit();

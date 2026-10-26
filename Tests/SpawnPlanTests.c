@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <sys/event.h>
 #include <sys/wait.h>
 
 static unsigned transportCalls;
@@ -14,6 +15,7 @@ static uint32_t capturedCreationMask = 027;
 static unsigned execCalls;
 static mach_port_t expectedRegisteredPort;
 static bool inspectPorts;
+static uint32_t capturedSpawnFlags;
 extern int posix_spawn_file_actions_add_fileportdup2_np(posix_spawn_file_actions_t *, mach_port_t, int);
 int LSBGuestChildWakeFD(void) { return internalWakeFD; }
 LSBChildStatus *LSBGuestChildStatus(void) { return NULL; }
@@ -26,6 +28,7 @@ int LSBReadCreationMask(uint32_t *mask) {
 
 int LSBTransportSpawnWithPorts(const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS], const LSBSpawnPorts *ports, pid_t *pid) {
     assert(LSBValidateSpawnPlan(plan) == 0);
+    capturedSpawnFlags = plan->spawnFlags;
     assert(plan->creationMask == capturedCreationMask);
     for (uint32_t i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
     assert(ports && ports->registeredPresent && ports->bootstrapPresent);
@@ -176,6 +179,105 @@ static void closeOnExecVariant(bool defaults) {
 static void normalCloseOnExec(void) { closeOnExecVariant(false); }
 static void defaultCloseOnExec(void) { closeOnExecVariant(true); }
 
+static int snapshotIndex(const LSBSpawnPlan *plan, int descriptor) {
+    for (uint32_t i = 0; i < plan->fdCount; ++i) if (plan->fds[i].number == descriptor) return (int)i;
+    return -1;
+}
+
+static void snapshotDropsKqueueVariant(bool defaults) {
+    int queue = kqueue(), ordinary = open("/dev/null", O_RDONLY);
+    CHECK(queue >= 0 && ordinary >= 0);
+    CHECK(!fcntl(queue, F_SETFD, defaults ? 0 : FD_CLOEXEC));
+    mach_port_t unsupported = MACH_PORT_NULL;
+    CHECK(fileport_makeport(queue, &unsupported) != 0);
+    LSBSpawnPlan *plan = newPlan();
+    plan->spawnFlags = defaults ? POSIX_SPAWN_CLOEXEC_DEFAULT : 0;
+    int received[LSB_MAX_FDS];
+    emptyFDs(received);
+    CHECK(snapshotFDs(plan, received) == 0);
+    CHECK(snapshotIndex(plan, queue) == -1);
+    CHECK(defaults ? snapshotIndex(plan, ordinary) == -1 : snapshotIndex(plan, ordinary) >= 0);
+    CHECK(LSBApplySpawnPlan(plan, received) == 0);
+    CHECK(fcntl(queue, F_GETFD) == -1 && errno == EBADF);
+    CHECK(defaults ? fcntl(ordinary, F_GETFD) == -1 : fcntl(ordinary, F_GETFD) == 0);
+}
+
+static void snapshotDropsCloseOnExecKqueue(void) { snapshotDropsKqueueVariant(false); }
+static void snapshotDropsDefaultKqueue(void) { snapshotDropsKqueueVariant(true); }
+
+static void snapshotKeepsActionInputs(void) {
+    int channel[2], inherited = open("/dev/null", O_RDONLY), directory = open("/private", O_RDONLY | O_DIRECTORY);
+    CHECK(!pipe(channel) && inherited >= 0 && directory >= 0);
+    CHECK(write(channel[1], "s", 1) == 1);
+    CHECK(!fcntl(channel[0], F_SETFD, FD_CLOEXEC) && !fcntl(inherited, F_SETFD, FD_CLOEXEC) && !fcntl(directory, F_SETFD, FD_CLOEXEC));
+    LSBSpawnPlan *plan = newPlan();
+    plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    plan->actionCount = 4;
+    plan->actions[0] = (LSBFileAction){.kind = LSB_ACTION_DUP2, .fd = channel[0], .target = 60};
+    plan->actions[1] = (LSBFileAction){.kind = LSB_ACTION_INHERIT, .fd = inherited};
+    plan->actions[2] = (LSBFileAction){.kind = LSB_ACTION_FCHDIR, .fd = directory};
+    plan->actions[3] = (LSBFileAction){.kind = LSB_ACTION_CLOSE, .fd = directory};
+    int received[LSB_MAX_FDS];
+    emptyFDs(received);
+    CHECK(snapshotFDs(plan, received) == 0 && plan->actionCount == 4);
+    const int inputs[] = {channel[0], inherited, directory};
+    for (unsigned i = 0; i < sizeof(inputs) / sizeof(inputs[0]); ++i) {
+        int index = snapshotIndex(plan, inputs[i]);
+        CHECK(index >= 0 && plan->fds[index].flags == FD_CLOEXEC);
+        mach_port_t port;
+        CHECK(!fileport_makeport(received[index], &port));
+        CHECK(mach_port_deallocate(mach_task_self(), port) == KERN_SUCCESS);
+    }
+    CHECK(LSBApplySpawnPlan(plan, received) == 0);
+    char byte, cwd[PATH_MAX];
+    CHECK(read(60, &byte, 1) == 1 && byte == 's');
+    CHECK(fcntl(channel[0], F_GETFD) == -1 && fcntl(directory, F_GETFD) == -1);
+    CHECK(fcntl(inherited, F_GETFD) == 0 && getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, "/private"));
+}
+
+static void snapshotOrderedReplacements(void) {
+    int channel[2], overwritten = kqueue(), closed = kqueue();
+    CHECK(!pipe(channel) && overwritten >= 0 && closed >= 0 && overwritten != 60 && closed != 60);
+    CHECK(write(channel[1], "r", 1) == 1);
+    CHECK(!fcntl(channel[0], F_SETFD, FD_CLOEXEC) && !fcntl(overwritten, F_SETFD, FD_CLOEXEC) && !fcntl(closed, F_SETFD, FD_CLOEXEC));
+    LSBSpawnPlan *plan = newPlan();
+    plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    uint32_t nullPath;
+    CHECK(LSBPlanAddString(plan, "/dev/null", &nullPath) == 0);
+    plan->actionCount = 5;
+    plan->actions[0] = (LSBFileAction){.kind = LSB_ACTION_DUP2, .fd = channel[0], .target = overwritten};
+    plan->actions[1] = (LSBFileAction){.kind = LSB_ACTION_DUP2, .fd = overwritten, .target = 60};
+    plan->actions[2] = (LSBFileAction){.kind = LSB_ACTION_CLOSE, .fd = closed};
+    plan->actions[3] = (LSBFileAction){.kind = LSB_ACTION_OPEN, .fd = closed, .flags = O_RDONLY, .path = nullPath};
+    plan->actions[4] = (LSBFileAction){.kind = LSB_ACTION_INHERIT, .fd = closed};
+    int received[LSB_MAX_FDS];
+    emptyFDs(received);
+    CHECK(snapshotFDs(plan, received) == 0 && plan->actionCount == 4);
+    CHECK(snapshotIndex(plan, channel[0]) >= 0 && snapshotIndex(plan, overwritten) == -1 && snapshotIndex(plan, closed) == -1);
+    CHECK(LSBApplySpawnPlan(plan, received) == 0);
+    char byte;
+    CHECK(read(60, &byte, 1) == 1 && byte == 'r');
+    CHECK(fcntl(overwritten, F_GETFD) == 0 && fcntl(closed, F_GETFD) == 0 && read(closed, &byte, 1) == 0);
+}
+
+static void snapshotPreservesActionErrors(void) {
+    const unsigned afterClose[] = {LSB_ACTION_CLOSE, LSB_ACTION_DUP2, LSB_ACTION_INHERIT, LSB_ACTION_FCHDIR};
+    for (unsigned i = 0; i < sizeof(afterClose) / sizeof(afterClose[0]); ++i) {
+        int queue = kqueue();
+        CHECK(queue >= 0 && !fcntl(queue, F_SETFD, FD_CLOEXEC));
+        LSBSpawnPlan *plan = newPlan();
+        plan->actionCount = 2;
+        plan->actions[0] = (LSBFileAction){.kind = LSB_ACTION_CLOSE, .fd = queue};
+        plan->actions[1] = (LSBFileAction){.kind = afterClose[i], .fd = queue, .target = 60};
+        int received[LSB_MAX_FDS];
+        emptyFDs(received);
+        CHECK(snapshotFDs(plan, received) == 0 && plan->actionCount == 1);
+        CHECK(snapshotIndex(plan, queue) == -1);
+        CHECK(LSBApplySpawnPlan(plan, received) == EBADF);
+        free(plan);
+    }
+}
+
 static void preservedInternalDescriptor(void) {
     LSBSpawnPlan *plan = newPlan();
     plan->spawnFlags = POSIX_SPAWN_CLOEXEC_DEFAULT;
@@ -254,6 +356,82 @@ static void defaultProcessGroup(void) {
     int received[LSB_MAX_FDS];
     emptyFDs(received);
     CHECK(LSBApplySpawnPlan(plan, received) == 0 && getpgrp() == original);
+}
+
+static void schedulerHints(void) {
+    LSBSpawnPlan *plan = newPlan();
+    LSBAdditionalSpawnAttributes additional;
+    posix_spawnattr_t attributes;
+    assert(!posix_spawnattr_init(&attributes));
+    // The exact widget launch seen on iOS 26: CLOEXEC_DEFAULT, SETSIGDEF, SETSIGMASK, APP_DEFAULT, UI_FOCAL.
+    short flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+    assert(flags == 0x400c && !posix_spawnattr_setflags(&attributes, flags));
+    sigset_t mask = 0, defaults = 0;
+    assert(!sigaddset(&mask, SIGUSR1) && !sigaddset(&defaults, SIGTERM));
+    assert(!posix_spawnattr_setsigmask(&attributes, &mask) && !posix_spawnattr_setsigdefault(&attributes, &defaults));
+    static const struct { uint32_t type, role; int error; } cases[] = {
+        {0, 0, 0}, {0x600, 0, 0}, {0x100, 0, 0}, {0x100, 1, 0},
+        {0, 1, ENOTSUP}, {0x600, 1, ENOTSUP}, {0x100, 2, ENOTSUP}, {0x100, 7, ENOTSUP},
+        {0x101, 1, ENOTSUP}, {0x200, 0, ENOTSUP}, {0x300, 0, ENOTSUP}, {0x700, 0, ENOTSUP}, {UINT32_MAX, 0, ENOTSUP}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        memcpy((char *)attributes + 0x24, &cases[i].type, sizeof(cases[i].type));
+        memcpy((char *)attributes + 0x58, &cases[i].role, sizeof(cases[i].role));
+        assert(readAttributes(plan, &attributes, &additional) == cases[i].error);
+        if (!cases[i].error) {
+            assert(plan->spawnFlags == (uint16_t)flags && plan->signalMask == mask && plan->signalDefault == defaults);
+            assert(additional.processType == cases[i].type && additional.darwinRole == cases[i].role);
+        }
+    }
+    uint32_t type = 0x100, role = 1;
+    memcpy((char *)attributes + 0x24, &type, sizeof(type));
+    memcpy((char *)attributes + 0x58, &role, sizeof(role));
+    assert(!posix_spawnattr_setflags(&attributes, flags | POSIX_SPAWN_START_SUSPENDED));
+    assert(readAttributes(plan, &attributes, &additional) == ENOTSUP);
+    assert(!posix_spawnattr_destroy(&attributes));
+    free(plan);
+}
+
+static void allocatorHintAndInheritedAppRole(void) {
+    LSBSpawnPlan *plan = newPlan();
+    LSBAdditionalSpawnAttributes additional;
+    posix_spawnattr_t attributes;
+    assert(!posix_spawnattr_init(&attributes));
+    assert(POSIX_SPAWN_SETSID == 0x0400 && NativeSpawnNanoAllocator == 0x0200);
+    static const struct { short flags; uint32_t type, role; int error; } cases[] = {
+        {0x0200, 0, 0, 0}, {0x420c, 0x100, 1, 0}, {0x4240, 0, 1, 0},
+        {0x4200, 0, 1, ENOTSUP}, {0x4240, 0x600, 1, ENOTSUP}, {0x4240, 0, 2, ENOTSUP},
+        {0x4440, 0, 1, ENOTSUP}, {0x42c0, 0, 1, ENOTSUP}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        assert(!posix_spawnattr_setflags(&attributes, cases[i].flags));
+        memcpy((char *)attributes + 0x24, &cases[i].type, sizeof(cases[i].type));
+        memcpy((char *)attributes + 0x58, &cases[i].role, sizeof(cases[i].role));
+        assert(readAttributes(plan, &attributes, &additional) == cases[i].error);
+        if (!cases[i].error) assert(plan->spawnFlags == ((uint16_t)cases[i].flags & ~NativeSpawnNanoAllocator));
+    }
+    // The exact Contacts/WidgetRenderer xpcproxy request reaches exec transport with only CLOEXEC_DEFAULT left.
+    assert(!posix_spawnattr_setflags(&attributes, 0x4240));
+    uint32_t type = 0, role = 1;
+    memcpy((char *)attributes + 0x24, &type, sizeof(type));
+    memcpy((char *)attributes + 0x58, &role, sizeof(role));
+    uint32_t options = 4, datalessPolicy = 6;
+    memcpy((char *)attributes + 0x80, &options, sizeof(options));
+    memcpy((char *)attributes + 0x98, &datalessPolicy, sizeof(datalessPolicy));
+    pid_t session = 0, group = 0, afterSession = 0, afterGroup = 0;
+    int sessionError = LSBProcessSessionSnapshot(&session, &group);
+    pid_t nativeSession = getsid(0), nativeGroup = getpgrp(), pid = 123;
+    unsigned calls = execCalls;
+    char *argv[] = {"tool", NULL}, *environment[] = {NULL};
+    transportFailure = EACCES;
+    errno = EDOM;
+    assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, &attributes, argv, environment) == EACCES && errno == EDOM && pid == 123);
+    assert(execCalls == calls + 1 && capturedSpawnFlags == POSIX_SPAWN_CLOEXEC_DEFAULT);
+    assert(LSBProcessSessionSnapshot(&afterSession, &afterGroup) == sessionError);
+    assert(session == afterSession && group == afterGroup && getsid(0) == nativeSession && getpgrp() == nativeGroup);
+    transportFailure = 0;
+    assert(!posix_spawnattr_destroy(&attributes));
+    free(plan);
 }
 
 static void shimSerialization(void) {
@@ -347,7 +525,9 @@ static void portInheritanceAndExecFailure(void) {
 static void execNeverReturns(void) {
     posix_spawnattr_t attributes;
     CHECK(!posix_spawnattr_init(&attributes));
-    CHECK(!posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC));
+    CHECK(!posix_spawnattr_setflags(&attributes, 0x4240));
+    uint32_t role = 1;
+    memcpy((char *)attributes + 0x58, &role, sizeof(role));
     char *argv[] = {"tool", NULL}, *environment[] = {NULL};
     (void)LSBPosixSpawn(NULL, "/bin/tool", NULL, &attributes, argv, environment);
     _exit(99);
@@ -443,14 +623,25 @@ static void simulatedSessionRejectsProcessGroup(void) {
 }
 
 int main(void) {
-    if (getenv("LSB_TEST_SESSION_GROUP")) { simulatedSessionRejectsProcessGroup(); return 0; }
+    if (getenv("LSB_TEST_SESSION_GROUP")) {
+        simulatedSessionRejectsProcessGroup();
+        runChild(allocatorHintAndInheritedAppRole, "allocator hint and inherited app role preserve logical sessions");
+        return 0;
+    }
     validation();
     runChild(cyclesAndOrdering, "descriptor cycles and ordered actions");
     runChild(normalCloseOnExec, "close-on-exec");
     runChild(defaultCloseOnExec, "close-on-exec default");
+    runChild(snapshotDropsCloseOnExecKqueue, "CLOEXEC kqueue is omitted before fileport transfer");
+    runChild(snapshotDropsDefaultKqueue, "CLOEXEC_DEFAULT omits unreferenced kqueue and ordinary descriptors");
+    runChild(snapshotKeepsActionInputs, "CLOEXEC dup2, inherit and fchdir inputs survive ordered replay");
+    runChild(snapshotOrderedReplacements, "replacement and close actions do not export obsolete kqueue values");
+    runChild(snapshotPreservesActionErrors, "elided initial close preserves later invalid descriptor errors");
     runChild(preservedInternalDescriptor, "internal wake descriptor survives and is not inherited");
     runChild(attributesAndFailure, "signal attributes and action errors");
     runChild(defaultProcessGroup, "default extension process group");
+    runChild(schedulerHints, "recognized app scheduler hints preserve signal attributes and reject unsupported policies");
+    runChild(allocatorHintAndInheritedAppRole, "allocator hint and inherited app role reach exec transport without changing sessions");
     strcpy(workingDirectory, "/tmp/LiveSimBooter-spawn-tests.XXXXXX");
     assert(mkdtemp(workingDirectory));
     char resolved[LSB_PATH_BYTES];

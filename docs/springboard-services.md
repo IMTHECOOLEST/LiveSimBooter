@@ -1,10 +1,10 @@
 # Services toward SpringBoard
 
-This note records the service-selection evidence and the staged experiment after the working backboardd display/input
-path. The latest trial shows the [first visible SpringBoard interface](#first-visible-springboard-interface), with an empty
-home screen; it does not establish a sufficient minimum service set or a fully functional system. The additional services
-below must be evaluated through their actual startup, service replies and failure traces; a generated job plist is not
-evidence that its daemon works.
+This note records the service-selection evidence after the working backboardd display/input path. The latest verified
+display trial shows [SpringBoard with application icon artwork](#public-graphics-services-and-icon-rendering-verified-2026-10-26).
+The subsequent [app-launch investigation](#app-launch-investigation-2026-10-26) has identified further spawn boundaries;
+it has not yet verified a stock application launch. Each service still requires actual startup, replies and failure traces;
+a generated job plist does not establish that its daemon works or that the selected set is sufficient for a complete system.
 
 ## Pinned simslim evidence
 
@@ -106,9 +106,11 @@ Thus this mode tests selected daemon startup and ordinary service handling; it d
 
 Disabling `KeepAlive` avoids unconditional restarts, but requests to a declared Mach service can still relaunch a failed
 daemon. The stock `containermanagerd` agent uses proxy modes for bundle and system containers; its separate system partner
-is now included, but their presence alone does not establish successful container operations. Each parent retains 16
-logical-child slots, so this mode accepts at most 14 selected jobs in addition to backboardd and cfprefsd. The broker permits 34 physical jobs: the 16 children and their queued exec replacements, plus simulator launchd
-and the native Metal helper. Demand-launched children still consume the same parent ledger.
+is now included, but their presence alone does not establish successful container operations. Each parent retains 64
+logical-child slots. This mode still accepts at most 14 selected jobs in addition to backboardd and cfprefsd, leaving room
+for applications, compiler services and adopted children. The broker permits 132 physical jobs: the 64 children and their
+queued exec replacements, plus simulator launchd and the backboardd, SpringBoard and public Metal helpers. Demand-launched
+children consume the same parent ledger; unreaped exits and pinned observations also occupy slots.
 
 Host graphics endpoint registration now shares one **30-second monotonic deadline** across the Indigo, IOSurface,
 framebuffer and two Metal registrations. The larger initial xpcproxy batch can occupy launchd_sim long enough that the
@@ -225,8 +227,9 @@ instance. The initial libnotify lines in the probe log are retained output from 
 
 The earlier checkpoint, committed as `614737c` (`Start simulator core services and verify notification delivery`),
 enforced the 14-selected-job boundary and allowed the 34 physical jobs needed during a
-full set of exec replacements. Local boundary tests cover rejection before any configuration files change and queuing
-all 16 replacements. The phone was left using the production shim and the seven surviving additional daemons, with
+full set of exec replacements. Current local boundary tests preserve the 14-selected-job limit and cover all 64
+replacement overlaps plus the three native Metal helpers. At that checkpoint the phone was left using the production shim
+and the seven surviving additional daemons, with
 LaunchServices omitted to avoid demand-driven abort/restart cycles:
 
 ```text
@@ -1063,3 +1066,111 @@ passed again afterward, and the final signed native build succeeded. Public-cont
 Native IOSurface tests exercised three processes, shared pixels, connection capacity recovery, and shutdown.
 Both app and extension retain the increased-memory-limit entitlement. Five signed CoreImage bundles and the updated guest shim
 were copied over Wi-Fi without post-copy checksums.
+
+## App-launch investigation (2026-10-26)
+
+After the public-graphics/icon changes were committed as `b876905`, the next trial requested Contacts
+(`com.apple.MobileAddressBook`) through `LSApplicationWorkspace`. Its outer error was
+`LSApplicationWorkspaceErrorDomain` **115**. An lsd-scoped diagnostic preserved the original FrontBoard completion result
+and exposed the underlying chain: `FBSOpenApplicationServiceErrorDomain` 1 → `FBProcessExit` 64 →
+`RBSRequestErrorDomain` 5 → `NSPOSIXErrorDomain` **45**, **"Launchd job spawn failed"**. This establishes a spawn failure;
+the outer request-denied wording alone did not establish an entitlement or process-identity rejection.
+See [the original error chain](../tmp/app-launch-fix/original-fbs-error-1.txt).
+
+### Dynamic child capacity
+
+LLDB observed launchd's new control jobs returning **`EAGAIN` (`0x23`)** after compiler jobs and adopted children had filled
+the old 16-slot parent ledger. A new child needs a free, unpinned slot; an exec replacement retains its existing logical
+slot. Reducing the selected startup jobs cannot guarantee space for later applications and their demand-launched services.
+The attribute snapshots are in [the LLDB request log](../tmp/app-launch-fix/lldb-spawn-requests.jsonl).
+
+The shared ledger is now **ABI 4**, with **64 slots** and a **2,080-byte** structure inside the unchanged **4 KiB** mapping.
+Old ABI/capacity combinations are rejected before slot access. Host, LiveProcess and guest shim must be deployed together;
+changing a header does not expand a running process's already initialized ledger. The initial service-selection limit
+remains **14 selected jobs plus backboardd and cfprefsd**. The broker's physical-job limit is **132**: 64 children with room
+for simultaneous exec replacements, simulator launchd, and three native Metal helpers. Unreaped statuses and observations
+that pin a slot still consume capacity. This increase supplies headroom; it does not remove resource limits.
+
+The boundary regressions cover the highest slot, exec replacement, exit/wait ownership, stale generations, reuse and
+cross-process mapping, plus a full broker with all three helpers. See
+[the integrated validation record](../tmp/app-launch-fix/integrated-tests.txt) and
+[the broker boundary run](../tmp/app-launch-fix/child-capacity-tests/Broker-all-helpers.log).
+
+### Stock application spawn attributes
+
+Two stages of the stock launch path use different attributes. Launchd creates `xpcproxy_sim`; the proxy then requests
+`POSIX_SPAWN_SETEXEC` for the application itself. The compatibility checks now handle these observed forms:
+
+| Request | Observed fields | Handling |
+| --- | --- | --- |
+| Launchd app trampoline | Flags `0x400c`, process type `APP_DEFAULT` (`0x100`), role `UI_FOCAL` (`1`) | Accept the app scheduler hints while retaining LiveProcess's native scheduler policy. |
+| xpcproxy app replacement | Flags `0x4240`, process type `0`, role `1` | Accept the inherited focal role only with SETEXEC; ordinary type-0/role-1 spawn still rejects. |
+| Nano allocator preference | Flag `0x0200` in `0x4240` | Consume the optional hint before transport; allocator defaults or explicit environment settings remain in effect. |
+| Dataless-file policy | Options at `0x80` equal `4`, policy at `0x98` equal `5` or `6` | Accept only the stock OFF/ON pairs for the fully materialized local RuntimeRoot; do not change native FileProvider policy. |
+
+`0x0200` is **`_POSIX_SPAWN_NANO_ALLOCATOR`**, not SETSID; real `POSIX_SPAWN_SETSID` is `0x0400` and remains unsupported
+as a spawn attribute. XNU uses the nano flag to append `nanozone=1` to the executable's apple vector. The current
+compatibility path does not synthesize that allocator preference. See the pinned
+[spawn flags](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/spawn.h#L53-L59) and
+[nano handling](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_exec.c#L5987-L5999).
+
+The iOS 26 libkernel dataless setter adds the `ORIG` marker (`4`) to its input, producing `5` for OFF and `6` for ON.
+`xpcproxy_sim` uses precisely those two inputs. The implementation checks both fields together and continues rejecting
+other option bits, malformed pairs, adjacent resource-limit fields and `START_SUSPENDED`. It does not implement cloud
+placeholder materialization. The pinned code is recorded in
+[xpcproxy disassembly](../tmp/app-launch-fix/xpcproxy-disassembly-current.txt) and
+[host-support libkernel disassembly](../tmp/lsd-services/host-kernel-csops-disassembly.txt); the
+[source field layout](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/spawn_internal.h#L221-L227)
+names the option and policy fields.
+
+These changes were driven by real Contacts and WidgetRenderer requests. Their earlier nano rejection is preserved in
+[the collected spawn log](../tmp/app-launch-fix/spawn-files-current.txt), and the subsequent options-field rejection is in
+[the device dataless-policy log](../tmp/app-launch-fix/dataless-rejection-device.log). Regression tests exercise the exact
+`0x4240`/type-0/role-1 request with options `4` and dataless policy `6`: it reaches exec transport carrying only
+`CLOEXEC_DEFAULT` (`0x4000`), preserves errno on transport failure, and does not alter native or logical session/group IDs.
+Unknown policies still return `ENOTSUP`.
+
+### Physical executable aliases at the native handoff
+
+After the attribute fixes, WidgetRenderer's xpcproxy reached the broker's exec RPC. Its replacement extension checked in,
+then failed native preparation with **`ENOENT` (2)** before READY. The requested executable began with `/var/mobile/...`,
+while the broker's canonical RuntimeRoot began with `/private/var/mobile/...`. `LiveProcess/main.c` previously recognized
+physical executables by a literal prefix comparison and prepended RuntimeRoot to the alias, producing a nonexistent
+`RuntimeRoot/var/mobile/.../RuntimeRoot/Applications/...` path. See the replacement requests in
+[the host console](../tmp/app-launch-fix/console-capacity-ui.log).
+
+Read-only checks on the phone confirm that each pair identifies the same file: WidgetRenderer is **87,568 bytes**,
+inode **5,992,372**; Contacts is **212,064 bytes**, inode **5,949,300**. Both incorrectly prefixed candidates return `ENOENT`.
+The full path/stat evidence is saved in [the device check](../tmp/app-launch-fix/executable-path-device.json).
+
+The extracted native resolver now canonicalizes a physical path first and accepts it only when it is below RuntimeRoot.
+Otherwise it translates guest absolute paths, or resolves relative paths after the ordered working-directory actions.
+Final containment remains mandatory, and an explicit canonical RuntimeRoot path that escapes through a symlink is rejected
+instead of being reinterpreted. Tests reproduce the prefix mismatch using macOS's `/tmp` → `/private/tmp` alias and cover
+contained aliases, ordinary guest paths, relative paths, missing files, length limits and symlink escapes. The focused
+[resolver test](../tmp/app-launch-fix/executable-path-tests/result.log) and iPhoneOS syntax check passed. This fix requires
+a rebuilt native LiveProcess extension; replacing only the guest shim does not change the resolver.
+
+### Diagnostics, control and validation boundary
+
+Stock launchd replaces its standard descriptors with `/dev/null`, so absence of stderr traces did not prove rejection
+before the spawn shim. `LSB_TRANSPORT_TRACE` now writes bounded error-only records to stderr and to
+`SIMULATOR_LOG_ROOT/spawn-rejections.<pid>.log`, preserving errno. Each source emits at most 32 errors per process;
+the file is created mode `0600` with `O_NOFOLLOW`. The logging tests also run with stderr redirected to `/dev/null`.
+
+The [guest launchctl worker](guest-control.md) permits further job inspection and control without restarting the whole
+runtime. Its queue claims complete requests atomically, preserves uncertain operations for inspection, and retrieves by
+the original request ID without resubmission. A completed historical result remains retrievable while another request
+is active, without releasing that request's lock. The worker's 60-second timeout and five-second kill/reap grace period
+use full monotonic timestamps. A successful `kickstart` command or zero launchctl exit status establishes acceptance of
+that control operation; it does not establish that an old daemon was killed, a new daemon started, or an application window
+appeared. Those outcomes need separate process and display evidence.
+
+The [full integrated suite](../tmp/app-launch-fix/integrated-tests-full.log) passed after the ABI/capacity and initial
+app-hint changes. Subsequent nano/dataless changes passed both normal and trace-enabled SpawnPlan/SpawnAttributes runs,
+including logical-session mode; see `tmp/app-launch-fix/nano-exec-tests`, `nano-exec-trace-tests`,
+`dataless-policy-tests` and `dataless-policy-trace-tests`. The control worker's native tests and five local Python queue
+tests passed, and its simulator build succeeded; logs are under `tmp/app-launch-fix/control-review`.
+These local results verify the implemented compatibility boundaries. Subsequent fixes to FrontBoard reconnection, UIKit
+resources/device capabilities and cache-only framework loading now open a visible Contacts window on the iPhone; see
+[the app launch results](launchd.md#cache-only-framework-weak-linking).

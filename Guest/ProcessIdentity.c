@@ -20,10 +20,14 @@ static char nativeNotifydPath[PATH_MAX];
 static char nativeBaseBoardPath[PATH_MAX];
 static char nativeRunningBoardServicesPath[PATH_MAX];
 static char nativeFrontBoardPath[PATH_MAX];
+static char nativeUIKitCorePath[PATH_MAX];
+static char nativeFrontBoardServicesPath[PATH_MAX];
 static const char baseBoardInstallPath[] = "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
 static const char runningBoardServicesInstallPath[] =
     "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
 static const char frontBoardInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard";
+static const char uiKitCoreInstallPath[] = "/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore";
+static const char frontBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices";
 
 static void configureNativeImagePath(char path[PATH_MAX], const char *suffix) {
     path[0] = '\0';
@@ -70,7 +74,13 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
         (nativeRunningBoardServicesPath[0] && !strcmp(path, nativeRunningBoardServicesPath));
     // FrontBoard keys its workspace/process dictionaries with RBS native handles and permits repeated registration only for native self.
     bool frontBoard = !strcmp(path, frontBoardInstallPath) || (nativeFrontBoardPath[0] && !strcmp(path, nativeFrontBoardPath));
-    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard) return;
+    // iOS 26 23A343 UIKitCore +0x115ea68 feeds getpid directly into an RBSTarget visibility assertion; its background assertions do likewise.
+    bool uiKitCore = !strcmp(path, uiKitCoreInstallPath) || (nativeUIKitCorePath[0] && !strcmp(path, nativeUIKitCorePath));
+    // Matching FrontBoardServices +0x54d74 compares native audit PID with getpid; +0x71900 publishes the scene host PID.
+    // See docs/springboard-services.md and the pinned disassembly analysis in tmp/app-launch-fix/routine712-runningboard-pid-source.md.
+    bool frontBoardServices = !strcmp(path, frontBoardServicesInstallPath) ||
+        (nativeFrontBoardServicesPath[0] && !strcmp(path, nativeFrontBoardServicesPath));
+    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard && !uiKitCore && !frontBoardServices) return;
     const struct mach_header_64 *header = (const struct mach_header_64 *)image;
     const unsigned char *command = (const unsigned char *)(header + 1), *end = command + header->sizeofcmds;
     forgetNativeIdentityImage(image);
@@ -142,6 +152,8 @@ __attribute__((constructor)) static void initializeIdentity(void) {
     configureNativeImagePath(nativeBaseBoardPath, baseBoardInstallPath);
     configureNativeImagePath(nativeRunningBoardServicesPath, runningBoardServicesInstallPath);
     configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
+    configureNativeImagePath(nativeUIKitCorePath, uiKitCoreInstallPath);
+    configureNativeImagePath(nativeFrontBoardServicesPath, frontBoardServicesInstallPath);
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);
@@ -169,6 +181,8 @@ __attribute__((noinline)) pid_t LSBGetPID(void) {
 kern_return_t LSBTaskNameForPID(mach_port_name_t target, int pid, mach_port_name_t *task) {
 #ifdef LSB_GUEST_RUNTIME
     uintptr_t caller = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+    kern_return_t childResult;
+    if (LSBLaunchdProcessTaskName(caller, target, pid, task, &childResult)) return childResult;
 #endif
     if (target == mach_task_self() && pid > 0 && pid == LSBGuestPID()) pid = LSBNativePID();
     kern_return_t result = task_name_for_pid(target, pid, task);
@@ -188,7 +202,7 @@ pid_t LSBGuestParentPID(void) {
 }
 
 #ifndef LSB_PROCESS_IDENTITY_TESTING
-// libxpc, BaseBoard, RunningBoardServices and FrontBoard use kernel identities. Opted-in notifyd publishes its native PID to sibling PROC watches.
+// libxpc and the scoped UI/process frameworks use kernel identities. Opted-in notifyd publishes its native PID to sibling PROC watches.
 // Only direct calls from those images retain native identity; other guest code sees the stable logical PID.
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } interpositions[] = {
     {(const void *)&LSBGetPID, (const void *)&getpid},

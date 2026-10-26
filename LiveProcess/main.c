@@ -3,6 +3,7 @@
 #include "PrivateXPC.h"
 #include "ChildStatus.h"
 #include "NativeProbeLoader.h"
+#include "ExecutablePath.h"
 #include "../NativeMetal/Backend.h"
 #include <errno.h>
 #include <dlfcn.h>
@@ -54,21 +55,7 @@ static int prepareStatus(void) {
 }
 
 static int resolveExecutable(char output[PATH_MAX]) {
-    const char *path = launch.plan.strings + launch.plan.path;
-    size_t rootLength = strlen(launch.runtimeRoot);
-    char candidate[PATH_MAX];
-    int size;
-    if (!strncmp(path, launch.runtimeRoot, rootLength) && path[rootLength] == '/') size = snprintf(candidate, sizeof(candidate), "%s", path);
-    else if (path[0] == '/') size = snprintf(candidate, sizeof(candidate), "%s%s", launch.runtimeRoot, path);
-    else {
-        char cwd[PATH_MAX];
-        if (!getcwd(cwd, sizeof(cwd))) return errno;
-        size = snprintf(candidate, sizeof(candidate), "%s/%s", cwd, path);
-    }
-    if (size < 0 || (size_t)size >= sizeof(candidate)) return ENAMETOOLONG;
-    if (!realpath(candidate, output)) return errno;
-    if (strncmp(output, launch.runtimeRoot, rootLength) || output[rootLength] != '/') return EACCES;
-    return 0;
+    return LSBResolveGuestExecutable(launch.runtimeRoot, launch.plan.strings + launch.plan.path, output);
 }
 
 static int runNativeProbe(int error) {
@@ -154,6 +141,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     if (launch.executionRole == LSB_EXECUTION_NATIVE_METAL_PROBE) return runNativeProbe(error);
     if (launch.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE) return runNativeMetalService(error, planApplied);
     char executablePath[PATH_MAX], dyldPath[PATH_MAX], insertLibrary[PATH_MAX + 32], brokerEnvironment[64], detail[1024] = {0};
+    char capabilitiesEnvironment[PATH_MAX + sizeof("SIMULATOR_CAPABILITIES=")];
     char statusEnvironment[64], wakeEnvironment[64];
     char guestPIDEnvironment[48], parentPIDEnvironment[48];
     char workqueueStartEnvironment[80], workqueueFeaturesEnvironment[80];
@@ -163,6 +151,9 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     if (!error && (length < 0 || (size_t)length >= sizeof(dyldPath))) error = ENAMETOOLONG;
     length = snprintf(insertLibrary, sizeof(insertLibrary), "DYLD_INSERT_LIBRARIES=%s/usr/lib/libLiveSimSpawn.dylib", launch.runtimeRoot);
     if (!error && (length < 0 || (size_t)length >= sizeof(insertLibrary))) error = ENAMETOOLONG;
+    length = snprintf(capabilitiesEnvironment, sizeof(capabilitiesEnvironment),
+                      "SIMULATOR_CAPABILITIES=%s/Library/Developer/CoreSimulator/DeviceType/capabilities.plist", launch.runtimeRoot);
+    if (!error && (length < 0 || (size_t)length >= sizeof(capabilitiesEnvironment))) error = ENAMETOOLONG;
     if (!error && !LSBMapDyldSim(dyldPath, &loader, detail, sizeof(detail))) error = ENOEXEC;
     if (!error && !LSBMapSimExecutable(executablePath, &executable, detail, sizeof(detail))) error = ENOEXEC;
     // Keep only a kernel send right across detachment; simulator libxpc cannot look up services without simulator launchd.
@@ -214,7 +205,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         closeStatus();
         fprintf(stderr, "[LiveProcess] Native worker appeared before handoff: %s\n", strerror(error)); return 1;
     }
-    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 10];
+    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 12];
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
@@ -228,6 +219,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         }
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
             strncmp(entry, "RB_USE_BINARY_ARCHIVE=", sizeof("RB_USE_BINARY_ARCHIVE=") - 1) &&
+            strncmp(entry, "LSB_SIMULATE_FRAMEWORK_BUNDLES=", sizeof("LSB_SIMULATE_FRAMEWORK_BUNDLES=") - 1) &&
+            strncmp(entry, "SIMULATOR_CAPABILITIES=", sizeof("SIMULATOR_CAPABILITIES=") - 1) &&
             strncmp(entry, "LSB_GUEST_PID=", sizeof("LSB_GUEST_PID=") - 1) &&
             strncmp(entry, "LSB_GUEST_PPID=", sizeof("LSB_GUEST_PPID=") - 1) &&
             strncmp(entry, "LSB_HOST_WORKQUEUE_START=", sizeof("LSB_HOST_WORKQUEUE_START=") - 1) &&
@@ -238,6 +231,10 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     // RenderBox binary archives require targetDeviceArchitecture, which stock MTLSimDevice does not implement.
     // Apply to every guest, including spawned apps with a replacement environment; native Metal helpers return above.
     environment[count++] = "RB_USE_BINARY_ARCHIVE=0";
+    // Cached install paths must resolve resources inside RuntimeRoot, including apps that supply a replacement environment.
+    environment[count++] = "LSB_SIMULATE_FRAMEWORK_BUNDLES=1";
+    // MobileGestalt reads this profile directly. A missing optional profile must not prevent command-line guests from starting.
+    environment[count++] = capabilitiesEnvironment;
     environment[count++] = insertLibrary;
     environment[count++] = brokerEnvironment;
     environment[count++] = statusEnvironment;

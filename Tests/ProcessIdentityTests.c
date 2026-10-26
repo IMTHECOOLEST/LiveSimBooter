@@ -2,6 +2,7 @@
 static kern_return_t testTaskNameForPID(mach_port_name_t target, int pid, mach_port_name_t *task);
 #define task_name_for_pid testTaskNameForPID
 #define LSB_PROCESS_IDENTITY_TESTING
+#define LSB_GUEST_RUNTIME
 #include "../Guest/ProcessIdentity.c"
 #undef task_name_for_pid
 #include "../Guest/ChildKill.h"
@@ -18,6 +19,19 @@ static unsigned taskNameCalls;
 static mach_port_name_t observedTaskTarget, *observedTaskOutput;
 static int observedTaskPID;
 static kern_return_t taskNameResult;
+static bool launchdOverride;
+static kern_return_t launchdResult;
+bool LSBLaunchdProcessTaskName(uintptr_t caller, mach_port_name_t target, int pid, mach_port_name_t *task, kern_return_t *result) {
+    (void)caller; (void)target; (void)pid;
+    if (!launchdOverride) return false;
+    *result = launchdResult;
+    if (task && launchdResult == KERN_SUCCESS) *task = 0x4321;
+    return true;
+}
+kern_return_t LSBPeerProcessTaskName(uintptr_t caller, mach_port_name_t target, int pid, mach_port_name_t *task, kern_return_t result) {
+    (void)caller; (void)target; (void)pid; (void)task;
+    return result;
+}
 static kern_return_t testTaskNameForPID(mach_port_name_t target, int pid, mach_port_name_t *task) {
     ++taskNameCalls;
     observedTaskTarget = target;
@@ -42,6 +56,15 @@ static void testTaskNameSelfTranslation(void) {
     assert(LSBTaskNameForPID(self, 123, &task) == KERN_FAILURE && task == 0x5678 && observedTaskPID == LSBNativePID());
     taskNameResult = KERN_INVALID_ARGUMENT;
     assert(LSBTaskNameForPID(self, 123, NULL) == KERN_INVALID_ARGUMENT && !observedTaskOutput && taskNameCalls == 8);
+    unsigned before = taskNameCalls;
+    launchdOverride = true;
+    launchdResult = KERN_SUCCESS;
+    taskNameResult = KERN_SUCCESS; // A reused logical PID could resolve natively, but the launchd override must run first.
+    assert(LSBTaskNameForPID(self, 789, &task) == KERN_SUCCESS && task == 0x4321 && taskNameCalls == before);
+    launchdResult = KERN_FAILURE;
+    task = 0x5678;
+    assert(LSBTaskNameForPID(self, 789, &task) == KERN_FAILURE && task == 0x5678 && taskNameCalls == before);
+    launchdOverride = false;
 }
 
 static void testNativeCallerRanges(void) {
@@ -263,6 +286,66 @@ static void testFrontBoardCallerIdentity(void) {
     configureNativeImagePath(nativeFrontBoardPath, frontBoardInstallPath);
 }
 
+static void testUIFrameworkCallerIdentity(void) {
+    struct { struct mach_header_64 header; struct segment_command_64 text, data; } image = {0};
+    image.header = (struct mach_header_64){.magic = MH_MAGIC_64, .ncmds = 2, .sizeofcmds = sizeof(image.text) + sizeof(image.data)};
+    image.text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(image.text), .vmaddr = 0x1000,
+                                           .vmsize = 0x100, .initprot = VM_PROT_READ | VM_PROT_EXECUTE};
+    image.data = image.text;
+    image.data.vmaddr = 0x2000;
+    image.data.initprot = VM_PROT_READ | VM_PROT_WRITE;
+    const struct mach_header *header = (const struct mach_header *)&image;
+    const struct { const char *name, *install; char *configured; } frameworks[] = {
+        {"UIKitCore", uiKitCoreInstallPath, nativeUIKitCorePath},
+        {"FrontBoardServices", frontBoardServicesInstallPath, nativeFrontBoardServicesPath}
+    };
+    const char *root = "/private/var/mobile/Group/RuntimeRoot";
+    for (unsigned framework = 0; framework < sizeof(frameworks) / sizeof(*frameworks); ++framework) {
+        const char *name = frameworks[framework].name, *install = frameworks[framework].install;
+        char physical[PATH_MAX], unrelated[PATH_MAX];
+        assert(snprintf(physical, sizeof(physical), "%s%s", root, install) < (int)sizeof(physical));
+        assert(!setenv("DYLD_ROOT_PATH", root, 1));
+        initializeIdentity();
+        assert(!strcmp(frameworks[framework].configured, physical));
+        const char *accepted[] = {install, physical};
+        for (unsigned i = 0; i < sizeof(accepted) / sizeof(*accepted); ++i) {
+            rememberNativeIdentityImage(header, 0x4000, accepted[i]);
+            assert(!callerNeedsNativeIdentity(0x4fff) && callerNeedsNativeIdentity(0x5000) && callerNeedsNativeIdentity(0x50ff));
+            assert(!callerNeedsNativeIdentity(0x5100) && !callerNeedsNativeIdentity(0x6000));
+            assert(LSBGetPID() == 123 && LSBGuestPID() == 123 && LSBNativePID() == getpid());
+            forgetNativeIdentityImage(header);
+            assert(!callerNeedsNativeIdentity(0x5000));
+        }
+        const char *invalidPaths[] = {"/Plugins/%1$s", "/System/Library/Frameworks/%1$s.framework/%1$s",
+            "/System/Library/PrivateFrameworks/%1$s.framework/%1$sHelper", "/System/Library/PrivateFrameworks/Other.framework/%1$s",
+            "/System/Library/PrivateFrameworks/%1$s.framework/../%1$s", "/System//Library/PrivateFrameworks/%1$s.framework/%1$s",
+            "/System/Library/PrivateFrameworks/%1$s.framework/./%1$s", "/System/Library/PrivateFrameworks/%1$s.framework/%1$s/",
+            "/private/var/mobile/Group/RuntimeRoot-other/System/Library/PrivateFrameworks/%1$s.framework/%1$s",
+            "/OtherRoot/System/Library/PrivateFrameworks/%1$s.framework/%1$s"};
+        for (unsigned i = 0; i < sizeof(invalidPaths) / sizeof(*invalidPaths); ++i) {
+            assert(snprintf(unrelated, sizeof(unrelated), invalidPaths[i], name) < (int)sizeof(unrelated));
+            rememberNativeIdentityImage(header, 0, unrelated);
+            assert(!callerNeedsNativeIdentity(0x1000) && LSBGetPID() == 123);
+        }
+        const char *invalidRoots[] = {NULL, "", "/", "relative", "/RuntimeRoot/", "/RuntimeRoot:/OtherRoot",
+            "/RuntimeRoot/../Other", "/Runtime/./Root", "/Runtime//Root"};
+        for (unsigned i = 0; i < sizeof(invalidRoots) / sizeof(*invalidRoots); ++i) {
+            if (invalidRoots[i]) assert(!setenv("DYLD_ROOT_PATH", invalidRoots[i], 1));
+            else assert(!unsetenv("DYLD_ROOT_PATH"));
+            initializeIdentity();
+            assert(!frameworks[framework].configured[0]);
+            rememberNativeIdentityImage(header, 0, physical);
+            assert(!callerNeedsNativeIdentity(0x1000) && LSBGetPID() == 123);
+            rememberNativeIdentityImage(header, 0, install); // Cached install paths do not depend on a physical-root alias.
+            assert(callerNeedsNativeIdentity(0x1000));
+            forgetNativeIdentityImage(header);
+        }
+    }
+    assert(!unsetenv("DYLD_ROOT_PATH"));
+    initializeIdentity();
+    assert(!nativeUIKitCorePath[0] && !nativeFrontBoardServicesPath[0] && LSBGetPID() == 123);
+}
+
 int main(void) {
     unsetenv("LSB_GUEST_PID");
     unsetenv("LSB_GUEST_PPID");
@@ -277,6 +360,7 @@ int main(void) {
     testBaseBoardCallerIdentity();
     testRunningBoardServicesCallerIdentity();
     testFrontBoardCallerIdentity();
+    testUIFrameworkCallerIdentity();
     testTaskNameSelfTranslation();
     setenv("LSB_GUEST_PPID", "0", 1);
     initializeIdentity();

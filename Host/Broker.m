@@ -116,8 +116,8 @@ static unsigned finishingDepth;
 static LSBTerminalSession *hostTerminal;
 static BOOL enableIndigo;
 static BOOL enableSpringBoardMetal;
-// Allow every launchd child to overlap its exec replacement, plus launchd and two isolated native Metal helpers.
-enum { BrokerJobCapacity = 2 * LSB_CHILD_STATUS_CAPACITY + 3, DisplayRegistrationTimeoutSeconds = 30,
+// Allow every launchd child to overlap its exec replacement, plus launchd and the backboardd, SpringBoard and public Metal helpers.
+enum { BrokerJobCapacity = 2 * LSB_CHILD_STATUS_CAPACITY + 4, DisplayRegistrationTimeoutSeconds = 30,
        RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
 typedef struct { audit_token_t audit; pid_t guestPID; } LSBRetiredIdentity;
 static LSBRetiredIdentity retiredIdentities[RetiredIdentityCapacity];
@@ -876,13 +876,27 @@ static int signalJob(LSBJob *child, int signalNumber) {
     return error;
 }
 
+static BOOL launchdOwnsChildIdentity(LSBJob *job) {
+    LSBPeerProcessIdentity identity = job.peerIdentity;
+    return job.simulatorLaunchd && !job.peerIdentityError && !strcmp(identity.executablePath, "/sbin/launchd_sim");
+}
+
 static int signalChild(LSBJob *parent, pid_t targetPID, int signalNumber) {
     if (signalNumber < 0 || signalNumber >= NSIG) return EINVAL;
     if (targetPID <= 0) return ENOTSUP;
+    BOOL nativeAlias = launchdOwnsChildIdentity(parent);
+    LSBJob *target = nil;
     for (LSBJob *job in jobs) {
-        if (job.guestPID == targetPID && job.parentIdentifier == parent.identifier && job.phase == JobRunning) return signalJob(job, signalNumber);
+        if (job.parentIdentifier != parent.identifier || job.phase != JobRunning || job.retiredForExec || job.finishing ||
+            job.executionRole != LSB_EXECUTION_SIMULATOR) continue;
+        // launchd's direct PID paths use the logical ID; its audit-token signal paths use the current native ID.
+        // An alias never widens ownership, and a conflicting logical/native match must not signal either process.
+        if (job.guestPID == targetPID || (nativeAlias && job.pid == targetPID)) {
+            if (target && target != job) return ESRCH;
+            target = job;
+        }
     }
-    return ESRCH;
+    return target ? signalJob(target, signalNumber) : ESRCH;
 }
 
 static int signalTerminal(pid_t foreground, int signalNumber) {
@@ -1100,7 +1114,11 @@ static void handleMessage(LSBReceivedMessage *message) {
             enqueueExec(message, sender);
             return;
         case LSB_REQUEST_KILL: {
-            if (!sender || sender.phase != JobRunning || sender.executionRole != LSB_EXECUTION_SIMULATOR) { replyError(message, EACCES); return; }
+            audit_token_t senderAudit = sender.audit;
+            if (!sender || sender.phase != JobRunning || sender.retiredForExec || sender.finishing ||
+                sender.executionRole != LSB_EXECUTION_SIMULATOR || memcmp(&message->audit, &senderAudit, sizeof(senderAudit))) {
+                replyError(message, EACCES); return;
+            }
             int error = signalChild(sender, message->targetPID, message->signalNumber);
             LSBTransportReply(message, error, error ? 0 : message->targetPID, 0, NULL, NULL, NULL);
             disposeMessage(message);
@@ -1143,9 +1161,10 @@ static void handleMessage(LSBReceivedMessage *message) {
         case LSB_REQUEST_COPY_PROCESS_IDENTITY: {
             audit_token_t senderAudit = sender.audit;
             LSBPeerProcessIdentity caller = sender.peerIdentity;
+            BOOL launchd = launchdOwnsChildIdentity(sender);
             if (!sender || sender.phase != JobRunning || sender.retiredForExec || sender.finishing ||
                 sender.executionRole != LSB_EXECUTION_SIMULATOR || memcmp(&message->audit, &senderAudit, sizeof(senderAudit)) ||
-                sender.peerIdentityError || strcmp(caller.executablePath, "/usr/libexec/runningboardd")) {
+                sender.peerIdentityError || (!launchd && strcmp(caller.executablePath, "/usr/libexec/runningboardd"))) {
                 logPeerIdentityRequest(pid, message->targetPID, 0, EACCES);
                 replyError(message, EACCES); return;
             }
@@ -1154,14 +1173,39 @@ static void handleMessage(LSBReceivedMessage *message) {
                 replyError(message, EINVAL); return;
             }
             LSBJob *target = nil;
-            for (LSBJob *job in jobs) if (job.pid == message->targetPID && job.phase == JobRunning && !job.retiredForExec &&
-                !job.finishing && job.executionRole == LSB_EXECUTION_SIMULATOR) { target = job; break; }
+            for (LSBJob *job in jobs) {
+                BOOL matches = launchd ? job.guestPID == message->targetPID && job.parentIdentifier == sender.identifier : job.pid == message->targetPID;
+                if (matches && job.phase == JobRunning && !job.retiredForExec && !job.finishing &&
+                    job.executionRole == LSB_EXECUTION_SIMULATOR) { target = job; break; }
+            }
             LSBPeerProcessIdentity snapshot = target.peerIdentity;
             audit_token_t targetAudit = target.audit;
             int error = target ? target.peerIdentityError : ESRCH;
             if (!error && validatePeerTaskIdentity(&snapshot, &targetAudit)) error = ESRCH;
             logPeerIdentityRequest(pid, message->targetPID, target.pidVersion, error);
             LSBTransportReplyProcessIdentity(message, error, error ? NULL : &snapshot);
+            disposeMessage(message);
+            return;
+        }
+        case LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID: {
+            audit_token_t senderAudit = sender.audit;
+            if (!sender || sender.phase != JobRunning || sender.retiredForExec || sender.finishing ||
+                sender.executionRole != LSB_EXECUTION_SIMULATOR || !launchdOwnsChildIdentity(sender) ||
+                memcmp(&message->audit, &senderAudit, sizeof(senderAudit))) { replyError(message, EACCES); return; }
+            if (message->targetPID <= 0) { replyError(message, EINVAL); return; }
+            LSBJob *target = nil;
+            for (LSBJob *job in jobs) {
+                if (job.pid != message->targetPID || job.parentIdentifier != sender.identifier || job.phase != JobRunning ||
+                    job.retiredForExec || job.finishing || job.executionRole != LSB_EXECUTION_SIMULATOR) continue;
+                // The request explicitly names a native process. A logical-ID match cannot identify an exec replacement here.
+                if (target) { replyError(message, ESRCH); return; }
+                target = job;
+            }
+            LSBPeerProcessIdentity identity = target.peerIdentity;
+            audit_token_t audit = target.audit;
+            int error = !target || target.guestPID <= 0 || target.peerIdentityError || audit.val[5] != (uint32_t)message->targetPID ||
+                audit.val[7] != target.pidVersion || validatePeerTaskIdentity(&identity, &audit) ? ESRCH : 0;
+            LSBTransportReply(message, error, error ? 0 : target.guestPID, 0, NULL, NULL, NULL);
             disposeMessage(message);
             return;
         }

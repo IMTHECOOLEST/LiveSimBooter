@@ -78,9 +78,15 @@ static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *da
     assert(!strcmp(message->plan.strings + message->plan.path, "/sbin/launchd_sim"));
     assert(!strcmp(message->plan.strings + message->plan.argv[1], configPath.fileSystemRepresentation));
     assert(!strcmp(environmentValue(&message->plan, "LSB_DEBUG_STOP_BEFORE_HANDOFF"), "1"));
+    NSString *capabilitiesPath = [root stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"];
+    assert(![NSFileManager.defaultManager fileExistsAtPath:capabilitiesPath]);
+    assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_CAPABILITIES"), capabilitiesPath.fileSystemRepresentation));
     assert(!environmentValue(&message->plan, "LSB_SIMULATE_SYSTEM_POWER"));
     NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
-    for (NSString *scope in @[@"Self", @"Child"]) assert(!bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
+    for (NSString *scope in @[@"Self", @"Child"]) {
+        assert(!bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
+        assert([bootstrap[scope][@"SIMULATOR_CAPABILITIES"] isEqualToString:capabilitiesPath]);
+    }
     assert([bootstrap[@"Paths"] isEqualToArray:@[jobDirectory]]);
     assert(!bootstrap[@"Child"][@"LSB_SIMULATOR_LAUNCHD"]);
     assert([[NSFileManager.defaultManager contentsOfDirectoryAtPath:jobDirectory error:NULL] isEqualToArray:@[@"com.kdt.LiveSimBooter.df.plist"]]);
@@ -273,8 +279,8 @@ static NSDictionary *snapshotDirectory(NSString *directory) {
 }
 
 static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
-    enum { capacity = LSB_CHILD_STATUS_CAPACITY - 2 };
-    assert(capacity == 14);
+    enum { capacity = 14 };
+    assert(capacity + 2 < LSB_CHILD_STATUS_CAPACITY);
     NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
     char names[capacity + 1][64];
     const char *selected[capacity + 2] = {0};
@@ -293,7 +299,7 @@ static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSS
     selected[capacity] = NULL;
     assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
     NSString *directory = [readPlist(configPath)[@"Bootstrap"][@"Paths"] firstObject];
-    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == LSB_CHILD_STATUS_CAPACITY);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == capacity + 2);
     dispose(message);
     prior = snapshotDirectory(dataPath);
     selected[capacity] = names[capacity];
@@ -594,11 +600,14 @@ int main(void) {
         NSString *root = [group stringByAppendingPathComponent:@"RuntimeRoot"];
         NSString *dataPath = [group stringByAppendingPathComponent:@"SimulatorData"];
         NSString *logPath = [dataPath stringByAppendingPathComponent:@"Library/Logs/LiveSimBooter-launchd.log"];
+        NSString *capabilitiesPath = [root stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"];
         assert(!mkdir(root.fileSystemRepresentation, 0700));
+        assert(![NSFileManager.defaultManager fileExistsAtPath:capabilitiesPath]);
         const char *inherited[] = {"LSB_DEBUG_STOP_BEFORE_HANDOFF=1", "KEEP=value=with=equals", "HOME=/wrong", "PATH=/wrong",
             "XPC_SIMULATOR_LAUNCHD_NAME=wrong", "XPC_SIMULATOR_HOLDING_TANK_HACK=999", "XPC_SIMULATOR_HOLDING_TANK_FD_HACK=7",
             "XPC_USERSPACE_REBOOT_TO_BOOT_MODE=wrong", "XPC_FLAGS=0x2", "TERM=xterm", "LSB_FAKE_PTY_STATE=/wrong", "LSB_SIMULATOR_LAUNCHD=0",
-            "SIMULATOR_BOOT_TIME=stale", "SIMULATOR_BOOT_TIME=0", "SIMULATOR_BOOT_TIME_EXTRA=preserved", NULL};
+            "SIMULATOR_BOOT_TIME=stale", "SIMULATOR_BOOT_TIME=0", "SIMULATOR_BOOT_TIME_EXTRA=preserved",
+            "SIMULATOR_CAPABILITIES=/wrong", "SIMULATOR_CAPABILITIES=", "SIMULATOR_CAPABILITIES_EXTRA=preserved", NULL};
         LSBReceivedMessage *message = calloc(1, sizeof(*message));
         assert(message);
         initialize(message);
@@ -616,6 +625,8 @@ int main(void) {
         assert(!strcmp(environmentValue(plan, "LSB_SIMULATOR_LAUNCHD"), "1"));
         assert(!strcmp(environmentValue(plan, "SIMULATOR_PRODUCT_CLASS"), "D84"));
         assert(!strcmp(environmentValue(plan, "SIMULATOR_MODEL_IDENTIFIER"), "iPhone16,2"));
+        assert(!strcmp(environmentValue(plan, "SIMULATOR_CAPABILITIES"), capabilitiesPath.fileSystemRepresentation));
+        assert(!strcmp(environmentValue(plan, "SIMULATOR_CAPABILITIES_EXTRA"), "preserved"));
         const char *bootTime = environmentValue(plan, "SIMULATOR_BOOT_TIME");
         assert(bootTime && *bootTime && strspn(bootTime, "0123456789") == strlen(bootTime));
         char *end;
@@ -643,6 +654,7 @@ int main(void) {
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_BOOT_TIME"] isEqualToString:bootGeneration]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_PRODUCT_CLASS"] isEqualToString:@"D84"]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqualToString:@"iPhone16,2"]);
+            assert([config[@"Bootstrap"][scope][@"SIMULATOR_CAPABILITIES"] isEqualToString:capabilitiesPath]);
             assert(!config[@"Bootstrap"][scope][@"LSB_SIMULATE_SYSTEM_POWER"]);
         }
         assert(!config[@"Bootstrap"][@"Child"][@"XPC_SIMULATOR_HOLDING_TANK_HACK"]);

@@ -10,8 +10,10 @@
 #define LSB_CHILD_STATUS_ENV "LSB_CHILD_STATUS"
 #define LSB_CHILD_WAKE_FD_ENV "LSB_CHILD_WAKE_FD"
 #define LSB_CHILD_STATUS_MAGIC 0x4c534243u
-#define LSB_CHILD_STATUS_VERSION 3u
-#define LSB_CHILD_STATUS_CAPACITY 16u
+#define LSB_CHILD_STATUS_VERSION 4u
+// Leave room for application jobs, compiler services and adopted children after the initial launchd services start.
+// The 64-slot ledger still fits in the existing 4096-byte mapping; version 4 rejects peers using the old 16-slot layout.
+#define LSB_CHILD_STATUS_CAPACITY 64u
 
 typedef struct {
     // High 44 bits: ticket generation; next 16: observer pins; low 4: phase. One CAS protects reuse against new pins.

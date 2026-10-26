@@ -1,3 +1,4 @@
+#include "SpawnDiagnostics.h"
 #include "../ProcessSupport/SpawnTransport.h"
 #include "ChildWait.h"
 #include "CreationMask.h"
@@ -10,6 +11,9 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdbool.h>
+#ifdef LSB_TRANSPORT_TRACE
+#include <stdatomic.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +33,21 @@ _Static_assert(offsetof(NativeAction, value.open.path) == 14, "Pinned Darwin ope
 _Static_assert(sizeof(void *) == 8, "Pinned spawn attributes require the 64-bit Darwin ABI");
 _Static_assert(sizeof(sigset_t) == sizeof(uint32_t), "Spawn wire signal sets require Darwin's 32-bit sigset_t");
 
+// XNU bsd/sys/spawn_internal.h and bsd/sys/resource_private.h define these scheduler hints.
+// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/spawn_internal.h#L328-L345
+// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/resource_private.h#L134-L142
+enum { NativeProcessTypeAppDefault = 0x100, NativeProcessTypeDaemonAdaptive = 0x600, NativeDarwinRoleUIFocal = 1 };
+// Private allocator hint, distinct from POSIX_SPAWN_SETSID (0x0400). XNU only adds apple[] "nanozone=1" for this bit.
+// https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_exec.c#L5987-L5999
+enum { NativeSpawnNanoAllocator = 0x0200 };
+
+#ifdef LSB_TRANSPORT_TRACE
+static _Atomic(unsigned) spawnTraceErrors;
+#define SPAWN_TRACE(...) do { if (atomic_fetch_add(&spawnTraceErrors, 1) < 32) LSBSpawnTrace(__VA_ARGS__); } while (0)
+#else
+#define SPAWN_TRACE(...) ((void)0)
+#endif
+
 static int readAttributes(LSBSpawnPlan *plan, const posix_spawnattr_t *attributes, LSBAdditionalSpawnAttributes *additional) {
     if (sigprocmask(SIG_SETMASK, NULL, (sigset_t *)&plan->signalMask)) return errno;
     for (int number = 1; number < NSIG; ++number) {
@@ -46,21 +65,44 @@ static int readAttributes(LSBSpawnPlan *plan, const posix_spawnattr_t *attribute
     if (error) return error;
     plan->spawnFlags = (uint16_t)flags;
     uint32_t supported = POSIX_SPAWN_RESETIDS | POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
-                         POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETEXEC;
-    if (plan->spawnFlags & ~supported) return ENOTSUP;
+                         POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETEXEC | NativeSpawnNanoAllocator;
+    if (plan->spawnFlags & ~supported) {
+#ifdef LSB_TRANSPORT_TRACE
+        uint32_t processType, darwinRole;
+        memcpy(&processType, (const unsigned char *)*attributes + 0x24, sizeof(processType));
+        memcpy(&darwinRole, (const unsigned char *)*attributes + 0x58, sizeof(darwinRole));
+        SPAWN_TRACE("[spawn-trace] unsupported flags=0x%x mask=0x%x process-type=0x%x darwin-role=0x%x\n",
+                    plan->spawnFlags, plan->spawnFlags & ~supported, processType, darwinRole);
+#endif
+        return ENOTSUP;
+    }
     if (flags & POSIX_SPAWN_SETPGROUP) {
         pid_t session, group;
         error = LSBProcessSessionSnapshot(&session, &group);
         // Logical sessions have no broker group model. Do not apply a guest PGID to the native extension process.
-        if (error != ENOTSUP) return error ? error : ENOTSUP;
+        if (error != ENOTSUP) {
+            SPAWN_TRACE("[spawn-trace] logical-session process group unsupported error=%d\n", error);
+            return error ? error : ENOTSUP;
+        }
     }
     error = LSBReadAdditionalSpawnAttributes(attributes, additional);
     if (error) return error;
-    // The extension keeps its native scheduler policy. Stock launchd's DAEMON_ADAPTIVE (0x600) hint is accepted but not applied.
-    if ((additional->processType && additional->processType != 0x600) || additional->darwinRole) return ENOTSUP;
+    // The extension keeps its native scheduler policy. Accept stock launchd's daemon and foreground-app hints without applying them.
+    bool appHints = additional->processType == NativeProcessTypeAppDefault &&
+                    (additional->darwinRole == 0 || additional->darwinRole == NativeDarwinRoleUIFocal);
+    bool defaultHints = (additional->processType == 0 || additional->processType == NativeProcessTypeDaemonAdaptive) && additional->darwinRole == 0;
+    // xpcproxy_sim carries UI_FOCAL into SETEXEC without requesting a new process type for the replacement image.
+    bool inheritedAppHints = (flags & POSIX_SPAWN_SETEXEC) && additional->processType == 0 && additional->darwinRole == NativeDarwinRoleUIFocal;
+    if (!appHints && !defaultHints && !inheritedAppHints) {
+        SPAWN_TRACE("[spawn-trace] unsupported process-type=0x%x darwin-role=0x%x flags=0x%x\n",
+                    additional->processType, additional->darwinRole, plan->spawnFlags);
+        return ENOTSUP;
+    }
     if ((flags & POSIX_SPAWN_SETSIGMASK) && (error = posix_spawnattr_getsigmask(attributes, (sigset_t *)&plan->signalMask))) return error;
     if ((flags & POSIX_SPAWN_SETSIGDEF) && (error = posix_spawnattr_getsigdefault(attributes, (sigset_t *)&plan->signalDefault))) return error;
     if ((flags & POSIX_SPAWN_SETPGROUP) && (error = posix_spawnattr_getpgroup(attributes, &plan->processGroup))) return error;
+    // Consume the optional optimization hint locally. The simulator allocator keeps its default or explicit environment configuration.
+    plan->spawnFlags &= ~NativeSpawnNanoAllocator;
     return 0;
 }
 
@@ -109,7 +151,9 @@ static int readActions(LSBSpawnPlan *plan, const posix_spawn_file_actions_t *act
             }
             case 5: action->kind = LSB_ACTION_CHDIR; path = source->value.directory; break;
             case 6: action->kind = LSB_ACTION_FCHDIR; break;
-            default: return ENOTSUP;
+            default:
+                SPAWN_TRACE("[spawn-trace] unsupported file-action index=%u kind=%d\n", i, source->kind);
+                return ENOTSUP;
         }
         if (path) {
             if (strnlen(path, 1024) == 1024) return ENAMETOOLONG;
@@ -195,14 +239,38 @@ static int snapshotFDs(LSBSpawnPlan *plan, int descriptors[LSB_MAX_FDS]) {
     int limit = getdtablesize();
     int wakeFD = LSBGuestChildWakeFD();
     int highest = 2;
+    bool omittedClose[LSB_MAX_ACTIONS] = {0};
     for (int fd = 0; fd < limit; ++fd) {
         if (fd == wakeFD) continue;
         int flags = fcntl(fd, F_GETFD);
         if (flags < 0) { if (errno == EBADF) continue; return errno; }
+        if ((flags & FD_CLOEXEC) || (plan->spawnFlags & POSIX_SPAWN_CLOEXEC_DEFAULT)) {
+            // Only the initial value needs transfer. A later use after OPEN/DUP2 replaced this slot consumes the replacement.
+            bool needed = false;
+            for (uint32_t i = 0; i < plan->actionCount; ++i) {
+                const LSBFileAction *action = &plan->actions[i];
+                if (action->fd == fd && (action->kind == LSB_ACTION_DUP2 || action->kind == LSB_ACTION_FCHDIR ||
+                                        action->kind == LSB_ACTION_INHERIT)) { needed = true; break; }
+                if (action->kind == LSB_ACTION_DUP2 && action->target == fd) break;
+                if (action->fd != fd) continue;
+                if (action->kind == LSB_ACTION_OPEN) break;
+                if (action->kind == LSB_ACTION_CLOSE) {
+                    // Replay sees this omitted, initially open descriptor already closed. Remove only that first close;
+                    // subsequent CLOSE/INHERIT/DUP2 actions must still observe their normal ordered state and errors.
+                    omittedClose[i] = true;
+                    break;
+                }
+            }
+            if (!needed) continue;
+        }
         if (plan->fdCount == LSB_MAX_FDS) return EMFILE;
         plan->fds[plan->fdCount++] = (LSBInheritedFD){fd, (uint32_t)flags};
         highest = fd;
     }
+    uint32_t actionCount = 0;
+    for (uint32_t i = 0; i < plan->actionCount; ++i)
+        if (!omittedClose[i]) plan->actions[actionCount++] = plan->actions[i];
+    plan->actionCount = actionCount;
     // Enumerate before duplicating, so staging descriptors cannot be mistaken for guest descriptors.
     for (uint32_t i = 0; i < plan->fdCount; ++i) {
         descriptors[i] = fcntl(plan->fds[i].number, F_DUPFD_CLOEXEC, highest + 1);
@@ -224,26 +292,35 @@ static int spawnOne(pid_t *pid, const char *path, const posix_spawn_file_actions
     for (uint32_t i = 0; i < LSB_MAX_ACTIONS; ++i) temporaryFDs[i] = -1;
     LSBAdditionalSpawnAttributes additional = {0};
     LSBSpawnPorts ports = {0};
+#ifdef LSB_TRANSPORT_TRACE
+    const char *stage = "path";
+#define SPAWN_STAGE(name, expression) do { if (!error) { stage = name; error = (expression); } } while (0)
+#else
+#define SPAWN_STAGE(name, expression) do { if (!error) error = (expression); } while (0)
+#endif
     int error = LSBPlanAddString(plan, path, &plan->path);
     char directory[LSB_PATH_BYTES];
-    if (!error && !getcwd(directory, sizeof(directory))) error = errno;
-    if (!error) error = LSBPlanAddString(plan, directory, &plan->cwd);
-    if (!error) error = LSBReadCreationMask(&plan->creationMask);
-    if (!error) error = addVector(plan, argv, &plan->argc, plan->argv);
-    if (!error) error = addVector(plan, envp, &plan->envc, plan->envp);
-    if (!error) error = snapshotSession(plan);
-    if (!error) error = readAttributes(plan, attributes, &additional);
-    if (!error) error = snapshotPorts(&additional.ports, &ports);
+    SPAWN_STAGE("getcwd", getcwd(directory, sizeof(directory)) ? 0 : errno);
+    SPAWN_STAGE("cwd", LSBPlanAddString(plan, directory, &plan->cwd));
+    SPAWN_STAGE("creation-mask", LSBReadCreationMask(&plan->creationMask));
+    SPAWN_STAGE("argv", addVector(plan, argv, &plan->argc, plan->argv));
+    SPAWN_STAGE("environment", addVector(plan, envp, &plan->envc, plan->envp));
+    SPAWN_STAGE("session", snapshotSession(plan));
+    SPAWN_STAGE("attributes", readAttributes(plan, attributes, &additional));
+    SPAWN_STAGE("ports", snapshotPorts(&additional.ports, &ports));
     bool replace = (plan->spawnFlags & POSIX_SPAWN_SETEXEC) != 0;
     plan->spawnFlags &= ~POSIX_SPAWN_SETEXEC;
-    if (!error) error = readActions(plan, actions, temporaryFDs);
-    if (!error) error = snapshotFDs(plan, descriptors);
-    if (!error) error = LSBValidateSpawnPlan(plan);
+    SPAWN_STAGE("actions", readActions(plan, actions, temporaryFDs));
+    SPAWN_STAGE("fds", snapshotFDs(plan, descriptors));
+    SPAWN_STAGE("validate", LSBValidateSpawnPlan(plan));
     pid_t child = -1;
     if (!error) {
-        if (replace) error = LSBTransportExecWithPorts(plan, descriptors, &ports);
-        else error = LSBTransportSpawnWithPorts(plan, descriptors, &ports, &child);
+        if (replace) { SPAWN_STAGE("exec-rpc", LSBTransportExecWithPorts(plan, descriptors, &ports)); }
+        else { SPAWN_STAGE("spawn-rpc", LSBTransportSpawnWithPorts(plan, descriptors, &ports, &child)); }
     }
+    if (error) SPAWN_TRACE("[spawn-trace] stage=%s error=%d path=%.1024s argv1=%.1024s flags=0x%x type=0x%x role=0x%x\n",
+                           stage, error, path, argv[1] ? argv[1] : "", plan->spawnFlags, additional.processType, additional.darwinRole);
+#undef SPAWN_STAGE
     for (uint32_t i = 0; i < plan->fdCount; ++i) if (descriptors[i] >= 0) close(descriptors[i]);
     for (uint32_t i = 0; i < LSB_MAX_ACTIONS; ++i) if (temporaryFDs[i] >= 0) close(temporaryFDs[i]);
     LSBSpawnPortsDispose(&ports);

@@ -42,7 +42,10 @@ static int nativeUnlink(const char *name) { assert(name == expectedName); ++forw
 
 static void testForwarding(void) {
     const char *names[] = {NULL, "", "unrelated", "apple.shm.notification_center.extra", "//apple.shm.notification_center",
-                          "/apple.shm.notification_center/nested", "APPLE.shm.notification_center"};
+                          "/apple.shm.notification_center/nested", "APPLE.shm.notification_center", "/FBW1:", "/FBW2:",
+                          "FBW1:com.apple.frontboard", "//FBW1:com.apple.frontboard", "/FBW0:com.apple.frontboard",
+                          "/FBW3:com.apple.frontboard", "/FBW1:com.apple.frontboard.systX", "/FBW1:../other",
+                          "/FBW2:name/nested", "/FBW1:name:other", "/FBW1:name with space", "/FBW1:\xc3\xa9"};
     assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
     for (unsigned i = 0; i < sizeof(names) / sizeof(*names); ++i) {
         expectedName = names[i]; expectedFlags = O_CREAT | O_RDWR | O_EXCL; expectedMode = 0621;
@@ -50,13 +53,17 @@ static void testForwarding(void) {
         assert(objectOpen(expectedName, expectedFlags, expectedMode) == -1 && errno == ENOSYS);
         assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
     }
-    expectedName = "apple.shm.notification_center"; expectedFlags = O_RDONLY;
-    for (unsigned i = 0; i < 4; ++i) {
-        if (!i) assert(!unsetenv(LSB_NOTIFICATION_SHM_ENABLE_ENV));
-        else assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, i == 1 ? "" : i == 2 ? "0" : "true", 1));
-        unsigned before = forwards;
-        assert(objectOpen(expectedName, expectedFlags) == -1 && errno == ENOSYS);
-        assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
+    const char *disabledNames[] = {"apple.shm.notification_center", "/FBW1:com.apple.frontboard.syst", "/FBW2:other-domain"};
+    expectedFlags = O_RDONLY;
+    for (unsigned index = 0; index < sizeof(disabledNames) / sizeof(*disabledNames); ++index) {
+        expectedName = disabledNames[index];
+        for (unsigned i = 0; i < 4; ++i) {
+            if (!i) assert(!unsetenv(LSB_NOTIFICATION_SHM_ENABLE_ENV));
+            else assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, i == 1 ? "" : i == 2 ? "0" : "true", 1));
+            unsigned before = forwards;
+            assert(objectOpen(expectedName, expectedFlags) == -1 && errno == ENOSYS);
+            assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
+        }
     }
 }
 #else
@@ -71,7 +78,7 @@ static void pathJoin(char result[PATH_MAX], const char *root, const char *suffix
     assert(count > 0 && count < PATH_MAX);
 }
 
-static void testMappings(const char *root) {
+static void testMappings(const char *root, const char *name, const char *slashName) {
     assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
     assert(objectOpen(name, O_RDWR) == -1 && errno == ENOENT);
     mode_t originalMask = umask(0027);
@@ -108,9 +115,9 @@ static void testMappings(const char *root) {
     assert(!objectUnlink(name));
 }
 
-static void testRejections(const char *root) {
+static void testRejections(const char *root, const char *name, const char *file) {
     char object[PATH_MAX], temporary[PATH_MAX], unrelated[PATH_MAX], linked[PATH_MAX];
-    pathJoin(temporary, root, "tmp"); pathJoin(object, temporary, "notification-center.shm");
+    pathJoin(temporary, root, "tmp"); pathJoin(object, temporary, file);
     pathJoin(unrelated, root, "untouched"); pathJoin(linked, root, "tmp-link");
     int fd = open(unrelated, O_CREAT | O_EXCL | O_RDWR, 0600);
     assert(fd >= 0 && write(fd, "keep", 4) == 4 && !close(fd));
@@ -155,6 +162,85 @@ static void testRejections(const char *root) {
     assert(!unlink(unrelated));
 }
 
+static void testWorkspaceIsolation(const char *root, const char *second) {
+    const char *objects[] = {"/FBW1:com.apple.frontboard.syst", "/FBW2:com.apple.frontboard.syst", "/FBW1:other_domain-2"};
+    int descriptors[3];
+    for (unsigned index = 0; index < 3; ++index) {
+        descriptors[index] = objectOpen(objects[index], O_CREAT | O_EXCL | O_RDWR, 0600);
+        assert(descriptors[index] >= 0 && !ftruncate(descriptors[index], (index + 1) * 4096));
+    }
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, second, 1));
+    for (unsigned index = 0; index < 3; ++index) assert(objectOpen(objects[index], O_RDONLY) == -1 && errno == ENOENT);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    for (unsigned index = 0; index < 3; ++index) {
+        struct stat status;
+        assert(!fstat(descriptors[index], &status) && status.st_size == (index + 1) * 4096);
+        assert(!close(descriptors[index]) && !objectUnlink(objects[index]));
+    }
+}
+
+#ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
+static void checkSandbox(const char *name, const char *operation, bool expected) {
+    errno = EDOM;
+    assert(LSBNotificationShmAllowsSandbox(name, operation) == expected && errno == EDOM);
+}
+
+static void testWorkspaceSandbox(const char *root) {
+    const char *workspace = "/FBW1:com.apple.frontboard.syst";
+    const char *operations[] = {"ipc-posix-shm-read-data", "ipc-posix-shm-write-create", "ipc-posix-shm-write-unlink"};
+    char temporary[PATH_MAX], object[PATH_MAX], linked[PATH_MAX];
+    pathJoin(temporary, root, "tmp"); pathJoin(object, temporary, "frontboard-workspace-1-com.apple.frontboard.syst.shm");
+    pathJoin(linked, root, "sandbox-object");
+    for (unsigned index = 0; index < 3; ++index) {
+        checkSandbox(workspace, operations[index], true); // Preflight also works before the first object is created.
+        checkSandbox("/FBW2:com.apple.frontboard.syst", operations[index], true);
+        checkSandbox(name, operations[index], false); // Notification support does not grant arbitrary SHM preflights.
+        checkSandbox("/FBW3:com.apple.frontboard.syst", operations[index], false);
+        checkSandbox("/FBW1:com.apple.frontboard.systX", operations[index], false);
+        checkSandbox("/FBW1:../outside", operations[index], false);
+        checkSandbox(NULL, operations[index], false);
+    }
+    checkSandbox(workspace, NULL, false);
+    checkSandbox(workspace, "file-read-data", false);
+    checkSandbox(workspace, "ipc-posix-shm-read-data.extra", false);
+    assert(access(object, F_OK) == -1 && errno == ENOENT); // Access queries have no creation side effect.
+    assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "0", 1));
+    checkSandbox(workspace, operations[0], false);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, "/", 1));
+    checkSandbox(workspace, operations[0], false);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+
+    int descriptor = objectOpen(workspace, O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(descriptor >= 0 && !close(descriptor));
+    for (unsigned index = 0; index < 3; ++index) checkSandbox(workspace, operations[index], true);
+    if (geteuid()) {
+        assert(!chmod(object, 0400));
+        checkSandbox(workspace, operations[0], true);
+        checkSandbox(workspace, operations[1], false);
+        checkSandbox(workspace, operations[2], true);
+        assert(!chmod(object, 0200));
+        checkSandbox(workspace, operations[0], false);
+        checkSandbox(workspace, operations[1], true);
+        assert(!chmod(object, 0600));
+        assert(!chmod(temporary, 0500));
+        checkSandbox(workspace, operations[0], true);
+        checkSandbox(workspace, operations[1], false);
+        checkSandbox(workspace, operations[2], false);
+        assert(!chmod(temporary, 0700));
+    }
+    assert(!link(object, linked));
+    for (unsigned index = 0; index < 3; ++index) checkSandbox(workspace, operations[index], false);
+    assert(!unlink(linked) && !rename(object, linked) && !symlink(linked, object));
+    for (unsigned index = 0; index < 3; ++index) checkSandbox(workspace, operations[index], false);
+    assert(!unlink(object) && !unlink(linked) && !mkfifo(object, 0600));
+    for (unsigned index = 0; index < 3; ++index) checkSandbox(workspace, operations[index], false);
+    assert(!unlink(object) && !rename(temporary, linked) && !symlink(linked, temporary));
+    for (unsigned index = 0; index < 3; ++index) checkSandbox(workspace, operations[index], false);
+    assert(!unlink(temporary) && !rename(linked, temporary));
+}
+#endif
+
 int main(void) {
     alarm(10);
 #ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
@@ -166,8 +252,15 @@ int main(void) {
     pathJoin(second, root, "other-runtime"); pathJoin(secondTmp, second, "tmp");
     assert(!mkdir(temporary, 0700) && !mkdir(second, 0700) && !mkdir(secondTmp, 0700));
     assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
-    testMappings(root);
-    testRejections(root);
+    testMappings(root, name, slashName);
+    testMappings(root, "/FBW1:com.apple.frontboard.syst", "/FBW1:com.apple.frontboard.syst");
+    testMappings(root, "/FBW2:com.apple.frontboard.syst", "/FBW2:com.apple.frontboard.syst");
+    testRejections(root, name, "notification-center.shm");
+    testRejections(root, "/FBW1:com.apple.frontboard.syst", "frontboard-workspace-1-com.apple.frontboard.syst.shm");
+    testWorkspaceIsolation(root, second);
+#ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
+    testWorkspaceSandbox(root);
+#endif
     int first = objectOpen(name, O_RDWR | O_CREAT | O_EXCL, 0600);
     assert(first >= 0 && !ftruncate(first, 1234));
     assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, second, 1));
@@ -179,6 +272,6 @@ int main(void) {
     assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
     assert(!fstat(first, &status) && status.st_size == 1234 && !close(first) && !objectUnlink(name));
     assert(!rmdir(secondTmp) && !rmdir(second) && !rmdir(temporary) && !rmdir(root));
-    puts("NotificationSharedMemory: shared mappings, unlink lifetime, access flags, isolation and unsafe-path rejection passed");
+    puts("NotificationSharedMemory: notification/FBW mappings, unlink lifetime, namespace isolation and safe sandbox preflights passed");
     return 0;
 }

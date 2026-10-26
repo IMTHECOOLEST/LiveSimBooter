@@ -589,10 +589,42 @@ int LSBTransportCopyCodeDirectoryHash(const audit_token_t *target, unsigned char
     return error;
 }
 
-int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *identity) {
+static int copyProcessIdentity(pid_t targetPID, bool logicalPID, LSBPeerProcessIdentity *identity) {
     if (identity) memset(identity, 0, sizeof(*identity));
-    if (!identity || nativePID <= 0) return EINVAL;
+    if (!identity || targetPID <= 0) return EINVAL;
     xpc_object_t request = createRequest(LSB_REQUEST_COPY_PROCESS_IDENTITY, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_dictionary_set_int64(request, "target-pid", targetPID);
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        if (!error && (requestID || (remoteError ? pid != 0 : pid <= 0 || (!logicalPID && pid != targetPID)) ||
+                       xpc_dictionary_get_count(reply) != (remoteError ? 4u : 8u))) error = EPROTO;
+        if (!error) error = remoteError;
+        if (!error) error = decodeIdentity(reply, identity, pid, NULL);
+    }
+    if (reply) xpc_release(reply);
+    if (error) LSBPeerProcessIdentityDispose(identity);
+    return error;
+}
+
+int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *identity) {
+    return copyProcessIdentity(nativePID, false, identity);
+}
+
+int LSBTransportCopyChildIdentity(pid_t guestPID, LSBPeerProcessIdentity *identity) {
+    return copyProcessIdentity(guestPID, true, identity);
+}
+
+int LSBTransportResolveNativeChildPID(pid_t nativePID, pid_t *guestPID) {
+    if (guestPID) *guestPID = 0;
+    if (!guestPID || nativePID <= 0) return EINVAL;
+    xpc_object_t request = createRequest(LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID, 0, 0);
     if (!request) return ENOMEM;
     xpc_dictionary_set_int64(request, "target-pid", nativePID);
     xpc_object_t reply = NULL;
@@ -603,13 +635,11 @@ int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *ide
         pid_t pid = 0;
         uint64_t requestID = 0;
         error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
-        if (!error && (requestID || pid != (remoteError ? 0 : nativePID) ||
-                       xpc_dictionary_get_count(reply) != (remoteError ? 4u : 8u))) error = EPROTO;
+        if (!error && (requestID || xpc_dictionary_get_count(reply) != 4 || (remoteError ? pid != 0 : pid <= 0))) error = EPROTO;
         if (!error) error = remoteError;
-        if (!error) error = decodeIdentity(reply, identity, nativePID, NULL);
+        if (!error) *guestPID = pid;
     }
     if (reply) xpc_release(reply);
-    if (error) LSBPeerProcessIdentityDispose(identity);
     return error;
 }
 
@@ -707,7 +737,8 @@ int LSBTransportReplyEntitlements(LSBReceivedMessage *message, int error, const 
 int LSBTransportReplyProcessIdentity(LSBReceivedMessage *message, int error, const LSBPeerProcessIdentity *identity) {
     if (!message || !message->object || error < 0 || message->kind != LSB_REQUEST_COPY_PROCESS_IDENTITY || message->requestID) return EINVAL;
     int encodingError = 0;
-    if (error ? identity != NULL : !identity || !identityPIDMatches(identity, message->targetPID) || !sendRight(identity->taskName) ||
+    pid_t nativePID = identity ? (pid_t)identity->audit.val[5] : 0;
+    if (error ? identity != NULL : !identity || !identityPIDMatches(identity, nativePID) || !sendRight(identity->taskName) ||
         identity->executablePath[0] != '/' || strnlen(identity->executablePath, sizeof(identity->executablePath)) >= sizeof(identity->executablePath))
         encodingError = EINVAL;
     if (encodingError) error = encodingError;
@@ -720,7 +751,7 @@ int LSBTransportReplyProcessIdentity(LSBReceivedMessage *message, int error, con
     xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(reply, "request-id", 0);
     xpc_dictionary_set_int64(reply, "error", error);
-    xpc_dictionary_set_int64(reply, "pid", error ? 0 : message->targetPID);
+    xpc_dictionary_set_int64(reply, "pid", error ? 0 : nativePID);
     if (!error) {
         xpc_dictionary_set_data(reply, "peer-audit", &identity->audit, sizeof(identity->audit));
         xpc_dictionary_set_data(reply, "peer-short-info", identity->shortInfo, sizeof(identity->shortInfo));
@@ -777,7 +808,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     uint64_t version = 0, kind = 0;
     int64_t childError = 0;
     if (!unsignedValue(request, "version", &version) || version != LSB_TRANSPORT_VERSION ||
-        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_COPY_PROCESS_IDENTITY ||
+        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID ||
         !unsignedValue(request, "request-id", &message->requestID) || !signedValue(request, "error", &childError) ||
         childError < 0 || childError > INT_MAX) error = EPROTO;
     if (!error) {
@@ -828,7 +859,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
             if (xpc_dictionary_get_count(request) != 6) error = EPROTO;
             else error = decodeIdentity(request, &message->peerIdentity, (pid_t)message->audit.val[5], &message->audit);
         } else if (!error && (xpc_dictionary_get_value(request, "self-short-info") || xpc_dictionary_get_value(request, "self-task-name"))) error = EPROTO;
-        if (!error && kind == LSB_REQUEST_COPY_PROCESS_IDENTITY) {
+        if (!error && (kind == LSB_REQUEST_COPY_PROCESS_IDENTITY || kind == LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID)) {
             int64_t target = 0;
             if (xpc_dictionary_get_count(request) != 5 || !signedValue(request, "target-pid", &target) || target <= 0 || target > INT_MAX) error = EPROTO;
             else message->targetPID = (pid_t)target;

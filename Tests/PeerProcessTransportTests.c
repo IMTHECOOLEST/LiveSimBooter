@@ -25,6 +25,11 @@ enum {
     ExtraFD, ExtraPort, ErrorWithIdentity, ReplyCount
 };
 enum { BadRequestCount = 12, BadCheckInCount = 12 };
+enum {
+    ResolveSame, ResolveDifferent, ResolveMissing, ResolveDenied, ResolveVersion, ResolveErrorType, ResolveRequestID,
+    ResolveMissingPID, ResolveZeroPID, ResolveNegativePID, ResolveUnsignedPID, ResolveOverflowPID, ResolveErrorPID,
+    ResolveExtraFD, ResolveExtraPort, ResolveReplyCount
+};
 
 int LSBTestCopyBrokerPort(mach_port_t *port) {
     mach_port_array_t ports = NULL;
@@ -86,7 +91,7 @@ static void replyVariant(LSBReceivedMessage *message, const LSBPeerProcessIdenti
     xpc_dictionary_set_uint64(reply, "version", 1);
     xpc_dictionary_set_uint64(reply, "request-id", 0);
     xpc_dictionary_set_int64(reply, "error", 0);
-    xpc_dictionary_set_int64(reply, "pid", message->targetPID);
+    xpc_dictionary_set_int64(reply, "pid", identity->audit.val[5]);
     setIdentity(reply, identity);
     audit_token_t audit = identity->audit;
     unsigned char info[LSB_PEER_SHORT_INFO_BYTES + 1] = {0};
@@ -129,13 +134,45 @@ static void replyVariant(LSBReceivedMessage *message, const LSBPeerProcessIdenti
     xpc_release(reply);
 }
 
-static void malformedRequest(const LSBPeerProcessIdentity *identity, unsigned variant, bool checkin) {
+static void resolveReplyVariant(LSBReceivedMessage *message, mach_port_t task, unsigned variant) {
+    if (variant <= ResolveDenied) {
+        int error = variant == ResolveMissing ? ESRCH : variant == ResolveDenied ? EACCES : 0;
+        pid_t pid = error ? 0 : getpid() + (variant == ResolveDifferent ? 100000 : 0);
+        assert(!LSBTransportReply(message, error, pid, 0, NULL, NULL, NULL));
+        return;
+    }
+    xpc_object_t reply = xpc_dictionary_create_reply(message->object);
+    assert(reply);
+    xpc_dictionary_set_uint64(reply, "version", 1);
+    xpc_dictionary_set_uint64(reply, "request-id", 0);
+    xpc_dictionary_set_int64(reply, "error", 0);
+    xpc_dictionary_set_int64(reply, "pid", getpid() + 100000);
+    switch (variant) {
+        case ResolveVersion: xpc_dictionary_set_uint64(reply, "version", 2); break;
+        case ResolveErrorType: xpc_dictionary_set_string(reply, "error", "0"); break;
+        case ResolveRequestID: xpc_dictionary_set_uint64(reply, "request-id", 1); break;
+        case ResolveMissingPID: xpc_dictionary_set_value(reply, "pid", NULL); break;
+        case ResolveZeroPID: xpc_dictionary_set_int64(reply, "pid", 0); break;
+        case ResolveNegativePID: xpc_dictionary_set_int64(reply, "pid", -1); break;
+        case ResolveUnsignedPID: xpc_dictionary_set_uint64(reply, "pid", getpid()); break;
+        case ResolveOverflowPID: xpc_dictionary_set_int64(reply, "pid", (int64_t)INT_MAX + 1); break;
+        case ResolveErrorPID: xpc_dictionary_set_int64(reply, "error", ESRCH); break;
+        case ResolveExtraFD: addFD(reply, "unexpected"); break;
+        case ResolveExtraPort: xpc_dictionary_set_mach_send(reply, "unexpected", task); break;
+        default: abort();
+    }
+    assert(!xpc_pipe_routine_reply(reply));
+    xpc_release(reply);
+}
+
+static void malformedRequest(const LSBPeerProcessIdentity *identity, unsigned variant, unsigned kind) {
+    bool checkin = kind == LSB_REQUEST_CHECKIN;
     mach_port_t broker = MACH_PORT_NULL;
     assert(!LSBTestCopyBrokerPort(&broker));
     xpc_object_t pipe = xpc_pipe_create_from_port(broker, 0), request = xpc_dictionary_create(NULL, NULL, 0), reply = NULL;
     assert(pipe && request);
     xpc_dictionary_set_uint64(request, "version", 1);
-    xpc_dictionary_set_uint64(request, "kind", checkin ? LSB_REQUEST_CHECKIN : LSB_REQUEST_COPY_PROCESS_IDENTITY);
+    xpc_dictionary_set_uint64(request, "kind", kind);
     xpc_dictionary_set_uint64(request, "request-id", 0);
     xpc_dictionary_set_int64(request, "error", 0);
     if (checkin) {
@@ -192,9 +229,16 @@ static int client(void) {
     assert(LSBTransportCopyProcessIdentity(0, &identity) == EINVAL && !identity.taskName && !identity.audit.val[5]);
     assert(LSBTransportCopyProcessIdentity(-1, &identity) == EINVAL && !identity.taskName);
     assert(LSBTransportCopyProcessIdentity(getppid(), NULL) == EINVAL);
-    for (unsigned variant = 0; variant < ReplyCount; ++variant) {
+    assert(LSBTransportCopyChildIdentity(0, &identity) == EINVAL && !identity.taskName);
+    assert(LSBTransportCopyChildIdentity(getppid(), NULL) == EINVAL);
+    pid_t resolved = -1;
+    assert(LSBTransportResolveNativeChildPID(0, &resolved) == EINVAL && !resolved);
+    resolved = -1;
+    assert(LSBTransportResolveNativeChildPID(-1, &resolved) == EINVAL && !resolved);
+    assert(LSBTransportResolveNativeChildPID(getppid(), NULL) == EINVAL);
+    for (unsigned logical = 0; logical < 2; ++logical) for (unsigned variant = 0; variant < ReplyCount; ++variant) {
         unsigned descriptors = descriptorCount();
-        int result = LSBTransportCopyProcessIdentity(getppid(), &identity);
+        int result = logical ? LSBTransportCopyChildIdentity(getppid() + 100000, &identity) : LSBTransportCopyProcessIdentity(getppid(), &identity);
         int expected = variant <= Repeat ? 0 : variant == Missing ? ESRCH : variant == Denied ? EACCES :
             variant == EncodingFailure ? EINVAL : EPROTO;
         assert(result == expected);
@@ -217,10 +261,20 @@ static int client(void) {
         }
         assert(descriptorCount() == descriptors);
     }
+    for (unsigned variant = 0; variant < ResolveReplyCount; ++variant) {
+        unsigned descriptors = descriptorCount();
+        resolved = -1;
+        int result = LSBTransportResolveNativeChildPID(getppid(), &resolved);
+        int expected = variant <= ResolveDifferent ? 0 : variant == ResolveMissing ? ESRCH : variant == ResolveDenied ? EACCES : EPROTO;
+        assert(result == expected);
+        assert(resolved == (result ? 0 : getppid() + (variant == ResolveDifferent ? 100000 : 0)));
+        assert(descriptorCount() == descriptors);
+    }
     LSBPeerProcessIdentity self = selfIdentity();
     mach_port_urefs_t before = references(self.taskName);
-    for (unsigned variant = 0; variant < BadRequestCount; ++variant) malformedRequest(&self, variant, false);
-    for (unsigned variant = 0; variant < BadCheckInCount; ++variant) malformedRequest(&self, variant, true);
+    for (unsigned variant = 0; variant < BadRequestCount; ++variant) malformedRequest(&self, variant, LSB_REQUEST_COPY_PROCESS_IDENTITY);
+    for (unsigned variant = 0; variant < BadRequestCount; ++variant) malformedRequest(&self, variant, LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID);
+    for (unsigned variant = 0; variant < BadCheckInCount; ++variant) malformedRequest(&self, variant, LSB_REQUEST_CHECKIN);
     assert(references(self.taskName) == before);
     LSBPeerProcessIdentityDispose(&self);
     assert(!LSBRequireSingleThread());
@@ -255,15 +309,23 @@ int main(int argc, char **argv) {
     LSBTransportDisposeMessage(&message);
     LSBPeerProcessIdentity self = selfIdentity();
     mach_port_urefs_t ownReferences = references(self.taskName), childReferences = references(childIdentity.taskName);
-    for (unsigned variant = 0; variant < ReplyCount; ++variant) {
+    for (unsigned logical = 0; logical < 2; ++logical) for (unsigned variant = 0; variant < ReplyCount; ++variant) {
         assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_COPY_PROCESS_IDENTITY);
-        assert(message.targetPID == getpid() && message.audit.val[5] == (unsigned)child);
+        assert(message.targetPID == getpid() + (logical ? 100000 : 0) && message.audit.val[5] == (unsigned)child);
         assert(!message.peerIdentity.taskName && !message.nativeServicePort && !message.ports.count);
         replyVariant(&message, &self, childIdentity.taskName, variant);
         LSBTransportDisposeMessage(&message);
         assert(references(self.taskName) == ownReferences && references(childIdentity.taskName) == childReferences);
     }
-    for (unsigned variant = 0; variant < BadRequestCount + BadCheckInCount; ++variant) {
+    for (unsigned variant = 0; variant < ResolveReplyCount; ++variant) {
+        assert(!LSBTransportReceive(broker, &message) && message.kind == LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID);
+        assert(message.targetPID == getpid() && message.audit.val[5] == (unsigned)child);
+        assert(!message.peerIdentity.taskName && !message.nativeServicePort && !message.ports.count);
+        resolveReplyVariant(&message, childIdentity.taskName, variant);
+        LSBTransportDisposeMessage(&message);
+        assert(references(self.taskName) == ownReferences && references(childIdentity.taskName) == childReferences);
+    }
+    for (unsigned variant = 0; variant < 2 * BadRequestCount + BadCheckInCount; ++variant) {
         unsigned descriptors = descriptorCount();
         assert(LSBTransportReceive(broker, &message) == EPROTO && !message.object && !message.peerIdentity.taskName);
         assert(references(childIdentity.taskName) == childReferences);

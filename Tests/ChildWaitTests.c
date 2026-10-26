@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -80,6 +81,34 @@ static void testWait4TerminalStatusAndUsage(void) {
         assert(LSBWaitPID(pid, &status, WNOHANG) == -1 && errno == ECHILD && status == 0x2345);
     }
     assert(LSBWait4(-1, NULL, 0, NULL) == -1 && errno == ECHILD);
+}
+
+static void testWait4ExplicitStatusOnly(void) {
+    assert(!setenv("LSB_WAIT4_STATUS_ONLY", "1", 1));
+    reset();
+    struct rusage usage, unchanged, zero = {0};
+    memset(&usage, 0xa5, sizeof(usage));
+    unchanged = usage;
+    int status = 0x1234;
+    LSBChildTicket ticket = running(601, getpgrp());
+    errno = EDOM;
+    assert(LSBWait4(601, &status, WNOHANG, &usage) == 0 && status == 0x1234 && errno == EDOM);
+    assert(!memcmp(&usage, &unchanged, sizeof(usage)));
+    assert(LSBWait4(601, &status, 0x40000000, &usage) == -1 && errno == EINVAL && status == 0x1234);
+    assert(!memcmp(&usage, &unchanged, sizeof(usage)));
+    assert(!LSBChildStatusPublishExit(&ledger, ticket, 37 << 8));
+    errno = ERANGE;
+    assert(LSBWait4(601, &status, 0, &usage) == 601 && WEXITSTATUS(status) == 37 && errno == ERANGE);
+    assert(!memcmp(&usage, &zero, sizeof(usage)));
+    ticket = running(602, getpgrp());
+    assert(!LSBChildStatusPublishExit(&ledger, ticket, SIGTERM));
+    assert(LSBWait4(602, &status, 0, &usage) == 602 && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+    usage = unchanged;
+    assert(LSBWait4(602, &status, WNOHANG, &usage) == -1 && errno == ECHILD);
+    assert(!memcmp(&usage, &unchanged, sizeof(usage)));
+    assert(!unsetenv("LSB_WAIT4_STATUS_ONLY"));
+    reset();
+    assert(LSBWait4(-1, NULL, WNOHANG, &usage) == -1 && errno == ENOTSUP);
 }
 
 typedef struct { LSBChildTicket ticket; int status, wake; } Completion;
@@ -177,13 +206,15 @@ static void testInterruptedWait(void) {
 
 int main(void) {
     alarm(15);
+    assert(!unsetenv("LSB_WAIT4_STATUS_ONLY"));
     assert(!pipe(wakeFDs) && !fcntl(wakeFDs[0], F_SETFL, O_NONBLOCK));
     testNoHangAndSelectors();
     testWait4TerminalStatusAndUsage();
+    testWait4ExplicitStatusOnly();
     testBlockingWait();
     testSignalHandlerReapAndDiscard();
     testInterruptedWait();
     close(wakeFDs[0]); close(wakeFDs[1]);
-    puts("ChildWait: waitpid/wait4 options, PID/groups, terminal status, unsupported rusage, blocking/lost wakes, signal reaping, discard and EINTR passed");
+    puts("ChildWait: waitpid/wait4, groups, status, strict/opt-in rusage, blocking/lost wakes, signal reaping, discard and EINTR passed");
     return 0;
 }

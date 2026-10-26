@@ -15,7 +15,8 @@ enum LSBExecutionRole { LSB_EXECUTION_SIMULATOR = 0, LSB_EXECUTION_NATIVE_METAL_
 
 enum LSBRequestKind {
     LSB_REQUEST_SPAWN = 1, LSB_REQUEST_CHECKIN = 2, LSB_REQUEST_READY = 3, LSB_REQUEST_KILL = 4, LSB_REQUEST_EXEC = 5,
-    LSB_REQUEST_RESOLVE_AUDIT_PID = 6, LSB_REQUEST_COPY_ENTITLEMENTS = 7, LSB_REQUEST_COPY_PROCESS_IDENTITY = 8
+    LSB_REQUEST_RESOLVE_AUDIT_PID = 6, LSB_REQUEST_COPY_ENTITLEMENTS = 7, LSB_REQUEST_COPY_PROCESS_IDENTITY = 8,
+    LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID = 9
 };
 typedef struct {
     uint64_t requestID;
@@ -86,6 +87,13 @@ int LSBTransportCopyEntitlements(const audit_token_t *target, unsigned operation
 int LSBTransportCopyCodeDirectoryHash(const audit_token_t *target, unsigned char hash[LSB_GUEST_CDHASH_BYTES]);
 // Exact native PID, restricted by the broker to managed peers. Clears the output on failure; dispose the owned task-name right on success.
 int LSBTransportCopyProcessIdentity(pid_t nativePID, LSBPeerProcessIdentity *identity);
+// Simulator launchd only: resolve a direct child's logical PID to its current genuine native identity after exec replacement.
+// The broker authenticates this mode from the sender's role; the returned audit token and task-name right remain native.
+int LSBTransportCopyChildIdentity(pid_t guestPID, LSBPeerProcessIdentity *identity);
+// Simulator launchd only: map an exact current native PID to its owned live child's stable guest PID.
+// The broker validates the child's genuine task-name/audit identity; no native identity field is rewritten or returned.
+// Returns an errno value and clears *guestPID on failure. Never falls back to interpreting nativePID as a logical child ID.
+int LSBTransportResolveNativeChildPID(pid_t nativePID, pid_t *guestPID);
 // Receive retains the request for a later reply; audit comes from the kernel, never the message payload.
 // On failure, sends an error reply when possible and disposes the malformed message, imported FDs and copied send references.
 int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message);

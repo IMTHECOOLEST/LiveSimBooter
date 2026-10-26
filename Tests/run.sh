@@ -40,6 +40,16 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/SpawnAttributesTests.c Guest/SpawnAttributes.c -o "$test_directory/SpawnAttributes"
 "$test_directory/SpawnAttributes"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchctlControlTests.c -o "$test_directory/LaunchctlControl"
+"$test_directory/LaunchctlControl"
+python3 Tests/GuestLaunchctlTests.py
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ExecutablePathTests.c LiveProcess/ExecutablePath.c -o "$test_directory/ExecutablePath"
+"$test_directory/ExecutablePath"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/UserHomeCompatibilityTests.c -o "$test_directory/UserHomeCompatibility"
+"$test_directory/UserHomeCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ChildMonitorTests.c Host/ChildMonitor.c -o "$test_directory/ChildMonitor"
 "$test_directory/ChildMonitor"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
@@ -74,7 +84,7 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ProcessIdentityInterposeTests.c "$test_directory/libProcessEvents.dylib" -o "$test_directory/ProcessIdentityInterpose"
 LSB_GUEST_PID=2147483000 DYLD_INSERT_LIBRARIES="$test_directory/libProcessEvents.dylib" "$test_directory/ProcessIdentityInterpose"
 identity_runtime="$(cd "$test_directory" && pwd -P)/IdentityRuntimeRoot"
-for identity_name in BaseBoard RunningBoardServices FrontBoard; do
+for identity_name in BaseBoard RunningBoardServices FrontBoard UIKitCore FrontBoardServices; do
     identity_framework="$identity_runtime/System/Library/PrivateFrameworks/$identity_name.framework"
     identity_unrelated="$identity_runtime/Plugins/$identity_name"
     mkdir -p "$identity_framework" "$identity_runtime/Plugins"
@@ -108,12 +118,29 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib 
 xcrun --sdk macosx clang -std=c11 -fobjc-arc -Wall -Wextra -Werror -arch arm64 -DLSB_FRAMEWORK_BUNDLE_INTERPOSE_TESTING \
     Tests/FrameworkBundleCompatibilityTests.m -framework Foundation -framework QuartzCore -o "$test_directory/FrameworkBundleCompatibilityInterpose"
 DYLD_INSERT_LIBRARIES="$test_directory/libFrameworkBundleCompatibility.dylib" "$test_directory/FrameworkBundleCompatibilityInterpose"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SharedCachePathCompatibilityTests.c -o "$test_directory/SharedCachePathCompatibility"
+"$test_directory/SharedCachePathCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Guest/SharedCachePathCompatibility.c -o "$test_directory/libSharedCachePathCompatibility.dylib"
+mkdir "$test_directory/cache-path-caller"
+for cache_path_fixture in Caller Sibling; do
+    xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+        Tests/SharedCachePathCallerFixture.c -o "$test_directory/cache-path-caller/lib$cache_path_fixture.dylib"
+done
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_SHARED_CACHE_PATH_INTERPOSE_TESTING \
+    Tests/SharedCachePathCompatibilityTests.c -o "$test_directory/SharedCachePathCompatibilityInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libSharedCachePathCompatibility.dylib" \
+    "$test_directory/SharedCachePathCompatibilityInterpose" "$test_directory/cache-path-caller/libCaller.dylib"
 python3 -B Tests/PatchIOSPlatformTests.py
 python3 -B Tests/LaunchdIdentityPatchTests.py
 python3 -B Tests/LaunchdIdentityVeneerTests.py
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdIdentityTests.c -o "$test_directory/LaunchdIdentity"
 "$test_directory/LaunchdIdentity"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LaunchdJobIdentityTests.c -o "$test_directory/LaunchdJobIdentity"
+"$test_directory/LaunchdJobIdentity"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_FAKE_PTY_TESTING \
     Tests/FakePTYTests.c Guest/FakePTY.c ProcessSupport/FakePTY.c -o "$test_directory/FakePTY"
 "$test_directory/FakePTY"

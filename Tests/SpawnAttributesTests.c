@@ -26,6 +26,10 @@ static void testPolicyAndArchitecture(void) {
     sigset_t signals = 0xffffffffu;
     assert(posix_spawnattr_setsigdefault(&attr, &signals) == 0);
     assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == 0);
+    put32(attr, 0x24, 0x100);
+    put32(attr, 0x58, 1);
+    assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == 0);
+    assert(decoded.processType == 0x100 && decoded.darwinRole == 1);
     put32(attr, 0x24, 0x300);
     put32(attr, 0x58, 7);
     assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == 0);
@@ -72,6 +76,39 @@ static void testUnsupportedFields(void) {
         memset((char *)attr + padding[i][0], 0xa5, padding[i][1] - padding[i][0]);
     assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == 0);
     assert(posix_spawnattr_destroy(&attr) == 0);
+}
+
+static void testLocalFilePolicy(void) {
+    posix_spawnattr_t attr;
+    assert(!posix_spawnattr_init(&attr));
+    LSBAdditionalSpawnAttributes decoded;
+    static const struct { uint32_t options, policy; int error; } cases[] = {
+        {0, 0, 0}, {4, 5, 0}, {4, 6, 0},
+        {0, 5, ENOTSUP}, {0, 6, ENOTSUP}, {4, 0, ENOTSUP}, {4, 1, ENOTSUP}, {4, 2, ENOTSUP}, {4, 4, ENOTSUP},
+        {4, 7, ENOTSUP}, {4, UINT32_MAX, ENOTSUP}, {5, 5, ENOTSUP}, {6, 6, ENOTSUP}, {7, 6, ENOTSUP}, {UINT32_MAX, 6, ENOTSUP}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        put32(attr, 0x80, cases[i].options);
+        put32(attr, 0x98, cases[i].policy);
+        unsigned char snapshot[0x100];
+        memcpy(snapshot, attr, sizeof(snapshot));
+        assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == cases[i].error);
+        assert(!memcmp(snapshot, attr, sizeof(snapshot)));
+        assert(!decoded.ports.count && !decoded.processType && !decoded.darwinRole);
+    }
+    // A valid dataless request cannot hide another option bit or an adjacent resource-limit request.
+    put32(attr, 0x98, 6);
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        if (bit == 2) continue;
+        put32(attr, 0x80, 4 | (1u << bit));
+        assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == ENOTSUP);
+    }
+    put32(attr, 0x80, 4);
+    put32(attr, 0x84, 1);
+    assert(LSBReadAdditionalSpawnAttributes(&attr, &decoded) == ENOTSUP);
+    put32(attr, 0x84, 0);
+    assert(!LSBReadAdditionalSpawnAttributes(&attr, &decoded));
+    assert(!posix_spawnattr_destroy(&attr));
 }
 
 static void testPortActions(void) {
@@ -208,6 +245,7 @@ static void testImportanceWatchHints(void) {
 int main(void) {
     testPolicyAndArchitecture();
     testUnsupportedFields();
+    testLocalFilePolicy();
     testPortActions();
     testImportanceWatchHints();
     puts("SpawnAttributesTests passed");

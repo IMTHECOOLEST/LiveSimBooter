@@ -263,7 +263,9 @@ status ledger described below. Direct audited signaling is sandbox denied on the
 delivery to launchd using the retained extension instance. Hosting an extension does not grant ordinary parent-process
 `waitpid` or signal permissions.
 
-Each guest receives a 4 KiB shared mapping with 16 child slots and a nonblocking wake-pipe reader. The host creates the backing
+Each guest receives a 4 KiB shared mapping with 64 child slots and a nonblocking wake-pipe reader. Ledger ABI version 4 uses
+2080 bytes of that mapping; the backing-file and mapping sizes remain unchanged. Version and capacity checks reject the old
+16-slot ABI, so the host, extension and guest shim must be deployed together. The host creates the backing
 file inside the App Group, unlinks it immediately, and transfers its descriptor at check-in. Native preparation maps it, closes
 the file descriptor, and preserves the reader outside file-action destinations and close sweeps. The mapping and FD survive
 cache detachment; no native object or callback is retained. The spawn shim excludes this private reader from ordinary FD inheritance.
@@ -301,11 +303,23 @@ The current limits are:
 - `WUNTRACED` and `WCONTINUED` are accepted alongside `WNOHANG`; unknown option bits return `EINVAL`. The ledger still
   reports terminal exits only. A live child yields 0 under `WNOHANG`, and normal/signal exits remain reapable with these flags.
   Stop/continue events are not synthesized or reported, so this is not full job-control support. `waitid` remains unsupported.
+- `wait4` supports the same terminal statuses and selectors when rusage is null. By default, nonnull rusage returns
+  `ENOTSUP` without consuming a status. The explicit `LSB_WAIT4_STATUS_ONLY=1` initialization option permits callers such as
+  Go's `os/exec` to request rusage: the shim clears it only after returning a positive reaped PID. These zeros mean
+  **uncollected**, not measured usage; `WNOHANG` returning 0 and all errors leave the usage buffer unchanged. Normal and signal
+  exit statuses still come from real broker terminal events. The sshdog staging recipe enables this compatibility mode.
 - Process-group selectors use the group captured at READY. Later guest `setpgid` changes are not reflected in stored child records.
 - A signal may interrupt a blocking wait with `EINTR` even with `SA_RESTART`; callers must retry. A status already available after interruption is returned first.
 - Interposed `sigaction`/`signal` mirror `SIG_IGN` and `SA_NOCLDWAIT` into the table and discard unreaped/future statuses.
   Concurrent changes to the SIGCHLD disposition must be serialized by the caller.
 - This models the broker's simulated children only. It does not merge native kernel-child waits, synthesize child `siginfo_t`, or virtualize sessions and parent PIDs.
+
+The [sshdog device experiment](sshdog.md#device-checkpoint) exercised non-PTY remote Fish and df after fixing the guest
+account-home path and excluding unused close-on-exec descriptors from FD export. After the initial nonnull-rusage
+`ENOTSUP`, the status-only opt-in let Go finish its wait successfully: Fish printed df output and `external-status=0`, and
+the daemon logged `Err: <nil>`. Guest `launchctl list` also ran through the SSH Fish session. A separate `exit 23` reached
+Go as status 23, although the upstream server incorrectly reported SSH client status 0. The PTY attempt failed opening
+`/dev/ptmx` with EPERM; command-mode success does not establish an interactive terminal.
 
 ## Build and exercise
 

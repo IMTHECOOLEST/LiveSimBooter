@@ -4,13 +4,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static _Atomic(LSBChildStatus *) childStatus;
 static _Atomic(int) childWakeFD = -1;
 static _Atomic(int) configurationError = ENOTSUP;
+static _Atomic(bool) wait4StatusOnly;
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "Child wait lookup must remain signal-safe");
 
 static void updateDiscard(const struct sigaction *action) {
@@ -26,6 +29,8 @@ int LSBChildWaitConfigure(LSBChildStatus *ledger, int wakeFD) {
     if (!(flags & O_NONBLOCK) || (flags & O_ACCMODE) == O_WRONLY) return EINVAL;
     struct sigaction action;
     if (sigaction(SIGCHLD, NULL, &action)) return errno;
+    const char *statusOnly = getenv("LSB_WAIT4_STATUS_ONLY");
+    atomic_store_explicit(&wait4StatusOnly, statusOnly && !strcmp(statusOnly, "1"), memory_order_relaxed);
     atomic_store_explicit(&childWakeFD, wakeFD, memory_order_relaxed);
     atomic_store_explicit(&childStatus, ledger, memory_order_release);
     atomic_store_explicit(&configurationError, 0, memory_order_relaxed);
@@ -102,8 +107,12 @@ pid_t LSBWaitPID(pid_t selector, int *status, int options) {
 pid_t LSBWait(int *status) { return LSBWaitPID(-1, status, 0); }
 
 pid_t LSBWait4(pid_t selector, int *status, int options, struct rusage *usage) {
-    if (usage) { errno = ENOTSUP; return -1; }
-    return LSBWaitPID(selector, status, options);
+    if (usage && !atomic_load_explicit(&wait4StatusOnly, memory_order_relaxed)) { errno = ENOTSUP; return -1; }
+    pid_t result = LSBWaitPID(selector, status, options);
+    // Explicit compatibility mode for callers such as Go os/exec that always request rusage. These zeros mean uncollected,
+    // not measured usage; the child's exit/signal status still comes from the broker's real terminal event.
+    if (result > 0 && usage) memset(usage, 0, sizeof(*usage));
+    return result;
 }
 
 int LSBSigaction(int number, const struct sigaction *action, struct sigaction *oldAction) {

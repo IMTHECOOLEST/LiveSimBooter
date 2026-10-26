@@ -144,7 +144,7 @@ PID. Process-info queries translate to the current native PID. These adapters ar
 They do not create a kernel PID namespace, and raw syscalls or arbitrary audit-based service authentication are not virtualized.
 
 The process source polls every 10 ms and coalesces events. It supports C dispatch retain/release ownership and does not emit
-fork events. Version 3 of the child ledger pins each subscribed ticket until polling completes: waitpid and SA_NOCLDWAIT may
+fork events. The child ledger pins each subscribed ticket until polling completes: waitpid and SA_NOCLDWAIT may
 consume the status without losing an existing source's EXIT event. A pinned slot cannot be reused; abandoning a live child
 does not manufacture EXIT. The proc_pidinfo flavor-18 reply rewrites PID/PPID only; unique IDs and audit
 identity remain native. wait4 supports a null rusage pointer; nonnull usage fails without consuming a status.
@@ -200,7 +200,7 @@ launchd. Each child's own shared ledger carries its current parent PID, so getpp
 Replacing a parent through SETEXEC preserves its existing children and does not trigger adoption. With no live simulator
 launchd, or after launchd exits, the explicit fallback is guest parent PID 0 with no simulated wait owner.
 
-If launchd's 16 child slots are full, copied adoption records wait for space and new spawns receive EAGAIN. Parent metadata
+If launchd's 64 child slots are full, copied adoption records wait for space and new spawns receive EAGAIN. Parent metadata
 updates immediately, but a specific waitpid for a deferred orphan can return ECHILD until its record is imported. The retry
 queue does not retain whole old ledgers. Unknown exit-monitor failures do not invent an exit status.
 
@@ -400,3 +400,154 @@ stock guest shader compilation, pipeline creation and triangle rendering with ve
 then presented its first spinner frame to the host image view, and the next run completed 300 frames with partial updates
 before aborting on an Indigo HID target mismatch. End-to-end touch delivery and complete simulator boot remain unverified;
 see [framebuffer evidence](framebuffer.md#first-stock-phone-frame).
+
+## Signaling children after SETEXEC
+
+The stock 23A343 launchd first obtains a target task-name right and reads its genuine audit token before handling
+`launchctl kill` or stopping a service. Its PID-to-audit helper is at `launchd_sim + 0x353d0`; the call to
+`task_name_for_pid` is at `+0x35404`. The signal-service handler propagates that Mach error directly, explaining an observed
+`launchctl kill SIGSTOP` result of 5. The stop path at `+0x18460` converts a failed audit lookup to ESRCH. Consequently,
+`kickstart -k` could retire the old job in launchd and start another instance while the original native process still held
+its listening socket. The observed sshdog pair was logical 5199/native 5201 and logical 6652/native 6653.
+
+`PeerProcessCompatibility` now recognizes only the exact `/sbin/launchd_sim` executable with `LSB_SIMULATOR_LAUNCHD=1`.
+Direct calls from that executable resolve child task-name requests through the host before trying a native PID lookup;
+falling back after a failed syscall would be unsafe when an old proxy PID has already been reused. The broker authenticates
+the full caller audit token and launchd role, accepts only its live direct children's logical PIDs, and validates the returned
+native task-name right against the current full audit token. The returned task/audit identities are never rewritten.
+RunningBoard's separate peer inspection continues to require native PIDs and retains its original framework caller scope.
+
+The stock signal adapter at `+0x35370` extracts the native PID from that audit token. For this verified launchd only, broker
+signaling accepts either a direct child's logical PID or its current native PID. It excludes retired, finishing, unrelated
+and native-service jobs, rejects ambiguous matches, and validates the current native generation before delivery.
+The normal `proc_terminate` path is also adapted, but only for direct calls from the opted-in launchd executable. It requests
+SIGTERM and reports that signal using libproc's errno-as-return-value convention. This is the conservative untracked-process
+case in [XNU's proc_terminate implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/proc_info.c#L3226-L3292).
+Guest sudden-termination/dirty tracking and native task termination policy are not emulated; launchd's existing timeout and
+SIGKILL escalation remain responsible for an unresponsive service. Other callers retain the native `proc_terminate` API.
+
+Successful signal delivery never manufactures an exit or releases a job slot: the existing native exit monitor must publish
+the real wait status. Group signaling, stopped/continued wait notifications, and `terminate_with_reason` metadata remain
+outside this adapter. Local tests cover logical/native PID divergence, reused proxy IDs, ownership, generation and full-audit
+checks, malformed task replies, send-right ownership, graceful termination, and native-lookup ordering. On the phone,
+`launchctl kickstart -k` terminated sshdog's old native process 7761 with actual wait status `0xf`; its replacement 8623
+accepted a fresh Fish SSH command. The old PID no longer had a process path. This verifies replacement and socket ownership,
+in addition to launchctl's successful return. See `tmp/sshdog/restart-verified.log` and
+`tmp/app-launch-fix/restart-peer-result.txt`. Opt-in diagnostics record `[launchd-child]` lookups and termination requests
+in the simulator spawn diagnostic log.
+
+## App-facing job PIDs after SETEXEC
+
+The app launch path needs a different PID at its public job-info boundary. Hardware-only LLDB stopped RunningBoard's
+launch-result path at `RunningBoard + 0x43f7c`: it requested the retired proxy PID 8754, while the broker had committed
+replacement 8755. Both the task-name object and its audit token were nil at `+0x43f94`. RunningBoard then explicitly
+removed the job through launchd routine 1003. Its incoming-connection path, using a current native PID, succeeded.
+This was an identity mismatch before process monitoring, rather than a launchd execution timeout.
+
+`LaunchdJobIdentity` translates the successful OSLaunchdJob reply's signed `pid` field to the current native child PID.
+The 23A343 serializer calls the setter at `launchd_sim + 0x33fe8`; the adapter additionally requires unsigned
+`job-state == 1`. Explicit native PID queries in routines 1008 and 712 translate back at getter sites `+0x3308c` and
+`+0x1bcb0`. The new broker request authenticates the simulator launchd and resolves only a live direct child's exact
+native PID, validating its task-name right against its complete current audit token. Genuine audit tokens, task-name
+rights, launchd's stored logical PID, parent wait status, and job-handle UUIDs retain their existing meanings.
+
+These adapters require the exact arm64 MH_EXECUTE image, UUID `C3EC5C45-8C85-3D11-B59C-62C4248F5EF9`, executable path,
+TEXT geometry, and three original call instructions. They match the caller return address and dictionary field types;
+unmatched calls retain native behavior. A failed mapping at a valid matched boundary returns PID zero, so a reused native
+number cannot accidentally select another job's logical PID. Send-right ownership and errno are preserved.
+Image callbacks select the pinned executable because an inserted dylib can precede it in dyld_sim's image array.
+
+The focused tests cover image ordering, modified instructions, malformed dictionaries, exec/reuse changes, failure paths,
+and send-right counts. Broker and transport tests cover sender authentication, exact native lookup, stale identities,
+and malformed wire replies. The on-device adapter now initializes automatically and Contacts' launch request returns
+`accepted=1, error=none`. The subsequent SpringBoard reconnect, UIKit asset and framework weak-link failures are addressed below. The final device run
+opened Contacts successfully. Evidence is under `tmp/app-launch-fix/`.
+
+## FrontBoard scene reconnection storage
+
+After job identity translation, Contacts reached its application process but SpringBoard stopped in
+`-[FBSceneWorkspace scene:didPrepareUpdate:]` at FrontBoard `+0x6b4cc`: the `FBSceneManager` workspace did not support
+reconnection. LLDB found a valid `RBSOSServiceProcessIdentity` for SpringBoard, while its workspace domain had no
+`reconnectShmemIdentifier` and an empty reconnectable-workspace set. The default domain initializer disables that support
+when its POSIX shared-memory sandbox preflight fails. A manually supplied read-data probe for
+`/FBW1:com.apple.frontboard.syste` returned denial (`1`), but that identifier is 26 characters, one longer than the stock
+25-character limit; it does not by itself establish the result of the initializer’s exact check.
+
+The 23A343 implementation derives two names, `/FBW1:` and `/FBW2:` followed by the first 25 characters of the domain's
+Mach service name. These are workspace connection-state buffers, unrelated to the framebuffer's IOSurfaces.
+Evidence and the stopped stack are in `tmp/app-launch-fix/lldb-springboard-contacts-reconnect.txt`.
+
+With `LSB_SIMULATE_NOTIFICATION_SHM=1`, the existing shared-memory adapter now maps those bounded names to separate
+`frontboard-workspace-1-*.shm` and `frontboard-workspace-2-*.shm` files in canonical, owned `SimulatorData/tmp`.
+It retains normal creation, exclusive creation, shared mapping and unlink lifetime. Symlinks, hardlinks, special files,
+unsafe roots and unsupported names remain rejected. The sandbox wrapper handles only native-self queries with filter 17
+and the three matching POSIX SHM operations, reporting access to those backing files. Unmatched calls retain their
+original arguments and native sandbox behavior; the adapter is inactive until guest constructors have initialized TLS.
+
+The next device run confirmed all three native preflights deny the correctly truncated
+`/FBW1:com.apple.frontboard.syst`, while the managed backing-file checks succeed. FrontBoard created its workspace buffer,
+and SpringBoard stayed alive through the Contacts launch. Contacts then aborted independently; that next application
+failure is separate from the resolved SpringBoard reconnect assertion. Diagnostic evidence is in
+`tmp/app-launch-fix/workspace-shm/guest-evidence.txt` and `console.log`.
+
+These are ordinary file-backed shared mappings. Dirty pages may be written to storage; this is not a RAM-only POSIX SHM
+implementation.
+
+A separate device probe verified native POSIX SHM with the entitled name `group.com.kdt.LiveSimBooter/rqk`. Apple's
+[app-group naming rules](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.application-groups)
+allow `<group identifier>/<unique name>`. This 27-byte group identifier leaves three suffix bytes under Darwin's 31-byte limit.
+Exclusive creation, a 16 KiB shared mapping, a spawned child's read/write exchange, real exit status zero, and mappings surviving
+unlink and FD closure all passed. Fileport and `xpc_fd` imports also mapped the same bytes after their wrappers were released.
+Those FD conversions were tested locally within the parent; the child opened the native name separately. This establishes that
+a broker can distribute genuine native SHM descriptors without replacing `mmap`. It is not yet the production backing store.
+The probe cleaned up its objects and job; results are in `tmp/app-launch-fix/appgroup-shm/result-v3.json`.
+
+## Application framework resources
+
+After the reconnect fix, Contacts aborted in UIKitCore's `-[_UIScreenComplexBoundingPathUtilities _loadBitmapForScreen:type:]`.
+The requested `BoundingPathBitmap-1290x2796-430x932-3.00x` exists in the staged simulator resources, but LLDB showed its bundle
+path was the native `/System/Library/PrivateFrameworks/UIKitCore.framework/BoundingPathData.bundle`. The LiveProcess guest
+handoff now enables the existing framework-bundle adapter for every guest, including applications with replacement environments.
+It removes duplicate input settings before adding `LSB_SIMULATE_FRAMEWORK_BUNDLES=1`; native Metal helper startup bypasses this path.
+The next device run still stopped Contacts at the same assertion. LLDB confirmed its bundle path now points into RuntimeRoot,
+and the phone contains the matching asset catalog. The remaining asset lookup failure was traced to missing device capabilities below; a widget renderer
+initially mistaken for Contacts was a separate process. Evidence is in `tmp/app-launch-fix/workspace-shm/lldb-contacts-framework.txt`.
+
+CoreUI's default data-asset lookup obtains its artwork idiom, subtype, gamut and memory class from MobileGestalt. The simulator
+MobileGestalt implementation reads those values from the device plist named by `SIMULATOR_CAPABILITIES`; the model identifier
+and screen dimensions alone do not supply them. Stage the matching device type's `Contents/Resources/capabilities.plist` at
+`RuntimeRoot/Library/Developer/CoreSimulator/DeviceType/capabilities.plist`. For the current iPhone 15 Pro Max configuration,
+the source is `/Library/Developer/CoreSimulator/Profiles/DeviceTypes/iPhone 15 Pro Max.simdevicetype/Contents/Resources/capabilities.plist`.
+Keep it consistent with `SIMULATOR_MODEL_IDENTIFIER=iPhone16,2`, product class `D84` and the 1290×2796 display.
+
+The stock plist supplies the capabilities; it is a separate runtime resource and is not embedded in this repository. The native
+handoff passes its physical path to simulator guests so application launch environments cannot drop it. Native Metal helpers
+retain the phone's own environment. A fresh-process device comparison confirmed that the ordinary `NSDataAsset` and CoreUI
+lookups return the expected 4,410 bytes with this profile. Without it, default lookup returned no data while an explicit
+CoreUI phone-idiom lookup succeeded against the same catalog. The subsequent Contacts launch reached IOSurface and then
+exited with SIGSEGV; the cache-only framework resolution fix below addresses that next failure.
+
+## Cache-only framework weak linking
+
+Contacts next stopped at a null indirect call in `IMDAuditTokenTaskHasEntitlement`, before it could evaluate an entitlement.
+Its once initializer calls CommonUtilities' `CUTWeakLinkSymbol` to resolve `SecTaskCreateWithAuditToken`. That resolver searches
+framework directories under `IPHONE_SIMULATOR_ROOT` and calls `dlopen` with the resulting physical path. The staged Security
+framework has its resources, while its executable lives only in the rebuilt shared cache.
+
+Hardware-only LLDB confirmed Contacts had the correct runtime environment. Opening
+`/System/Library/Frameworks/Security.framework/Security` succeeded and resolved both `SecTaskCreateWithAuditToken` and
+`SecTaskCopyValueForEntitlement`; opening the RuntimeRoot-prefixed path failed. dyld first tried a doubly prefixed path, then
+the nonexistent loose executable. This failure is independent of the existing entitlement implementation and CFBundle resource
+translation. The captured comparison is `tmp/app-launch-fix/workspace-shm/lldb-contacts-weaklink.txt`.
+
+`SharedCachePathCompatibility` translates a physical RuntimeRoot `dlopen` path only when its logical suffix is present in
+the current shared cache and there is no loose entry or symlinked parent. It accepts the canonical root and its strict `/var`
+alias, rejects ambiguous paths, and preserves native behavior for other inputs. The final call is a mandatory tail call so
+`@loader_path`, `@rpath`, and caller-sensitive modes retain their original calling image. Early startup bypasses translation
+until guest constructors have initialized the runtime.
+
+On the iPhone, the fresh-process weak-link probe resolved both real Security exports through `CUTWeakLinkSymbol`, before
+its explicit logical/physical load checks. Both paths then returned the same handle without a dyld error. The production
+shim, with no temporary fault-stop hooks, launched Contacts native PID 9996 (logical 9995) and displayed its “No Contacts”
+screen. SpringBoard remained running. Evidence: `tmp/app-launch-fix/workspace-shm/security-weaklink-device.log`,
+`console-cache-path.log`, `jobs-cache-path.txt`, and `contacts-cache-path.png`.
