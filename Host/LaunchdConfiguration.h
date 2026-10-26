@@ -13,5 +13,9 @@ int LSBPrepareLaunchdDFPlan(LSBReceivedMessage *message, const char *runtimeRoot
 
 // Stock backboardd plus the simulator cfprefsd daemon, preserving their MachServices but omitting unsupported native policy attributes.
 int LSBPrepareLaunchdBackboardPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]);
+// Host-selected stock daemon labels, NULL-terminated, in addition to backboardd/cfprefsd. Never read labels from guest environment.
+// Runs each once in a separate owned job directory; preserves service declarations while omitting credentials and native policy.
+int LSBPrepareLaunchdServicesPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[],
+                                 const char *const labels[]);
 // Process-event and orphan-adoption regression job under simulator launchd.
 int LSBPrepareLaunchdLifecyclePlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]);

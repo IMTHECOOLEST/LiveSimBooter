@@ -32,15 +32,17 @@ static mach_msg_timeout_t remainingMilliseconds(int64_t deadline) {
     return now < 0 || now >= deadline ? 0 : (mach_msg_timeout_t)((deadline - now + 999999) / 1000000);
 }
 
-static int registerEndpoint(mach_port_t service, const audit_token_t *audit, const char *name, mach_port_t endpoint, kern_return_t *status) {
+static int registerEndpoint(mach_port_t service, const audit_token_t *audit, const char *name, mach_port_t endpoint,
+                            uint32_t timeoutMilliseconds, kern_return_t *status) {
     if (status) *status = -1;
+    if (!timeoutMilliseconds || timeoutMilliseconds > 30000) return EINVAL;
     if (!MACH_PORT_VALID(service) || !MACH_PORT_VALID(endpoint) || !audit || !audit->val[5] || audit->val[5] > INT_MAX || !name) return EINVAL;
     size_t length = strnlen(name, 128);
     if (!length) return EINVAL;
     if (length == 128) return ENAMETOOLONG;
     int64_t now = monotonicNanoseconds();
     if (now < 0) return errno;
-    int64_t deadline = now + 1000000000;
+    int64_t deadline = now + (int64_t)timeoutMilliseconds * 1000000;
     mach_port_t replyPort = MACH_PORT_NULL;
     if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &replyPort)) return ENOMEM;
     RegisterRequest request = {
@@ -101,8 +103,13 @@ cleanup:
 
 int LSBLaunchdRegisterEndpoint(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
                               mach_port_t endpoint, kern_return_t *bootstrapStatus) {
+    return LSBLaunchdRegisterEndpointWithTimeout(service, expectedAudit, name, endpoint, 1000, bootstrapStatus);
+}
+
+int LSBLaunchdRegisterEndpointWithTimeout(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
+                                         mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *bootstrapStatus) {
     int savedErrno = errno;
-    int result = registerEndpoint(service, expectedAudit, name, endpoint, bootstrapStatus);
+    int result = registerEndpoint(service, expectedAudit, name, endpoint, timeoutMilliseconds, bootstrapStatus);
     errno = savedErrno;
     return result;
 }

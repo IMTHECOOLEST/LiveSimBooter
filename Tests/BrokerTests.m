@@ -7,9 +7,9 @@
 #include <unistd.h>
 #include <sys/event.h>
 #include <sys/wait.h>
-#define LSBLaunchdRegisterEndpoint LSBTestRegisterEndpoint
+#define LSBLaunchdRegisterEndpointWithTimeout LSBTestRegisterEndpoint
 #include "../Host/Broker.m"
-#undef LSBLaunchdRegisterEndpoint
+#undef LSBLaunchdRegisterEndpointWithTimeout
 
 typedef struct {
     unsigned objectID;
@@ -43,16 +43,19 @@ static int endpointErrors[5];
 static char registeredEndpoints[5][128];
 static mach_port_t registeredPorts[5];
 static audit_token_t registeredAudits[5];
+static uint32_t registeredTimeouts[5];
 static void (^endpointHook)(unsigned index);
 
 int LSBTestRegisterEndpoint(mach_port_t service, const audit_token_t *audit, const char *name,
-                            mach_port_t endpoint, kern_return_t *status) {
+                            mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *status) {
     assert(!NSThread.isMainThread && MACH_PORT_VALID(service) && audit && name && status && endpointCalls < 5);
     unsigned index = endpointCalls++;
     assert(strlen(name) < sizeof(registeredEndpoints[index]));
     strcpy(registeredEndpoints[index], name);
     registeredPorts[index] = endpoint;
     registeredAudits[index] = *audit;
+    assert(timeoutMilliseconds && timeoutMilliseconds <= 30000);
+    registeredTimeouts[index] = timeoutMilliseconds;
     if (endpointHook) endpointHook(index);
     *status = endpointErrors[index] ? 1100 : KERN_SUCCESS;
     return endpointErrors[index];
@@ -266,6 +269,7 @@ static void resetBroker(void) {
     memset(registeredEndpoints, 0, sizeof(registeredEndpoints));
     memset(registeredPorts, 0, sizeof(registeredPorts));
     memset(registeredAudits, 0, sizeof(registeredAudits));
+    memset(registeredTimeouts, 0, sizeof(registeredTimeouts));
     reportedPID = getpid();
     submitError = readySendError = launchdBootstrapSendError = monitorCreateError = identityCheckError = 0;
     runningBoardError = EACCES;
@@ -1024,7 +1028,7 @@ static void testParentDeathDetachesOrphans(void) {
     assert(!jobs.count && !deliveredSignals);
 }
 
-// Adoption cases use distinct logical/native identities without launching real subprocesses.
+// Capacity and adoption cases use distinct logical/native identities without launching real subprocesses.
 static LSBJob *managedJob(LSBJob *parent, pid_t identity) {
     LSBJob *job = [LSBJob new];
     job.identifier = nextIdentifier++;
@@ -1043,6 +1047,91 @@ static LSBJob *managedJob(LSBJob *parent, pid_t identity) {
     }
     [jobs addObject:job];
     return job;
+}
+
+static void testGlobalJobCapacity(void) {
+    assert(BrokerJobCapacity == 2 * LSB_CHILD_STATUS_CAPACITY + 2);
+    for (unsigned replacing = 0; replacing < 2; ++replacing) {
+        resetBroker();
+        for (unsigned index = 0; index < BrokerJobCapacity - 1; ++index) managedJob(nil, 6000 + index);
+        LSBJob *old = jobs[0], *other = jobs[1];
+        int acceptedFD, rejectedFD;
+        unsigned acceptedObject, rejectedObject;
+        LSBReceivedMessage *accepted = spawnRequest(&acceptedFD, &acceptedObject);
+        if (replacing) { accepted->kind = LSB_REQUEST_EXEC; enqueueExec(accepted, old); }
+        else enqueueSpawn(accepted, nil);
+        assert(jobs.count == BrokerJobCapacity && startingJob && submittedLaunches == 1);
+        assert(!replyFor(acceptedObject) && fcntl(acceptedFD, F_GETFD) >= 0);
+        if (replacing) assert(old.replacementIdentifier == startingJob.identifier && startingJob.guestPID == old.guestPID);
+
+        enqueueSpawn(spawnRequest(&rejectedFD, &rejectedObject), nil);
+        assert(replyFor(rejectedObject)->error == EAGAIN && jobs.count == BrokerJobCapacity && submittedLaunches == 1);
+        assertClosed(rejectedFD);
+        LSBReceivedMessage *exec = spawnRequest(&rejectedFD, &rejectedObject);
+        exec->kind = LSB_REQUEST_EXEC;
+        enqueueExec(exec, other);
+        assert(replyFor(rejectedObject)->error == EAGAIN && !other.replacementIdentifier);
+        assert(jobs.count == BrokerJobCapacity && submittedLaunches == 1);
+        assertClosed(rejectedFD);
+        resetBroker();
+        assertClosed(acceptedFD);
+    }
+}
+
+static void testExecDoesNotConsumeAnotherChildSlot(void) {
+    resetBroker();
+    LSBJob *parent = managedJob(nil, 6500);
+    for (unsigned index = 0; index < LSB_CHILD_STATUS_CAPACITY; ++index) managedJob(parent, 6501 + index);
+    assert(jobs.count < BrokerJobCapacity);
+    LSBJob *old = jobs[1];
+    LSBChildTicket ticket = old.parentTicket;
+    int fd;
+    unsigned object;
+    enqueueSpawn(spawnRequest(&fd, &object), parent);
+    assert(replyFor(object)->error == EAGAIN && !startingJob && !submittedLaunches);
+    assertClosed(fd);
+
+    LSBReceivedMessage *exec = spawnRequest(&fd, &object);
+    exec->kind = LSB_REQUEST_EXEC;
+    enqueueExec(exec, old);
+    LSBJob *replacement = startingJob;
+    assert(replacement && replacement.guestPID == old.guestPID && jobs.count == LSB_CHILD_STATUS_CAPACITY + 2);
+    reportedPID = getpid() + 200;
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 6600, 0));
+    handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 6600, replacement.identifier));
+    assert(replyFor(object) && !replyFor(object)->error && replyFor(object)->pid == old.guestPID);
+    assert(!findJob(old.identifier) && jobs.count == LSB_CHILD_STATUS_CAPACITY + 1);
+    assert(replacement.parentTicket.index == ticket.index && replacement.parentTicket.generation == ticket.generation);
+    LSBChildObservation observation;
+    assert(!LSBChildStatusObserve(parent.childStatus, old.guestPID, &observation));
+    assert(observation.nativePID == reportedPID && observation.execGeneration == 1 && !observation.exited);
+    LSBChildTicket extra;
+    assert(LSBChildStatusReserve(parent.childStatus, &extra) == EAGAIN);
+    assertClosed(fd);
+}
+
+static void testFullLaunchdBatchFitsExecOverlap(void) {
+    resetBroker();
+    LSBJob *launchd = managedJob(nil, 6700);
+    launchd.simulatorLaunchd = YES;
+    managedJob(nil, 6701); // Host-owned native Metal helper occupies a physical job, not a launchd child-ledger slot.
+    NSMutableArray<LSBJob *> *proxies = [NSMutableArray array];
+    for (unsigned i = 0; i < LSB_CHILD_STATUS_CAPACITY; ++i) [proxies addObject:managedJob(launchd, 6702 + i)];
+    int fds[LSB_CHILD_STATUS_CAPACITY];
+    for (unsigned i = 0; i < LSB_CHILD_STATUS_CAPACITY; ++i) {
+        unsigned object;
+        LSBReceivedMessage *exec = spawnRequest(&fds[i], &object);
+        exec->kind = LSB_REQUEST_EXEC;
+        enqueueExec(exec, proxies[i]);
+        LSBJob *replacement = findJob(proxies[i].replacementIdentifier);
+        assert(replacement && !replyFor(object) && replacement.guestPID == proxies[i].guestPID);
+        assert(replacement.phase == (i ? JobQueued : JobStarting));
+    }
+    assert(jobs.count == BrokerJobCapacity && submittedLaunches == 1);
+    LSBChildTicket extra;
+    assert(LSBChildStatusReserve(launchd.childStatus, &extra) == EAGAIN);
+    resetBroker();
+    for (unsigned i = 0; i < LSB_CHILD_STATUS_CAPACITY; ++i) assertClosed(fds[i]);
 }
 
 static void testLaunchdAdoptsRunningAndZombieChildren(void) {
@@ -1280,6 +1369,42 @@ static void testDisplayEndpointRegistrationCompletesAll(void) {
         assert(!mach_port_deallocate(mach_task_self(), service));
         assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
     }
+}
+
+static void testDisplayRegistrationSharesStartupBudget(void) {
+    resetBroker();
+    LSBJob *launchd = runTestJob(nil, 795);
+    launchd.simulatorLaunchd = YES;
+    launchd.indigo = [RecordedIndigoServer new];
+    launchd.framebuffer = [RecordedFramebufferServer new];
+    launchd.iosurface = [RecordedIOSurfaceServer new];
+    launchd.servicesPending = YES;
+    endpointHook = ^(unsigned index) { if (!index) usleep(20000); };
+    mach_port_t service;
+    assert(!mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service));
+    assert(!mach_port_insert_right(mach_task_self(), service, service, MACH_MSG_TYPE_MAKE_SEND));
+    registerDisplayServices(launchd, service);
+    // Proxy handoff remains live while the worker holds its original registration request.
+    int fd;
+    unsigned object;
+    enqueueSpawn(spawnRequest(&fd, &object), launchd);
+    LSBJob *proxy = startingJob;
+    assert(proxy && launchd.servicesPending);
+    reportedPID = getpid();
+    handleMessage(messageFor(LSB_REQUEST_CHECKIN, reportedPID, 796, 0));
+    handleMessage(messageFor(LSB_REQUEST_READY, reportedPID, 796, proxy.identifier));
+    assert(replyFor(object) && !replyFor(object)->error && launchd.servicesPending);
+    runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
+    assert(!launchd.servicesError && endpointCalls == 3);
+    assert(registeredTimeouts[0] > 29000 && registeredTimeouts[0] <= 30000);
+    assert(registeredTimeouts[1] < registeredTimeouts[0] && registeredTimeouts[2] <= registeredTimeouts[1]);
+    kern_return_t status = 42;
+    audit_token_t expected = launchd.audit;
+    assert(registerDisplayEndpoint(service, &expected, "expired", 111, 0, &status) == ETIMEDOUT);
+    assert(status == -1 && endpointCalls == 3); // Exhaustion sends no extra mutation and never retries an unknown outcome.
+    finishJob(launchd, ECANCELED);
+    assert(!mach_port_deallocate(mach_task_self(), service));
+    assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
 }
 
 static mach_port_t newServiceEndpoint(void) {
@@ -1722,6 +1847,9 @@ int main(void) {
         testExitStatusesAndRepeatedReaping();
         testExecReplacement();
         testExecFailurePreservesCaller();
+        testGlobalJobCapacity();
+        testExecDoesNotConsumeAnotherChildSlot();
+        testFullLaunchdBatchFitsExecOverlap();
         testAuditOwnerAuthenticationAndIdentity();
         testAuditIdentityHistoryNeverEvicts();
         testAuditResolutionSeesCommittedExecOnly();
@@ -1729,6 +1857,7 @@ int main(void) {
         testGraphicsOwnerExecIsRejectedWithoutChangingAuthorization();
         testDirectBackboardWaitsForServices();
         testDisplayEndpointRegistrationCompletesAll();
+        testDisplayRegistrationSharesStartupBudget();
         testNativeMetalReadyGatesLaunchd();
         testNativeMetalOwnerLifecycle();
         testNativeProbeAssertionLoss();

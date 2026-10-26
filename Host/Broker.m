@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { JobQueued, JobStarting, JobDispatched, JobRunning };
@@ -94,7 +95,9 @@ static BOOL launchLaneFailed;
 static unsigned finishingDepth;
 static LSBTerminalSession *hostTerminal;
 static BOOL enableIndigo;
-enum { RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
+// Allow every launchd child to overlap its exec replacement, plus simulator launchd and its native Metal helper.
+enum { BrokerJobCapacity = 2 * LSB_CHILD_STATUS_CAPACITY + 2, DisplayRegistrationTimeoutSeconds = 30,
+       RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
 typedef struct { audit_token_t audit; pid_t guestPID; } LSBRetiredIdentity;
 static LSBRetiredIdentity retiredIdentities[RetiredIdentityCapacity];
 static unsigned retiredIdentityCount, auditResolutionLogs;
@@ -517,7 +520,7 @@ static LSBJob *enqueueJob(LSBReceivedMessage *message, LSBJob *parent, uint32_t 
     retryAdoptions();
     if (pendingAdoptions.count) { replyError(message, EAGAIN); return nil; }
     if (launchLaneFailed) { replyError(message, EBUSY); return nil; }
-    if (jobs.count >= 16) { replyError(message, EAGAIN); return nil; }
+    if (jobs.count >= BrokerJobCapacity) { replyError(message, EAGAIN); return nil; }
     LSBJob *job = [LSBJob new];
     job.executionRole = executionRole;
     int error = prepareChildStatus(job);
@@ -553,7 +556,7 @@ static void enqueueExec(LSBReceivedMessage *message, LSBJob *old) {
                                   owner.iosurfaceAuthorizedIdentifier == old.identifier || owner.nativeMetalAuthorizedIdentifier == old.identifier) {
         replyError(message, ENOTSUP); return;
     }
-    if (jobs.count >= 16) { replyError(message, EAGAIN); return; }
+    if (jobs.count >= BrokerJobCapacity) { replyError(message, EAGAIN); return; }
     LSBJob *job = [LSBJob new];
     int error = inheritChildStatus(job, old);
     if (error) { replyError(message, error); return; }
@@ -608,6 +611,17 @@ static int signalTerminal(pid_t foreground, int signalNumber) {
     return found ? firstError : ESRCH;
 }
 
+static int registerDisplayEndpoint(mach_port_t service, const audit_token_t *audit, const char *name,
+                                   mach_port_t endpoint, int64_t deadline, kern_return_t *status) {
+    *status = -1;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return errno;
+    int64_t remaining = deadline - (int64_t)now.tv_sec * NSEC_PER_SEC - now.tv_nsec;
+    if (remaining <= 0) return ETIMEDOUT;
+    uint32_t milliseconds = (uint32_t)((remaining + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC);
+    return LSBLaunchdRegisterEndpointWithTimeout(service, audit, name, endpoint, milliseconds, status);
+}
+
 static void registerDisplayServices(LSBJob *active, mach_port_t service) {
     if (!active.servicesPending) return;
     LSBJob *helper = findJob(active.nativeMetalServiceIdentifier);
@@ -634,26 +648,33 @@ static void registerDisplayServices(LSBJob *active, mach_port_t service) {
     LSBFramebufferServer *framebuffer = active.framebuffer;
     LSBIOSurfaceServer *iosurface = active.iosurface;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // Launchd can spend several seconds synchronously spawning its initial xpcproxy batch before servicing the final registration.
+        // Keep each original request/reply alive within one bounded startup budget; timeout is an unknown outcome, not retry permission.
+        struct timespec now = {0};
+        int clockError = clock_gettime(CLOCK_MONOTONIC, &now) ? errno : 0;
+        int64_t deadline = ((int64_t)now.tv_sec + DisplayRegistrationTimeoutSeconds) * NSEC_PER_SEC + now.tv_nsec;
         kern_return_t indigoStatus = -1, iosurfaceStatus = -1, framebufferStatus = -1, metalStatus = -1, backboardMetalStatus = -1;
-        int indigoError = indigo ? LSBLaunchdRegisterEndpoint(service, &expected, "IndigoHIDRegistrationPort",
-                                                             indigo.registrationPort, &indigoStatus) : 0;
+        int indigoError = clockError ? clockError : indigo ? registerDisplayEndpoint(service, &expected, "IndigoHIDRegistrationPort",
+                                                                                    indigo.registrationPort, deadline, &indigoStatus) : 0;
         int endpointError = indigoError, iosurfaceError = ECANCELED, framebufferError = ECANCELED;
         if (!endpointError && iosurface) {
-            iosurfaceError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.IOSurface.Remote", iosurface.registrationPort, &iosurfaceStatus);
+            iosurfaceError = registerDisplayEndpoint(service, &expected, "com.apple.IOSurface.Remote",
+                                                     iosurface.registrationPort, deadline, &iosurfaceStatus);
             endpointError = iosurfaceError;
         }
         if (!endpointError && framebuffer) {
-            framebufferError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.CoreSimulator.SimFramebufferServer",
-                                                         framebuffer.registrationPort, &framebufferStatus);
+            framebufferError = registerDisplayEndpoint(service, &expected, "com.apple.CoreSimulator.SimFramebufferServer",
+                                                        framebuffer.registrationPort, deadline, &framebufferStatus);
             endpointError = framebufferError;
         }
         int metalError = ECANCELED, backboardMetalError = ECANCELED;
         if (!endpointError && MACH_PORT_VALID(metal)) {
-            metalError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.metal.simulator", metal, &metalStatus);
+            metalError = registerDisplayEndpoint(service, &expected, "com.apple.metal.simulator", metal, deadline, &metalStatus);
             endpointError = metalError;
         }
         if (!endpointError && MACH_PORT_VALID(metal)) {
-            backboardMetalError = LSBLaunchdRegisterEndpoint(service, &expected, "com.apple.metal.simulator.backboardd", metal, &backboardMetalStatus);
+            backboardMetalError = registerDisplayEndpoint(service, &expected, "com.apple.metal.simulator.backboardd",
+                                                          metal, deadline, &backboardMetalStatus);
             endpointError = backboardMetalError;
         }
         if (MACH_PORT_VALID(metal)) mach_port_deallocate(mach_task_self(), metal);
@@ -1011,6 +1032,13 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
         enableIndigo = YES;
         return argc == 2 ? LSBPrepareLaunchdBackboardPlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     }
+    if (argc > 1 && !strcmp(argv[1], "--launchd-services")) {
+        const char *defaults[] = {"com.apple.notifyd", "com.apple.lsd", "com.apple.runningboardd", "com.apple.containermanagerd",
+                                  "com.apple.fontservicesd", "com.apple.containermanagerd.system", "com.apple.distnoted.xpc.daemon",
+                                  "com.apple.configd_sim", NULL};
+        enableIndigo = YES;
+        return LSBPrepareLaunchdServicesPlan(message, runtimeRoot.fileSystemRepresentation, envp, argc > 2 ? argv + 2 : defaults);
+    }
     if (argc > 1 && !strcmp(argv[1], "--launchd-lifecycle"))
         return argc == 2 ? LSBPrepareLaunchdLifecyclePlan(message, runtimeRoot.fileSystemRepresentation, envp) : EINVAL;
     plan->version = LSB_PLAN_VERSION;
@@ -1065,7 +1093,7 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
 
 static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole) {
     if (!enableIndigo) { enqueueJob(initial, nil, executionRole); return 0; }
-    // Only the host's --launchd-backboardd plan can provision a native service. Neither the plan pathname nor guest environment selects it.
+    // Only the host's graphics launch modes can provision a native service. Neither the plan pathname nor guest environment selects it.
     const char *arguments[] = { "LiveSimBooter", "--native-metal-probe", NULL };
     LSBReceivedMessage *request = calloc(1, sizeof(*request));
     if (!request) { disposeMessage(initial); return ENOMEM; }

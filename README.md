@@ -44,6 +44,9 @@ pool; drawable and GPU waits stay off the UI thread. Apple-logo/progress renderi
 See [backboardd progress and cache measurements](docs/backboardd.md), [framebuffer transport](docs/framebuffer.md), and
 [the native IOSurface service](docs/iosurface.md).
 
+`--launchd-services` adds selected matching-runtime daemons to that bootstrap. Optional trailing stock job labels replace
+the default selection. See [services toward SpringBoard](docs/springboard-services.md) for the staged tests and limits.
+
 The native Metal backend uses matching simulator serializer/server libraries adapted through platform, dependency and
 export metadata, with their code sections unchanged. A phone probe running as the backboardd job compiled shader source
 through the stock guest compiler, created a pipeline, rendered a triangle, verified IOSurface pixels and wrote a PNG.

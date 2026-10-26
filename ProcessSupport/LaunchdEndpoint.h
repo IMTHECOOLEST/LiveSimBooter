@@ -2,6 +2,7 @@
 #define LSB_LAUNCHD_ENDPOINT_H
 
 #include <mach/mach.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +13,10 @@ extern "C" {
 // bootstrapStatus receives -1 unless an authenticated reply supplies the server's return code. Both input rights stay borrowed.
 int LSBLaunchdRegisterEndpoint(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
                               mach_port_t endpoint, kern_return_t *bootstrapStatus);
+// Same transaction and ownership rules, with a caller-selected 1..30000 millisecond budget shared by send and receive.
+// Keep one request alive while startup is busy; never retry an unknown registration after a timeout.
+int LSBLaunchdRegisterEndpointWithTimeout(mach_port_t service, const audit_token_t *expectedAudit, const char *name,
+                                         mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *bootstrapStatus);
 #ifdef __cplusplus
 }
 #endif

@@ -12,8 +12,11 @@ mkdir -p tmp/device-log
 
 ## Install and transfer
 
-The host target requests `com.apple.developer.kernel.increased-memory-limit` through `LiveSimBooter.entitlements` in both
-Debug and Release. Use a provisioning profile that grants it and inspect the final signed entitlements before installation.
+The host and LiveProcess extension request `com.apple.developer.kernel.increased-memory-limit` through their respective
+entitlements files. Each target needs a provisioning profile that grants it; inspect both final signed entitlements before installation.
+The extension's profile was refreshed through a separate app target using the same extension bundle identifier, since Xcode's
+extension capability UI did not offer it. The refreshed profile and the installed extension signature both contain the key
+on the 2026-10-26 iOS 26.1 device test. Refreshing a profile alone does not add the key to this project's signed executable.
 It is separate from Extended Virtual Addressing; verify the intended VM range under LLDB instead of assuming that range is available.
 
 Install a normally signed development build of the host app. Compilation without signing is useful for checks but does

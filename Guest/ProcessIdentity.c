@@ -13,6 +13,25 @@
 
 static _Atomic(pid_t) guestPID, parentPID;
 static _Atomic(bool) parentKnown;
+static char nativeNotifydPath[PATH_MAX];
+
+static void configureNativeNotifydIdentity(void) {
+    nativeNotifydPath[0] = '\0';
+    const char *enabled = getenv("LSB_SIMULATE_NOTIFICATION_SHM"), *root = getenv("DYLD_ROOT_PATH");
+    if (!enabled || strcmp(enabled, "1") || !root || root[0] != '/') return;
+    static const char suffix[] = "/usr/sbin/notifyd";
+    size_t length = strnlen(root, sizeof(nativeNotifydPath));
+    if (length < 2 || length > sizeof(nativeNotifydPath) - sizeof(suffix) || root[length - 1] == '/' || strchr(root, ':')) return;
+    // Launchd configuration supplies a canonical host path. Reject aliases and root lists without doing filesystem work in dyld callbacks.
+    for (const char *component = root + 1; *component;) {
+        const char *end = strchr(component, '/');
+        size_t size = end ? (size_t)(end - component) : strlen(component);
+        if (!size || (size == 1 && component[0] == '.') || (size == 2 && component[0] == '.' && component[1] == '.')) return;
+        component += size + (end != NULL);
+    }
+    memcpy(nativeNotifydPath, root, length);
+    memcpy(nativeNotifydPath + length, suffix, sizeof(suffix));
+}
 
 typedef struct { _Atomic(uintptr_t) image, begin, end; } NativeIdentityRange;
 static NativeIdentityRange nativeIdentityRanges[16];
@@ -27,7 +46,9 @@ static void forgetNativeIdentityImage(const struct mach_header *image) {
 
 static void __attribute__((unused)) rememberNativeIdentityImage(const struct mach_header *image, intptr_t slide, const char *path) {
     const char *leaf = path ? strrchr(path, '/') : NULL;
-    if (!image || image->magic != MH_MAGIC_64 || !leaf || strcmp(leaf + 1, "libxpc.dylib")) return;
+    if (!image || image->magic != MH_MAGIC_64 || !leaf) return;
+    bool notifyd = nativeNotifydPath[0] && !strcmp(path, nativeNotifydPath);
+    if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd) return;
     const struct mach_header_64 *header = (const struct mach_header_64 *)image;
     const unsigned char *command = (const unsigned char *)(header + 1), *end = command + header->sizeofcmds;
     forgetNativeIdentityImage(image);
@@ -95,6 +116,7 @@ static pid_t environmentPID(const char *key) {
 }
 
 __attribute__((constructor)) static void initializeIdentity(void) {
+    configureNativeNotifydIdentity();
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);
@@ -133,8 +155,8 @@ pid_t LSBGuestParentPID(void) {
 }
 
 #ifndef LSB_PROCESS_IDENTITY_TESTING
-// libxpc compares getpid() against kernel audit tokens. Its direct calls retain native identity; guest code
-// sees the stable logical PID. A call through another image or a tail call cannot be classified as libxpc here.
+// libxpc compares getpid() against kernel audit tokens. Opted-in notifyd publishes its PID to sibling clients' native PROC watches.
+// Only direct calls from those images retain native identity; other guest code sees the stable logical PID.
 __attribute__((used, section("__DATA,__interpose"))) static const struct { const void *replacement, *original; } interpositions[] = {
     {(const void *)&LSBGetPID, (const void *)&getpid},
     {(const void *)&LSBTaskNameForPID, (const void *)&task_name_for_pid},

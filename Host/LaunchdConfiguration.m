@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
+#include <CommonCrypto/CommonDigest.h>
 #include "LaunchdConfiguration.h"
+#include "ChildStatus.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -8,6 +10,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// Backboardd and cfprefsd are always direct launchd children alongside the selected services.
+enum { BaselineLaunchdChildren = 2, MaximumSelectedServices = LSB_CHILD_STATUS_CAPACITY - BaselineLaunchdChildren };
+_Static_assert(LSB_CHILD_STATUS_CAPACITY > BaselineLaunchdChildren, "selected services need available child-ledger slots");
 
 static int openDirectory(int parent, const char *name) {
     if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
@@ -127,10 +133,126 @@ static BOOL controlledEnvironment(const char *entry, NSDictionary<NSString *, NS
            [key isEqualToString:@"LSB_FAKE_PTY_STATE"] || [key isEqualToString:@"TERM"];
 }
 
-static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[], NSString *probe) {
+static BOOL serviceEnvironmentKey(NSString *key) {
+    if (!key.length || [key containsString:@"="]) return NO;
+    for (NSString *prefix in @[@"DYLD_", @"LSB_", @"XPC_", @"SIMULATOR_", @"IPHONE_"])
+        if ([key hasPrefix:prefix]) return NO;
+    return ![@[@"HOME", @"CFFIXED_USER_HOME", @"TMPDIR", @"PATH", @"TERM"] containsObject:key];
+}
+
+static BOOL validGuestProgram(NSString *path) {
+    if (![path isKindOfClass:NSString.class] || ![path hasPrefix:@"/"] || [path lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= LSB_PATH_BYTES)
+        return NO;
+    if (![path canBeConvertedToEncoding:NSUTF8StringEncoding] || [path rangeOfString:@"\0"].location != NSNotFound) return NO;
+    for (NSString *part in path.pathComponents) if ([part isEqual:@".."] || [part isEqual:@"."]) return NO;
+    return path.length > 1;
+}
+
+static int addServiceJobs(NSString *root, const char *const labels[], NSMutableDictionary<NSString *, NSData *> *jobs,
+                         NSMutableArray<NSString *> *logs) {
+    if (!labels) return EINVAL;
+    NSMutableSet<NSString *> *seen = [NSMutableSet setWithArray:@[@"com.apple.backboardd", @"com.apple.cfprefsd.xpc.daemon"]];
+    for (unsigned index = 0; labels[index]; ++index) {
+        if (index == MaximumSelectedServices) return E2BIG;
+        const char *labelBytes = labels[index];
+        size_t length = strnlen(labelBytes, 129);
+        if (!length || length > 128) return EINVAL;
+        for (size_t i = 0; i < length; ++i) {
+            unsigned char c = labelBytes[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+                return EINVAL;
+        }
+        NSString *label = [NSString stringWithUTF8String:labelBytes];
+        if ([label isEqual:@"."] || [label isEqual:@".."] || [seen containsObject:label]) return EINVAL;
+        [seen addObject:label];
+        NSString *filename = [label stringByAppendingString:@".plist"];
+        NSString *stockPath = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
+        struct stat metadata;
+        if (lstat(stockPath.fileSystemRepresentation, &metadata)) return errno;
+        if (!S_ISREG(metadata.st_mode)) return S_ISLNK(metadata.st_mode) ? ELOOP : EINVAL;
+        if (metadata.st_size <= 0 || metadata.st_size > 1024 * 1024) return EFBIG;
+        char canonical[PATH_MAX];
+        if (!realpath(stockPath.fileSystemRepresentation, canonical)) return errno;
+        const char *rootBytes = root.fileSystemRepresentation;
+        size_t rootLength = strlen(rootBytes);
+        if (strncmp(canonical, rootBytes, rootLength) || canonical[rootLength] != '/') return EPERM;
+        NSData *data = [NSData dataWithContentsOfFile:stockPath];
+        if (!data) return EIO;
+        NSDictionary *stock = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
+        if (![stock isKindOfClass:NSDictionary.class] || ![stock[@"Label"] isEqual:label]) return EINVAL;
+        NSString *program = stock[@"Program"];
+        NSArray *arguments = stock[@"ProgramArguments"];
+        if (program && !validGuestProgram(program)) return EINVAL;
+        if (arguments && (![arguments isKindOfClass:NSArray.class] || !arguments.count || arguments.count > LSB_MAX_VECTOR)) return EINVAL;
+        for (id argument in arguments) {
+            if (![argument isKindOfClass:NSString.class] || ![argument canBeConvertedToEncoding:NSUTF8StringEncoding] ||
+                [argument lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= LSB_STRING_BYTES || [argument rangeOfString:@"\0"].location != NSNotFound)
+                return EINVAL;
+        }
+        if (!program && (!arguments || !validGuestProgram(arguments[0]))) return EINVAL;
+        NSDictionary *services = stock[@"MachServices"];
+        if (services && ![services isKindOfClass:NSDictionary.class]) return EINVAL;
+        for (id name in services) {
+            id value = services[name];
+            if (![name isKindOfClass:NSString.class] || ![name length] ||
+                (![value isKindOfClass:NSDictionary.class] && ![value isKindOfClass:NSNumber.class])) return EINVAL;
+        }
+        id publishes = stock[@"PublishesEvents"];
+        if (publishes && ![publishes isKindOfClass:NSString.class] && ![publishes isKindOfClass:NSDictionary.class]) return EINVAL;
+        NSString *logName = [label stringByAppendingString:@".log"];
+        NSString *log = [@"/private/var/mobile/Library/Logs" stringByAppendingPathComponent:logName];
+        NSMutableDictionary *job = [@{@"Label": label, @"WorkingDirectory": @"/private/var/mobile/",
+            @"StandardOutPath": log, @"StandardErrorPath": log, @"RunAtLoad": @YES, @"KeepAlive": @NO, @"EnableTransactions": @NO} mutableCopy];
+        if (program) job[@"Program"] = program;
+        if (arguments) job[@"ProgramArguments"] = arguments;
+        if (services) job[@"MachServices"] = services;
+        if (publishes) job[@"PublishesEvents"] = publishes;
+        NSDictionary *environment = stock[@"EnvironmentVariables"];
+        if (environment && ![environment isKindOfClass:NSDictionary.class]) return EINVAL;
+        NSMutableDictionary *safeEnvironment = [NSMutableDictionary dictionary];
+        for (id key in environment) {
+            id value = environment[key];
+            if (![key isKindOfClass:NSString.class] || ![value isKindOfClass:NSString.class] ||
+                ![key canBeConvertedToEncoding:NSUTF8StringEncoding] || ![value canBeConvertedToEncoding:NSUTF8StringEncoding] ||
+                [key rangeOfString:@"\0"].location != NSNotFound || [value rangeOfString:@"\0"].location != NSNotFound) return EINVAL;
+            if (serviceEnvironmentKey(key)) safeEnvironment[key] = value;
+        }
+        if (safeEnvironment.count) job[@"EnvironmentVariables"] = safeEnvironment;
+        NSData *jobData = [NSPropertyListSerialization dataWithPropertyList:job format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+        if (!jobData) return EINVAL;
+        jobs[filename] = jobData;
+        [logs addObject:logName];
+    }
+    return 0;
+}
+
+static NSString *serviceDirectoryName(const char *const labels[], int *error) {
+    *error = EINVAL;
+    if (!labels) return nil;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (unsigned i = 0; labels[i]; ++i) {
+        if (i == MaximumSelectedServices) { *error = E2BIG; return nil; }
+        if (strnlen(labels[i], 129) > 128) return nil;
+        NSString *name = [NSString stringWithUTF8String:labels[i]];
+        if (!name) return nil;
+        [names addObject:name];
+    }
+    NSData *selection = [[[names sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(selection.bytes, (CC_LONG)selection.length, digest);
+    NSMutableString *suffix = [NSMutableString string];
+    for (unsigned i = 0; i < 16; ++i) [suffix appendFormat:@"%02x", digest[i]];
+    // Different selections use distinct directories; narrowing never loads stale jobs or deletes an earlier experiment.
+    *error = 0;
+    return [@"LiveSimBooter-CoreDaemons-" stringByAppendingString:suffix];
+}
+
+static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[], NSString *probe,
+                             const char *const serviceLabels[]) {
     if (!message || !runtimeRoot || runtimeRoot[0] != '/') return EINVAL;
     @autoreleasepool {
-        BOOL includeJob = probe != nil, backboard = [probe isEqualToString:@"backboardd"], lifecycle = [probe isEqualToString:@"lifecycle"];
+        BOOL services = [probe isEqualToString:@"services"], includeJob = probe != nil;
+        BOOL backboard = services || [probe isEqualToString:@"backboardd"], lifecycle = [probe isEqualToString:@"lifecycle"];
         char canonical[PATH_MAX];
         if (!realpath(runtimeRoot, canonical)) return errno;
         struct stat status;
@@ -141,12 +263,15 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
         NSString *dataPath = [group stringByAppendingPathComponent:@"SimulatorData"];
         NSString *configPath = [dataPath stringByAppendingPathComponent:@"var/run/LiveSimBooter-launchd-bootstrap.plist"];
         NSString *logPath = [dataPath stringByAppendingPathComponent:@"Library/Logs/LiveSimBooter-launchd.log"];
-        NSString *directoryName = backboard ? @"LiveSimBooter-BackboardDaemons" : lifecycle ? @"LiveSimBooter-LifecycleDaemons" : @"LiveSimBooter-LaunchDaemons";
+        int selectionError = 0;
+        NSString *directoryName = services ? serviceDirectoryName(serviceLabels, &selectionError) : backboard ? @"LiveSimBooter-BackboardDaemons" :
+            lifecycle ? @"LiveSimBooter-LifecycleDaemons" : @"LiveSimBooter-LaunchDaemons";
+        if (!directoryName) return selectionError ? selectionError : EINVAL;
         NSString *jobDirectory = [[dataPath stringByAppendingPathComponent:@"Library"] stringByAppendingPathComponent:directoryName];
         NSString *label = backboard ? @"com.apple.backboardd" : [@"com.kdt.LiveSimBooter." stringByAppendingString:probe ?: @"df"];
         NSString *jobNameString = [label stringByAppendingString:@".plist"];
         NSString *jobPath = [jobDirectory stringByAppendingPathComponent:jobNameString];
-        NSString *logName = [probe ?: @"df" stringByAppendingString:@".log"];
+        NSString *logName = [backboard ? @"backboardd" : probe ?: @"df" stringByAppendingString:@".log"];
         NSString *jobLogPath = [[dataPath stringByAppendingPathComponent:@"Library/Logs"] stringByAppendingPathComponent:logName];
         if (strlen(canonical) >= LSB_PATH_BYTES || strlen(dataPath.fileSystemRepresentation) >= LSB_PATH_BYTES ||
             strlen(configPath.fileSystemRepresentation) >= LSB_PATH_BYTES ||
@@ -169,6 +294,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"HOME": dataPath, @"CFFIXED_USER_HOME": dataPath, @"TMPDIR": [dataPath stringByAppendingString:@"/tmp/"],
             @"PATH": [NSString stringWithFormat:@"%@/usr/bin:%@/bin:%@/usr/sbin:%@/sbin", root, root, root, root]
         } mutableCopy];
+        if (services) runtimeEnvironment[@"LSB_SIMULATE_NOTIFICATION_SHM"] = @"1";
         if (backboard) {
             runtimeEnvironment[@"LSB_SIMULATE_SYSTEM_POWER"] = @"1";
             // The cached client dlopens getenv directly; an absent value resolves its dispatch table back to its own trampolines.
@@ -208,6 +334,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
         NSData *plist = [NSPropertyListSerialization dataWithPropertyList:configuration format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
         if (!plist) return EINVAL;
         NSMutableDictionary<NSString *, NSData *> *jobPlists = [NSMutableDictionary dictionary];
+        NSMutableArray<NSString *> *serviceLogs = [NSMutableArray array];
         if (includeJob) {
             // The trailing slash selects launchd's mobile-directory prefix rule before proxy calls chdir on the translated path.
             NSString *guestLog = [@"/private/var/mobile/Library/Logs" stringByAppendingPathComponent:logName];
@@ -257,6 +384,10 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
                 jobPlists[preferencesName] = preferencesPlist;
             }
         }
+        if (services) {
+            int serviceError = addServiceJobs(root, serviceLabels, jobPlists, serviceLogs);
+            if (serviceError) return serviceError;
+        }
         LSBSpawnPlan *plan = calloc(1, sizeof(*plan));
         if (!plan) return ENOMEM;
         plan->version = LSB_PLAN_VERSION;
@@ -266,6 +397,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
         if (!error) error = LSBPlanAddString(plan, "/sbin/launchd_sim", &plan->argv[plan->argc++]);
         if (!error) error = LSBPlanAddString(plan, configPath.fileSystemRepresentation, &plan->argv[plan->argc++]);
         for (const char *const *entry = inheritedEnv; !error && entry && *entry; ++entry) {
+            if (services && (!strncmp(*entry, "LSB_DEBUG_", 10) || !strncmp(*entry, "DYLD_PRINT_", 11))) continue;
             if (!controlledEnvironment(*entry, launchEnvironment)) error = addEnvironment(plan, *entry);
         }
         for (NSString *key in [launchEnvironment.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
@@ -310,6 +442,12 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             if (preferencesLog < 0) error = errno;
             else close(preferencesLog);
         }
+        for (NSString *name in serviceLogs) {
+            if (error) break;
+            int serviceLog = openRegularLog(directories[6], name.UTF8String);
+            if (serviceLog < 0) error = errno;
+            else close(serviceLog);
+        }
         if (!error && backboard) error = prepareTouchPreferences(directories[8], &touchPreferences);
         for (NSString *name in [jobPlists.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
             if (error) break;
@@ -333,17 +471,22 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
 }
 
 int LSBPrepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]) {
-    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, nil);
+    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, nil, NULL);
 }
 
 int LSBPrepareLaunchdDFPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]) {
-    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"df");
+    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"df", NULL);
 }
 
 int LSBPrepareLaunchdBackboardPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]) {
-    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"backboardd");
+    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"backboardd", NULL);
+}
+
+int LSBPrepareLaunchdServicesPlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[],
+                                 const char *const labels[]) {
+    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"services", labels);
 }
 
 int LSBPrepareLaunchdLifecyclePlan(LSBReceivedMessage *message, const char *runtimeRoot, const char *const inheritedEnv[]) {
-    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"lifecycle");
+    return prepareLaunchdPlan(message, runtimeRoot, inheritedEnv, @"lifecycle", NULL);
 }

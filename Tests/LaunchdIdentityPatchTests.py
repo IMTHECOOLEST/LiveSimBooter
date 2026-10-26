@@ -161,6 +161,34 @@ class PinnedBinaryTests(unittest.TestCase):
         # The separate PID-domain creation path still compares the requested native PID against the original audit PID.
         self.assertEqual(self.patched[0x2D2E0:0x2D338], self.original[0x2D2E0:0x2D338])
 
+    def test_event_publisher_fetch_and_poll_resolve_only_the_authenticated_owner(self):
+        # The event dispatcher obtains the full native audit token in x22. Preserve it for later policy checks.
+        self.assertEqual(decode_branch(struct.unpack_from('<I', self.original, 0x2FD70)[0], 0x2FD70), 0x374AC)
+        self.assertEqual(struct.unpack_from('<I', self.original, 0x2FD80)[0], 0xAA0003F6)  # mov x22, x0
+        for index, routine, site in ((6, 0x193, 0x30048), (7, 0x196, 0x2FFD8)):
+            self.assertEqual(PATCH.SITES[index], (site, 0xB94016C0, 22, 0))
+            jump = struct.unpack_from('<H', self.original, 0x3F2C6 + (routine - 0x190) * 2)[0]
+            self.assertEqual(0x2FDA0 + jump * 4, site)
+            call = struct.unpack_from('<I', self.original, site + 4)[0]
+            self.assertEqual(call >> 26, 0b100101)
+            self.assertEqual(decode_branch(call, site + 4), 0x17F84)  # managed job lookup
+            self.assertEqual(struct.unpack_from('<I', self.original, site + 8)[0],
+                             0xB4000000 | (((0x30228 - (site + 8)) // 4) << 5))  # missing job -> EPERM
+        self.assertEqual(self.patched[0x2FD48:0x2FFD8], self.original[0x2FD48:0x2FFD8])
+        self.assertEqual(self.patched[0x2FFDC:0x30048], self.original[0x2FFDC:0x30048])
+        self.assertEqual(self.patched[0x3004C:0x30578], self.original[0x3004C:0x30578])
+        self.assertEqual(self.patched[0x3F2C6:0x3F2E0], self.original[0x3F2C6:0x3F2E0])
+
+    def test_prior_six_site_revision_is_rejected(self):
+        # Older signed outputs must not be silently upgraded or mistaken for the current all-sites patch.
+        changed = bytearray(self.patched)
+        for offset, before, _, _ in PATCH.SITES[6:]:
+            struct.pack_into('<I', changed, offset, before)
+        changed[0x52800:PATCH.CAVE_END] = bytes(PATCH.CAVE_END - 0x52800)
+        changed[0x52800:0x52800 + len(PATCH.SYMBOL)] = PATCH.SYMBOL
+        with self.assertRaisesRegex(ValueError, 'Partial patch or mismatched owner-read instructions'):
+            PATCH.patched_bytes(changed)
+
     def test_signature_moved_metadata_bounded_and_idempotent(self):
         old_start, old_size = PATCH.inspect_header(self.original)
         new_start, new_size = PATCH.inspect_header(self.patched)
@@ -192,7 +220,8 @@ class PinnedBinaryTests(unittest.TestCase):
                     PATCH.patched_bytes(changed)
 
     def test_reject_partial_or_tampered_patch(self):
-        for offset in (PATCH.SITES[1][0], PATCH.SITES[4][0], PATCH.SITES[5][0], PATCH.CAVE_BEGIN + 72, PATCH.SYMBOL_OFFSET, PATCH.GOT_SLOT,
+        for offset in (PATCH.SITES[1][0], PATCH.SITES[4][0], PATCH.SITES[5][0], PATCH.SITES[6][0], PATCH.SITES[7][0],
+                       PATCH.CAVE_BEGIN + 72, PATCH.SYMBOL_OFFSET, PATCH.GOT_SLOT,
                        PATCH.CHAIN_TAIL, PATCH.ORIGINAL_SIGNATURE + 200, 0x4321, PATCH.FIXUPS_COMMAND + 8):
             with self.subTest(offset=hex(offset)):
                 changed = bytearray(self.patched)

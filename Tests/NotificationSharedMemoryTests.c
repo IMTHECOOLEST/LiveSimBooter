@@ -1,0 +1,184 @@
+#include "../Guest/NotificationSharedMemory.h"
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
+static const char *expectedName;
+static int expectedFlags;
+static mode_t expectedMode;
+static unsigned forwards;
+static int nativeOpen(const char *name, int flags, ...) {
+    assert(name == expectedName && flags == expectedFlags);
+    if (flags & O_CREAT) {
+        va_list arguments;
+        va_start(arguments, flags);
+        assert((mode_t)va_arg(arguments, int) == expectedMode);
+        va_end(arguments);
+    }
+    ++forwards;
+    errno = ENOSYS;
+    return -1;
+}
+static int nativeUnlink(const char *name) { assert(name == expectedName); ++forwards; errno = ENOSYS; return -1; }
+#define shm_open nativeOpen
+#define shm_unlink nativeUnlink
+#define LSB_NOTIFICATION_SHM_TESTING
+#include "../Guest/NotificationSharedMemory.c"
+#undef shm_open
+#undef shm_unlink
+#define objectOpen LSBNotificationShmOpen
+#define objectUnlink LSBNotificationShmUnlink
+
+static void testForwarding(void) {
+    const char *names[] = {NULL, "", "unrelated", "apple.shm.notification_center.extra", "//apple.shm.notification_center",
+                          "/apple.shm.notification_center/nested", "APPLE.shm.notification_center"};
+    assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
+    for (unsigned i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+        expectedName = names[i]; expectedFlags = O_CREAT | O_RDWR | O_EXCL; expectedMode = 0621;
+        unsigned before = forwards;
+        assert(objectOpen(expectedName, expectedFlags, expectedMode) == -1 && errno == ENOSYS);
+        assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
+    }
+    expectedName = "apple.shm.notification_center"; expectedFlags = O_RDONLY;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!i) assert(!unsetenv(LSB_NOTIFICATION_SHM_ENABLE_ENV));
+        else assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, i == 1 ? "" : i == 2 ? "0" : "true", 1));
+        unsigned before = forwards;
+        assert(objectOpen(expectedName, expectedFlags) == -1 && errno == ENOSYS);
+        assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
+    }
+}
+#else
+#define objectOpen shm_open
+#define objectUnlink shm_unlink
+#endif
+
+static const char *name = "apple.shm.notification_center", *slashName = "/apple.shm.notification_center";
+
+static void pathJoin(char result[PATH_MAX], const char *root, const char *suffix) {
+    int count = snprintf(result, PATH_MAX, "%s/%s", root, suffix);
+    assert(count > 0 && count < PATH_MAX);
+}
+
+static void testMappings(const char *root) {
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    assert(objectOpen(name, O_RDWR) == -1 && errno == ENOENT);
+    mode_t originalMask = umask(0027);
+    int writer = objectOpen(name, O_RDWR | O_CREAT | O_EXCL, 0666);
+    umask(originalMask);
+    assert(writer >= 0 && (fcntl(writer, F_GETFD) & FD_CLOEXEC) && !(fcntl(writer, F_GETFL) & O_NONBLOCK));
+    struct stat status;
+    assert(!fstat(writer, &status) && S_ISREG(status.st_mode) && status.st_size == 0 && (status.st_mode & 0777) == 0640);
+    assert(objectOpen(slashName, O_RDWR | O_CREAT | O_EXCL, 0600) == -1 && errno == EEXIST);
+    assert(!ftruncate(writer, 4096));
+    int reader = objectOpen(slashName, O_RDONLY);
+    assert(reader >= 0 && (fcntl(reader, F_GETFD) & FD_CLOEXEC) && (fcntl(reader, F_GETFL) & O_ACCMODE) == O_RDONLY);
+    volatile uint32_t *writeMap = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, writer, 0);
+    volatile const uint32_t *readMap = mmap(NULL, 4096, PROT_READ, MAP_SHARED, reader, 0);
+    assert(writeMap != MAP_FAILED && readMap != MAP_FAILED);
+    writeMap[17] = 0x12345678;
+    assert(readMap[17] == 0x12345678);
+    assert(write(reader, "x", 1) == -1 && errno == EBADF);
+    assert(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, reader, 0) == MAP_FAILED);
+    assert(!objectUnlink(slashName));
+    assert(objectOpen(name, O_RDONLY) == -1 && errno == ENOENT);
+    assert(objectUnlink(name) == -1 && errno == ENOENT);
+    assert(!close(writer) && !close(reader));
+    writeMap[17] = 0x87654321; // POSIX unlink and descriptor close cannot invalidate existing mappings.
+    assert(readMap[17] == 0x87654321);
+    int replacement = objectOpen(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(replacement >= 0 && !ftruncate(replacement, 4096));
+    volatile const uint32_t *newMap = mmap(NULL, 4096, PROT_READ, MAP_SHARED, replacement, 0);
+    assert(newMap != MAP_FAILED && !newMap[17] && readMap[17] == 0x87654321);
+    assert(!munmap((void *)newMap, 4096) && !munmap((void *)writeMap, 4096) && !munmap((void *)readMap, 4096));
+    assert(!close(replacement));
+    int truncated = objectOpen(name, O_RDWR | O_TRUNC);
+    assert(truncated >= 0 && !fstat(truncated, &status) && !status.st_size && !close(truncated));
+    assert(!objectUnlink(name));
+}
+
+static void testRejections(const char *root) {
+    char object[PATH_MAX], temporary[PATH_MAX], unrelated[PATH_MAX], linked[PATH_MAX];
+    pathJoin(temporary, root, "tmp"); pathJoin(object, temporary, "notification-center.shm");
+    pathJoin(unrelated, root, "untouched"); pathJoin(linked, root, "tmp-link");
+    int fd = open(unrelated, O_CREAT | O_EXCL | O_RDWR, 0600);
+    assert(fd >= 0 && write(fd, "keep", 4) == 4 && !close(fd));
+    assert(!symlink(unrelated, object));
+    assert(objectOpen(name, O_RDWR | O_TRUNC) == -1 && errno == ELOOP);
+    assert(objectUnlink(name) == -1 && errno == ELOOP);
+    struct stat status;
+    assert(!stat(unrelated, &status) && status.st_size == 4);
+    assert(!unlink(object) && !mkfifo(object, 0600));
+    assert(objectOpen(name, O_RDWR | O_TRUNC) == -1 && errno == EINVAL);
+    assert(objectUnlink(name) == -1 && errno == EINVAL);
+    assert(!unlink(object) && !mkdir(object, 0700));
+    assert(objectOpen(name, O_RDONLY) == -1 && errno == EINVAL);
+    assert(objectUnlink(name) == -1 && errno == EINVAL);
+    assert(!rmdir(object) && !link(unrelated, object));
+    assert(objectOpen(name, O_RDWR | O_TRUNC) == -1 && errno == EACCES);
+    assert(objectUnlink(name) == -1 && errno == EACCES);
+    assert(!stat(unrelated, &status) && status.st_size == 4 && !unlink(object));
+    assert(objectOpen(name, O_WRONLY | O_CREAT, 0600) == -1 && errno == EINVAL);
+    assert(objectOpen(name, O_RDONLY | O_TRUNC) == -1 && errno == EINVAL);
+    assert(objectOpen(name, O_RDWR | O_APPEND) == -1 && errno == EINVAL);
+
+    assert(!rename(temporary, linked) && !symlink(linked, temporary));
+    assert(objectOpen(name, O_RDWR | O_CREAT, 0600) == -1);
+    assert(objectUnlink(name) == -1);
+    assert(!unlink(temporary) && !rename(linked, temporary));
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, "/", 1));
+    assert(objectOpen(name, O_RDWR | O_CREAT, 0600) == -1 && errno == EINVAL);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, "relative", 1));
+    assert(objectUnlink(name) == -1 && errno == EINVAL);
+    pathJoin(linked, root, ".");
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, linked, 1));
+    assert(objectOpen(name, O_RDONLY) == -1 && errno == EINVAL);
+    assert(!unsetenv(LSB_NOTIFICATION_SHM_ROOT_ENV));
+    assert(objectUnlink(name) == -1 && errno == EINVAL);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    if (geteuid()) {
+        assert(!chmod(unrelated, 0000) && !rename(unrelated, object));
+        assert(objectOpen(name, O_RDONLY) == -1 && errno == EACCES);
+        assert(!chmod(object, 0600) && !rename(object, unrelated));
+    }
+    assert(!unlink(unrelated));
+}
+
+int main(void) {
+    alarm(10);
+#ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
+    testForwarding();
+#endif
+    char directory[] = "/tmp/LiveSimBooter-notification-shm.XXXXXX", root[PATH_MAX], temporary[PATH_MAX], second[PATH_MAX], secondTmp[PATH_MAX];
+    assert(mkdtemp(directory) && realpath(directory, root));
+    pathJoin(temporary, root, "tmp");
+    pathJoin(second, root, "other-runtime"); pathJoin(secondTmp, second, "tmp");
+    assert(!mkdir(temporary, 0700) && !mkdir(second, 0700) && !mkdir(secondTmp, 0700));
+    assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
+    testMappings(root);
+    testRejections(root);
+    int first = objectOpen(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(first >= 0 && !ftruncate(first, 1234));
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, second, 1));
+    assert(objectOpen(name, O_RDONLY) == -1 && errno == ENOENT);
+    int other = objectOpen(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    struct stat status;
+    assert(other >= 0 && !fstat(other, &status) && !status.st_size);
+    assert(!close(other) && !objectUnlink(name));
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    assert(!fstat(first, &status) && status.st_size == 1234 && !close(first) && !objectUnlink(name));
+    assert(!rmdir(secondTmp) && !rmdir(second) && !rmdir(temporary) && !rmdir(root));
+    puts("NotificationSharedMemory: shared mappings, unlink lifetime, access flags, isolation and unsafe-path rejection passed");
+    return 0;
+}

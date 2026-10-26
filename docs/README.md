@@ -11,6 +11,7 @@ per second after fixing drawable-pool stalls. Apple-logo/progress rendering and 
 - [Simulator launchd](launchd.md): empty bootstrap, tank handoff without execve, workqueue startup, and device findings.
 - [Backboardd](backboardd.md): the expanded runtime cache, service identity, and boot progress.
 - [Simulator preferences](cfprefsd.md): the stock cfprefsd job and isolated `BKDigitizerVisualizeTouches` preference.
+- [Services toward SpringBoard](springboard-services.md): simslim evidence, selected daemon startup, notification compatibility, and remaining limits.
 - [Framebuffer](framebuffer.md): verified first phone frame, frame scheduling, surface fences, and bounded dirty-rectangle composition.
 - [IOSurface](iosurface.md): Apple's native remote server, authenticated guest connections, and allocation tests.
 - [System power](system-power.md): the denied power user-client open and the tested virtual-awake subscription adapter.

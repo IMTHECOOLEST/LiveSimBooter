@@ -217,8 +217,10 @@ The backboardd experiment revealed that the logical PID adapter must leave some 
 After xpcproxy replacement, libdispatch's firehose setup queried the old guest PID and received ESRCH. A self
 `proc_pidinfo(guestPID, ...)` query now resolves to the current native PID and returns the native payload unchanged. Direct
 `getpid()` calls from libxpc's executable segments also retain the native PID, because libxpc compares it against kernel
-audit tokens. Other guest callers still receive the stable logical PID. Image add/remove notifications maintain the libxpc
-address ranges; an indirect call through another image or a tail call cannot be classified by this direct-caller adapter.
+audit tokens. With `LSB_SIMULATE_NOTIFICATION_SHM=1`, direct calls from the exact `DYLD_ROOT_PATH/usr/sbin/notifyd` image also
+retain the native PID: notifyd publishes it for clients' native process-exit watches. `libsystem_notify` and unrelated guest
+callers still receive the stable logical PID. Image add/remove notifications maintain these executable address ranges;
+an indirect call through another image or a tail call cannot be classified by this direct-caller adapter.
 
 These changes passed the phone run with guest PID 80376 and native replacement PID 80379. They deliberately leave kernel
 audit tokens, process unique IDs and PID generations unchanged. Managed-child `proc_pidinfo` translation and logical
@@ -229,13 +231,15 @@ kernel audit token against jobs still indexed by the proxy's stable guest PID. B
 (`BOOTSTRAP_NOT_PRIVILEGED`), then `-[BKHIDSystem startHIDSystem]` failed. Details, the backtrace and the expanded cache's
 verified df run are in [backboardd and the simulator UI cache](backboardd.md).
 
-The implemented adapter changes six inline PID loads in the pinned 23A343 launchd_sim, UUID
+The implemented adapter changes eight inline PID loads in the pinned 23A343 launchd_sim, UUID
 `C3EC5C45-8C85-3D11-B59C-62C4248F5EF9`. The current bootstrap check-in (routine 206) and XPC listener activation (routine 805)
 both call the endpoint handler at image offset `0x23670`. Its PID load at `0x236b0` now resolves the caller through the broker
 before the existing job lookup and endpoint-owner comparison. The two legacy check-in loads at `0x2e658` and `0x2e6b8`, plus
 XPC self lookup at `0x1bc08`, use the same adapter. The fifth load at `0x1db98` covers the owner comparison before returning
 an XPC service's bundle dictionary (routine 718). The sixth, at `0x2d130`, selects the managed requestor's domain before
-endpoint activation. Interposing `audit_token_to_pid` alone cannot cover these inline reads.
+endpoint activation. The seventh and eighth, at `0x30048` and `0x2ffd8`, resolve an event publisher's owner for fetching
+subscriptions (routine 403 / `0x193`) and arming its poll (routine 406 / `0x196`). Interposing `audit_token_to_pid` alone
+cannot cover these inline reads.
 
 The dictionary comparison became observable after explicitly registering the stock MTLCompilerService bundle. Launchd
 spawned xpcproxy with guest PID **81562**, then the broker committed its compiler replacement with native PID **81564**.
@@ -260,6 +264,30 @@ The capture is `tmp/metal-iosurface/lldb-compiler-listener-failure.txt`. The sig
 the phone: launchd **81795** started native compiler **81799** with stable logical PID **81798**, and native guest **81797**
 completed source shader compilation, pipeline creation and GPU triangle rendering before exiting 0. Evidence is
 `tmp/metal-native/console-compiler-sixth.log` and the **81797** section of `tmp/metal-iosurface/guest-compiler-sixth.log`.
+
+The next two loads became observable while starting [selected core daemons](springboard-services.md). After the exact-name
+notification shared-memory adapter let notifyd finish its initial setup, it exited with native termination reason
+`namespace=19, code=1, signal=9`. Attaching to notifyd caught `brk #0xb001` at its image offset `0x5ec4`, with error-handler
+argument `1` (`EPERM`) and the message `BUG IN LIBNOTIFY: Event publisher error`. Its main thread was already in the normal
+`dispatch_main` / `pthread_exit` cleanup path; that stack was not the fault. The Foundation namespace did not establish a
+Foundation caller: XNU's [user breakpoint handler](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/arm64/sleh.c)
+marks this trap range potentially unrecoverable, and its
+[exception policy](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/exception.c) uses the Foundation reason
+namespace when terminating an undebugged process through that path.
+
+The generated job already preserved stock `PublishesEvents = com.apple.notifyd.matching`. The simulator libxpc publisher
+first sends routine `0x193` with that stream name, then routine `0x196` to arm polling. The pinned launchd jump table routes
+these requests to `0x30048` and `0x2ffd8`; both load the native audit PID from `[x22 + 0x14]` and call the global managed-job
+lookup at `0x17f84`. A lookup miss returns `EPERM` through `0x30228`, before consulting the job's declared streams. The two
+new veneers translate only that lookup operand into `w0`, preserving the full token in `x22`, stream ownership checks,
+poll lifecycle and existing error paths. Other event routines' inline PID reads remain outside this patch's scope.
+
+With the signed eight-site output on the phone, notifyd remained alive and CoreServicesProbe native **83502**, logical
+**83491**, completed a real notification round trip: two check registrations, a 64-bit state set/get, post, observed change
+with matching state, and both cancellations all returned status 0; the probe exited 0. Its six bootstrap lookups also
+succeeded, which establishes endpoint availability rather than full functionality of the other daemons. Failure evidence
+is in `tmp/springboard-services/lldb-notifyd-first-trap.txt`; the successful **83502** run is in
+`tmp/springboard-services/probe-events-fixed.log`, following an earlier timed-out run in the same file.
 
 [The offline patcher](../Tools/patch-ios26-launchd-identity.py) replaces each load with a `B` into verified empty __TEXT
 padding. Each veneer preserves all general and SIMD registers except the original load's destination, restores NZCV,
@@ -291,9 +319,10 @@ Indigo registration deadline below. Avoid pausing the host broker while expectin
 Use a fresh output directory: the patcher and executable signer refuse to overwrite their source or an existing output.
 The patcher accepts the original stock payload or that same payload with a different signature allocation, validates its
 UUID and all nonsigning bytes, rejects partial or unrelated patches, and recognizes an already patched input idempotently.
-Older four-site and five-site outputs are not inputs to this six-site patch: regenerate from the original stock or unpatched
-signed payload. The fifth and sixth veneers occupy verified zero padding at `0x52400` and `0x52600`; the resolver name is at
-`0x52800`, with the reserved range ending at `0x52900` inside the existing `__TEXT` segment. The last named section ends at
+Older four-site, five-site and six-site outputs are not inputs to this eight-site patch: regenerate from the original stock
+or unpatched signed payload. The fifth and sixth veneers occupy verified zero padding at `0x52400` and `0x52600`; the event
+publisher veneers occupy `0x52800` and `0x52a00`. The resolver name is at `0x52c00`, with the reserved range ending at
+`0x52d00` inside the existing `__TEXT` segment. The last named section ends at
 `0x51b8c` and the segment ends at `0x54000`; the complete reserved range is verified empty before patching.
 It never signs or deploys a file. Rebuild and deploy the matching host app and shim with the patched launchd; an older shim
 without the exported resolver cannot complete the patched owner lookups.
@@ -325,13 +354,16 @@ Install the signed executable as `RuntimeRoot/sbin/launchd_sim` and the signed s
 `RuntimeRoot/usr/lib/libLiveSimSpawn.dylib`, retaining the previous files for reversal. The executable signer preserves
 MH_EXECUTE while clearing CS_EXECSEG_MAIN_BINARY, as required by this runtime's earlier signing tests.
 
-All twelve offline patch tests passed against both stock and the device's unpatched signed binary. An independent chain walk
-verified all 1,708 existing fixups and exactly one new `_dlsym` bind. The native arm64 harness assembles the same veneer source,
-compares its instructions with the emitted patch bytes, and exercises all six sites with positive, zero, negative and
+The earlier twelve offline patch tests passed against both stock and the device's unpatched signed binary; the current
+fourteen-test suite passes against stock 23A343, including the two publisher routes and rejection of an older patch revision.
+An independent chain walk verified all 1,708 existing fixups and exactly one new `_dlsym` bind. The native arm64 harness assembles the same veneer source,
+compares its instructions with the emitted patch bytes, and exercises all eight sites with positive, zero, negative and
 missing-helper results. It verifies original token bytes, destination W-register zero extension, and GPR/SIMD/flags/SP/LR
 preservation. Broker, transport and resolver tests cover authorization, stale generations, aliases, replacement ordering,
 and history saturation. The requestor-domain test also preserves the original managed lookup, fallback and native PID-domain
-creation instructions. The separate phone trial above establishes the sixth site's compiler-listener and rendering result.
+creation instructions. The publisher tests pin both original jump-table entries, managed-job calls, missing-owner error
+branches and unchanged stream validation. The separate phone trials above establish the sixth site's compiler-listener and
+rendering result and the eight-site revision's notification round trip.
 
 `dyld_info -validate_only` and `-imports` accept the new metadata. The installed `dyld_info -fixups` printer traps when it
 tries to name the added GOT slot's section: the slot is valid segment/page padding outside a named section. Use the independent

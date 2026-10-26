@@ -74,6 +74,53 @@ static void testNativeCallerRanges(void) {
     assert(LSBGetPID() == LSBGuestPID());
 }
 
+static void testNotifydCallerIdentity(void) {
+    struct { struct mach_header_64 header; struct segment_command_64 text; } image = {0};
+    image.header = (struct mach_header_64){.magic = MH_MAGIC_64, .ncmds = 1, .sizeofcmds = sizeof(image.text)};
+    image.text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(image.text), .vmaddr = 0x1000,
+                                           .vmsize = 0x100, .initprot = VM_PROT_READ | VM_PROT_EXECUTE};
+    const struct mach_header *header = (const struct mach_header *)&image;
+    const char *root = "/private/var/mobile/Group/RuntimeRoot", *notifyd = "/private/var/mobile/Group/RuntimeRoot/usr/sbin/notifyd";
+    assert(!setenv("DYLD_ROOT_PATH", root, 1));
+    const char *disabled[] = {NULL, "", "0", "01", "true", "1 "};
+    for (unsigned i = 0; i < sizeof(disabled) / sizeof(disabled[0]); ++i) {
+        if (disabled[i]) assert(!setenv("LSB_SIMULATE_NOTIFICATION_SHM", disabled[i], 1));
+        else assert(!unsetenv("LSB_SIMULATE_NOTIFICATION_SHM"));
+        configureNativeNotifydIdentity();
+        rememberNativeIdentityImage(header, 0, notifyd);
+        assert(!callerNeedsNativeIdentity(0x1000));
+        rememberNativeIdentityImage(header, 0, "/usr/lib/system/libxpc.dylib");
+        assert(callerNeedsNativeIdentity(0x1000)); // Existing libxpc handling does not depend on the notification mode.
+        forgetNativeIdentityImage(header);
+    }
+    assert(!setenv("LSB_SIMULATE_NOTIFICATION_SHM", "1", 1));
+    configureNativeNotifydIdentity();
+    const char *unrelated[] = {"/usr/sbin/notifyd", "/private/var/mobile/Group/RuntimeRoot-other/usr/sbin/notifyd",
+        "/private/var/mobile/Group/RuntimeRoot/usr/bin/notifyd", "/private/var/mobile/Group/RuntimeRoot/usr/sbin/notifyd-helper",
+        "/private/var/mobile/Group/RuntimeRoot/usr/sbin/../sbin/notifyd", "/usr/lib/system/libsystem_notify.dylib",
+        "/private/var/mobile/Group/RuntimeRoot/usr/lib/system/libsystem_notify.dylib"};
+    for (unsigned i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); ++i) {
+        rememberNativeIdentityImage(header, 0, unrelated[i]);
+        assert(!callerNeedsNativeIdentity(0x1000));
+    }
+    rememberNativeIdentityImage(header, 0x4000, notifyd);
+    assert(callerNeedsNativeIdentity(0x5000) && callerNeedsNativeIdentity(0x50ff) && !callerNeedsNativeIdentity(0x5100));
+    assert(LSBGetPID() == 123); // Ordinary guest callers still observe their logical identity.
+    forgetNativeIdentityImage(header);
+    const char *invalidRoots[] = {NULL, "", "/", "relative/RuntimeRoot", "/private/var/mobile/Group/RuntimeRoot/",
+        "/private//RuntimeRoot", "/private/./RuntimeRoot", "/private/../RuntimeRoot", "/RuntimeRoot:/OtherRoot"};
+    for (unsigned i = 0; i < sizeof(invalidRoots) / sizeof(invalidRoots[0]); ++i) {
+        if (invalidRoots[i]) assert(!setenv("DYLD_ROOT_PATH", invalidRoots[i], 1));
+        else assert(!unsetenv("DYLD_ROOT_PATH"));
+        configureNativeNotifydIdentity();
+        assert(!nativeNotifydPath[0]);
+        rememberNativeIdentityImage(header, 0, notifyd);
+        assert(!callerNeedsNativeIdentity(0x1000));
+    }
+    assert(!unsetenv("DYLD_ROOT_PATH") && !unsetenv("LSB_SIMULATE_NOTIFICATION_SHM"));
+    configureNativeNotifydIdentity();
+}
+
 int main(void) {
     unsetenv("LSB_GUEST_PID");
     unsetenv("LSB_GUEST_PPID");
@@ -84,6 +131,7 @@ int main(void) {
     initializeIdentity();
     assert(LSBGuestPID() == 123 && LSBGuestParentPID() == 456 && LSBNativePID() == getpid());
     testNativeCallerRanges();
+    testNotifydCallerIdentity();
     testTaskNameSelfTranslation();
     setenv("LSB_GUEST_PPID", "0", 1);
     initializeIdentity();

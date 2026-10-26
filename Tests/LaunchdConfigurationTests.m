@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #include "../Host/LaunchdConfiguration.h"
+#include "../ProcessSupport/ChildStatus.h"
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -256,6 +257,156 @@ static void testBackboardPreferences(LSBReceivedMessage *message, NSString *root
     assert([[NSData dataWithContentsOfFile:preferencesPath] isEqual:binary]);
 }
 
+static NSDictionary *snapshotDirectory(NSString *directory) {
+    NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
+    NSArray *paths = [NSFileManager.defaultManager subpathsOfDirectoryAtPath:directory error:NULL];
+    assert(paths);
+    for (NSString *relative in paths) {
+        NSString *path = [directory stringByAppendingPathComponent:relative];
+        BOOL isDirectory;
+        assert([NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDirectory]);
+        id contents = isDirectory ? @"directory" : [NSData dataWithContentsOfFile:path];
+        assert(contents);
+        snapshot[relative] = contents;
+    }
+    return snapshot;
+}
+
+static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
+    enum { capacity = LSB_CHILD_STATUS_CAPACITY - 2 };
+    assert(capacity == 14);
+    NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
+    char names[capacity + 1][64];
+    const char *selected[capacity + 2] = {0};
+    for (unsigned i = 0; i <= capacity; ++i) {
+        snprintf(names[i], sizeof(names[i]), "com.kdt.LiveSimBooter.capacity.%u", i);
+        selected[i] = names[i];
+        NSString *label = [NSString stringWithUTF8String:names[i]];
+        NSString *path = [stockDirectory stringByAppendingPathComponent:[label stringByAppendingString:@".plist"]];
+        NSDictionary *stock = @{@"Label": label, @"ProgramArguments": @[@"/bin/df"]};
+        assert([stock writeToFile:path atomically:YES]);
+    }
+    NSDictionary *prior = snapshotDirectory(dataPath);
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected) == E2BIG);
+    assertUnchanged(message);
+    assert([snapshotDirectory(dataPath) isEqual:prior]); // Includes paths as well as contents: no partial job/log publication.
+    selected[capacity] = NULL;
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+    NSString *directory = [readPlist(configPath)[@"Bootstrap"][@"Paths"] firstObject];
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == LSB_CHILD_STATUS_CAPACITY);
+    dispose(message);
+    prior = snapshotDirectory(dataPath);
+    selected[capacity] = names[capacity];
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected) == E2BIG);
+    assertUnchanged(message);
+    assert([snapshotDirectory(dataPath) isEqual:prior]);
+}
+
+static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
+    NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
+    NSString *notifyPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
+    NSDictionary *notify = @{
+        @"Label": @"com.apple.notifyd", @"ProgramArguments": @[@"/usr/sbin/notifyd", @"--test"],
+        @"MachServices": @{@"com.apple.system.notification_center": @{@"ResetAtClose": @YES}},
+        @"PublishesEvents": @"com.apple.notifyd.matching", @"UserName": @"root", @"GroupName": @"wheel",
+        @"POSIXSpawnType": @"Interactive", @"KeepAlive": @YES, @"EnableTransactions": @YES, @"EnablePressuredExit": @YES,
+        @"LimitLoadToSessionType": @"System", @"LaunchEvents": @{@"other": @{}}, @"HardResourceLimits": @{@"NumberOfFiles": @512},
+        @"EnvironmentVariables": @{@"ASL_DISABLE": @"1", @"DEBUGSCOPE": @"normal", @"DYLD_INSERT_LIBRARIES": @"/bad",
+            @"LSB_DEBUG_STOP_BEFORE_HANDOFF": @"1", @"SIMULATOR_ROOT": @"/bad", @"XPC_FLAGS": @"2", @"HOME": @"/bad"}
+    };
+    assert([notify writeToFile:notifyPath atomically:YES]);
+    NSString *runningPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.runningboardd.plist"];
+    NSDictionary *running = @{@"Label": @"com.apple.runningboardd", @"Program": @"/usr/libexec/runningboardd",
+        @"MachServices": @{@"com.apple.runningboard": @YES}, @"PublishesEvents": @{@"test.event": @{@"RequireTrusted": @YES}}};
+    assert([running writeToFile:runningPath atomically:YES]);
+    NSString *oldDirectory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-BackboardDaemons"];
+    NSString *oldJobPath = [oldDirectory stringByAppendingPathComponent:@"com.apple.backboardd.plist"];
+    NSData *oldJob = [NSData dataWithContentsOfFile:oldJobPath];
+    const char *selected[] = {"com.apple.notifyd", NULL}, *both[] = {"com.apple.notifyd", "com.apple.runningboardd", NULL};
+    const char *inherited[] = {"LSB_DEBUG_STOP_BEFORE_HANDOFF=1", "LSB_DEBUG_OTHER=1", "DYLD_PRINT_LIBRARIES=1", "KEEP=ok", NULL};
+    assert(!getenv("LSB_DEBUG_STOP_CHILDREN"));
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, inherited, selected));
+    assert(!environmentValue(&message->plan, "LSB_DEBUG_STOP_BEFORE_HANDOFF") && !environmentValue(&message->plan, "LSB_DEBUG_OTHER"));
+    assert(!environmentValue(&message->plan, "DYLD_PRINT_LIBRARIES") && !strcmp(environmentValue(&message->plan, "KEEP"), "ok"));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    NSString *directory = [bootstrap[@"Paths"] firstObject], *selectedDirectory = directory;
+    assert([directory hasPrefix:[dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-CoreDaemons-"]]);
+    assert([bootstrap[@"Paths"] isEqual:@[directory]]);
+    for (NSString *scope in @[@"Self", @"Child"]) {
+        assert(!bootstrap[scope][@"LSB_DEBUG_STOP_BEFORE_HANDOFF"]);
+        assert([bootstrap[scope][@"LSB_SIMULATE_SYSTEM_POWER"] isEqual:@"1"]);
+        assert([bootstrap[scope][@"LSB_SIMULATE_NOTIFICATION_SHM"] isEqual:@"1"]);
+        assert([bootstrap[scope][@"SIMULATOR_MAINSCREEN_WIDTH"] isEqual:@"1290"]);
+    }
+    NSString *jobPath = [directory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
+    NSDictionary *job = readPlist(jobPath);
+    assert([job[@"ProgramArguments"] isEqual:notify[@"ProgramArguments"]] && [job[@"MachServices"] isEqual:notify[@"MachServices"]]);
+    assert([job[@"PublishesEvents"] isEqual:notify[@"PublishesEvents"]]);
+    assert(([job[@"EnvironmentVariables"] isEqual:@{@"ASL_DISABLE": @"1", @"DEBUGSCOPE": @"normal"}]));
+    assert([job[@"RunAtLoad"] boolValue] && ![job[@"KeepAlive"] boolValue] && ![job[@"EnableTransactions"] boolValue]);
+    for (NSString *key in @[@"UserName", @"GroupName", @"POSIXSpawnType", @"EnablePressuredExit", @"LimitLoadToSessionType",
+                            @"LaunchEvents", @"HardResourceLimits"]) assert(!job[key]);
+    assert([job[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/com.apple.notifyd.log"]);
+    assert([job[@"StandardErrorPath"] isEqual:job[@"StandardOutPath"]]);
+    NSString *log = [dataPath stringByAppendingPathComponent:@"Library/Logs/com.apple.notifyd.log"];
+    struct stat metadata;
+    assert(!stat(log.fileSystemRepresentation, &metadata) && S_ISREG(metadata.st_mode) && (metadata.st_mode & 0777) == 0600);
+    assert([[NSData dataWithContentsOfFile:oldJobPath] isEqual:oldJob]);
+    dispose(message);
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, both));
+    directory = [readPlist(configPath)[@"Bootstrap"][@"Paths"] firstObject];
+    assert(![directory isEqual:selectedDirectory]);
+    jobPath = [directory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
+    job = readPlist([directory stringByAppendingPathComponent:@"com.apple.runningboardd.plist"]);
+    assert([job[@"Program"] isEqual:running[@"Program"]] && !job[@"ProgramArguments"]);
+    assert([job[@"PublishesEvents"] isEqual:running[@"PublishesEvents"]]);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == 4);
+    dispose(message);
+    NSData *priorJob = [NSData dataWithContentsOfFile:jobPath];
+    const char *duplicate[] = {"com.apple.notifyd", "com.apple.notifyd", NULL};
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, duplicate) == EINVAL);
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, NULL) == EINVAL);
+    const char *invalid[] = {"", "..", "../com.apple.notifyd", "com.apple.notifyd/plist", "com.apple.backboardd", "com.apple.cfprefsd.xpc.daemon"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i) {
+        const char *labels[] = {invalid[i], NULL};
+        assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, labels) == EINVAL);
+    }
+    for (NSString *key in @[@"Label", @"ProgramArguments", @"MachServices", @"PublishesEvents", @"EnvironmentVariables"]) {
+        NSMutableDictionary *malformed = notify.mutableCopy;
+        malformed[key] = @7;
+        assert([malformed writeToFile:notifyPath atomically:YES]);
+        assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, both) == EINVAL);
+        assertUnchanged(message);
+    }
+    for (id value in @[@[@"relative"], @[@"/usr/../sbin/notifyd"], @[@"/usr/sbin/notifyd", @7], @[]]) {
+        NSMutableDictionary *malformed = notify.mutableCopy;
+        malformed[@"ProgramArguments"] = value;
+        assert([malformed writeToFile:notifyPath atomically:YES]);
+        assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, both) == EINVAL);
+        assertUnchanged(message);
+    }
+    assert([notify writeToFile:notifyPath atomically:YES]);
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqual:@[selectedDirectory]]);
+    assert([[NSData dataWithContentsOfFile:jobPath] isEqual:priorJob]); // Narrowing does not load or delete the broader experiment.
+    dispose(message);
+    const char *reordered[] = {"com.apple.runningboardd", "com.apple.notifyd", NULL};
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, reordered));
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqual:@[directory]]);
+    dispose(message);
+    assert(!unlink(log.fileSystemRepresentation) && !symlink(configPath.fileSystemRepresentation, log.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, both) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(log.fileSystemRepresentation));
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, both));
+    dispose(message);
+    assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL));
+    assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqual:@[oldDirectory]]);
+    assert([[NSData dataWithContentsOfFile:oldJobPath] isEqual:oldJob]);
+    dispose(message);
+    testServiceCapacity(message, root, dataPath, configPath);
+}
+
 static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
     NSData *previous = [NSData dataWithContentsOfFile:configPath];
     assert(LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL) == ENOENT);
@@ -352,6 +503,7 @@ static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSSt
         for (NSString *key in screen) assert(!readPlist(configPath)[@"Bootstrap"][scope][key]);
     }
     dispose(message);
+    testServiceJobs(message, root, dataPath, configPath);
     assert([NSFileManager.defaultManager removeItemAtPath:[root stringByAppendingPathComponent:@"System"] error:NULL]);
 }
 

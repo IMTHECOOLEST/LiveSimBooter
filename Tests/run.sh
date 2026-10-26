@@ -115,6 +115,14 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdCompatibilityTests.c -o "$test_directory/LaunchdCompatibility"
 "$test_directory/LaunchdCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/NotificationSharedMemoryTests.c -o "$test_directory/NotificationSharedMemory"
+"$test_directory/NotificationSharedMemory"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Guest/NotificationSharedMemory.c -o "$test_directory/libNotificationSharedMemory.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_NOTIFICATION_SHM_INTERPOSE_TESTING \
+    Tests/NotificationSharedMemoryTests.c -o "$test_directory/NotificationSharedMemoryInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libNotificationSharedMemory.dylib" "$test_directory/NotificationSharedMemoryInterpose"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/SystemPowerCompatibilityTests.c -framework IOKit -framework CoreFoundation -o "$test_directory/SystemPowerCompatibility"
 "$test_directory/SystemPowerCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \

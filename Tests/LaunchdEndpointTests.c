@@ -14,7 +14,7 @@
 typedef struct { mach_msg_header_t header; mach_msg_body_t body; mach_msg_port_descriptor_t endpoint; NDR_record_t ndr; char name[128]; } Request;
 #pragma pack(pop)
 typedef struct { mach_port_t service, endpoint; unsigned variant; } Server;
-enum { Success, Denied, WrongGeneration, WrongID, WrongNDR, WrongSize };
+enum { Success, Denied, WrongGeneration, WrongID, WrongNDR, WrongSize, DelayedReply, ExpiredReply };
 
 static mach_port_t newPort(void) {
     mach_port_t port;
@@ -42,6 +42,8 @@ static void *serve(void *context) {
     assert(request->body.msgh_descriptor_count == 1 && request->endpoint.type == MACH_MSG_PORT_DESCRIPTOR);
     assert(request->endpoint.disposition == MACH_MSG_TYPE_PORT_SEND && request->endpoint.name == server->endpoint);
     assert(!strcmp(request->name, "IndigoHIDRegistrationPort") && !memcmp(&request->ndr, &NDR_record, sizeof(NDR_record)));
+    if (server->variant == DelayedReply) usleep(1200000); // Longer than the ordinary one-second transaction.
+    if (server->variant == ExpiredReply) usleep(100000);
     struct { mig_reply_error_t reply; uint32_t extra; } response = {
         .reply = {.Head = {.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0), .msgh_size = 36,
                           .msgh_remote_port = request->header.msgh_remote_port, .msgh_id = 801},
@@ -52,7 +54,13 @@ static void *serve(void *context) {
     if (server->variant == WrongSize) response.reply.Head.msgh_size = sizeof(response);
     request->header.msgh_remote_port = MACH_PORT_NULL;
     mach_msg_destroy(&request->header);
-    assert(!mach_msg(&response.reply.Head, MACH_SEND_MSG | MACH_SEND_TIMEOUT, response.reply.Head.msgh_size, 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL));
+    mach_msg_return_t sent = mach_msg(&response.reply.Head, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                     response.reply.Head.msgh_size, 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+    if (server->variant == ExpiredReply) {
+        // Darwin can consume a send-once reply after its receiver disappeared; either result must leave no retained rights.
+        assert(sent == KERN_SUCCESS || sent == MACH_SEND_INVALID_DEST);
+        if (sent) mach_msg_destroy(&response.reply.Head);
+    } else assert(!sent);
     return NULL;
 }
 
@@ -75,8 +83,32 @@ int main(void) {
         assert(!mach_port_get_refs(mach_task_self(), server.service, MACH_PORT_RIGHT_SEND, &refs) && refs == 1);
         closePort(server.service); closePort(server.endpoint);
     }
+    for (unsigned variant = DelayedReply; variant <= ExpiredReply; ++variant) {
+        Server server = {.service = newPort(), .endpoint = newPort(), .variant = variant};
+        audit_token_t token = ownAudit();
+        pthread_t thread;
+        assert(!pthread_create(&thread, NULL, serve, &server));
+        kern_return_t status = 42;
+        errno = EDOM;
+        uint32_t timeout = variant == DelayedReply ? 2000 : 20;
+        int result = LSBLaunchdRegisterEndpointWithTimeout(server.service, &token, "IndigoHIDRegistrationPort",
+                                                          server.endpoint, timeout, &status);
+        assert(result == (variant == DelayedReply ? 0 : ETIMEDOUT));
+        assert(status == (variant == DelayedReply ? 0 : -1) && errno == EDOM);
+        assert(!pthread_join(thread, NULL));
+        mach_port_status_t portStatus;
+        mach_msg_type_number_t count = MACH_PORT_RECEIVE_STATUS_COUNT;
+        assert(!mach_port_get_attributes(mach_task_self(), server.service, MACH_PORT_RECEIVE_STATUS,
+                                         (mach_port_info_t)&portStatus, &count) && !portStatus.mps_msgcount);
+        mach_port_urefs_t refs;
+        assert(!mach_port_get_refs(mach_task_self(), server.endpoint, MACH_PORT_RIGHT_SEND, &refs) && refs == 1);
+        assert(!mach_port_get_refs(mach_task_self(), server.service, MACH_PORT_RIGHT_SEND, &refs) && refs == 1);
+        closePort(server.service); closePort(server.endpoint);
+    }
     mach_port_t service = newPort(), endpoint = newPort();
     audit_token_t token = ownAudit();
+    assert(LSBLaunchdRegisterEndpointWithTimeout(service, &token, "IndigoHIDRegistrationPort", endpoint, 0, NULL) == EINVAL);
+    assert(LSBLaunchdRegisterEndpointWithTimeout(service, &token, "IndigoHIDRegistrationPort", endpoint, 30001, NULL) == EINVAL);
     assert(LSBLaunchdRegisterEndpoint(service, &token, "", endpoint, NULL) == EINVAL);
     char longName[129]; memset(longName, 'x', 128); longName[128] = 0;
     assert(LSBLaunchdRegisterEndpoint(service, &token, longName, endpoint, NULL) == ENAMETOOLONG);
