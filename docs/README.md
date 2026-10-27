@@ -9,8 +9,11 @@ Contacts on iPhone18,2 / iOS 27.0 build 24A435. Touches, the simulator keyboard,
 presentation, the performance HUD, and live touch-marker settings have device evidence. The host keeps persistent IOSurface,
 Fish and Settings tabs. Native-cache retention with hardware workqueue redirection is the current default.
 
-This remains an experimental partial simulator: generic fork/exec and complete job control are unsupported, PosterBoard's
-blank app screen and black wallpaper are still under investigation, and the observed Spotlight last-character crash is deferred.
+The user verified **Home Screen → Edit → Edit Wallpaper** and color/gradient wallpaper rendering. PosterBoard's lock-screen
+path and direct activation remain **broken (black output) and deferred**. The working editor's clipped Done button is also deferred;
+see [current wallpaper status](springboard-services.md#current-wallpaper-status).
+This remains an experimental partial simulator: generic fork/exec and complete job control are unsupported, and the observed
+Spotlight last-character crash is deferred.
 Historical sections below describe earlier cache layouts and failures; use the setup guide for current preparation commands.
 
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.

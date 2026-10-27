@@ -59,6 +59,10 @@ IconServices to that bootstrap. Optional trailing stock job labels replace the d
 included in graphical launchd modes. See [services toward SpringBoard](docs/springboard-services.md) for the selection and
 [the terminal architecture and validation boundary](docs/fake-pty.md#launchd-owned-fish-and-tabs).
 
+The user verified **Home Screen → Edit → Edit Wallpaper** and color/gradient wallpaper rendering. PosterBoard's lock-screen
+path and direct activation still show black output and are **broken and deferred**. The working editor's Done button extends
+beyond the right edge; its layout fix is also deferred. See [the current wallpaper status](docs/springboard-services.md#current-wallpaper-status).
+
 The native Metal backend uses matching simulator serializer/server libraries adapted through platform, dependency and
 export metadata, with their code sections unchanged. A phone probe running as the backboardd job compiled shader source
 through the stock guest compiler, created a pipeline, rendered a triangle, verified IOSurface pixels and wrote a PNG.

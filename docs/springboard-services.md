@@ -1476,3 +1476,104 @@ over the guest Home Screen. No debugger was attached. The simulator was left run
 The [preparation and rollback notes](../tmp/lsd-metadata-default/flex-springboard/README.md) and device activation receipt
 record the temporary files. Restore the preserved original SpringBoard executable with affected guests stopped when
 inspection ends; the normal setup guide does not install FLEX. PosterBoard's live presentation remains unresolved.
+
+### FLEX disappearance and framebuffer boundary
+
+The user observed FLEX disappearing when PosterBoard activated and returning afterward; it stayed visible over Contacts
+and Passwords. A temporary V2 monitor in native SpringBoard **12618** recorded unchanged FLEX visibility, alpha, level
+**1999**, context ID, scene activation and model/presentation geometry. No higher visible SpringBoard UIWindow appeared.
+Its snapshots did not inspect the compositor's global scene ordering, so numeric window levels alone do not explain this.
+
+The timestamped V3 monitor ran under native host **12678**, SpringBoard logical **12689** / native **12710** with the same
+23A343 cache noted above. During the user-confirmed black screen, SpringBoard's secure-display provider remained false,
+and FLEX remained visible according to UIKit. An explicit temporary marker changed only FLEX's existing context through
+the verified typed `-[UIWindow _setSecure:]` API. Its secure getter changed false to true at elapsed **70.3 seconds**, but
+the screen remained black. Removing the marker restored false at **115.2 seconds**, confirmed in the next snapshot.
+No window level, global secure policy, PosterBoard executable or production shim was changed. This test did not support
+secure-display filtering as the explanation; it does not characterize every compositor policy.
+
+A separate native-host LLDB inspection invoked the existing asynchronous framebuffer readback. The retained 1290×2796
+image contained **zero nonblack RGB pixels**, matching the black native screenshot. The host's renderer and presentation
+were enabled, and its frame log reported successful copies without rejection or GPU failure. This excludes a nonblack
+retained frame merely being obscured by the native UIView; it does not distinguish black incoming pixels from a copy error.
+The next useful pixel comparison is the incoming IOSurface versus the retained frame for one presentation while its
+producer fence is held. PosterBoard's earlier nonblack offscreen rendering remains a separate observation.
+
+The host debugger detached and the process resumed. A subsequent guest-backboardd attachment recognized guest stack
+symbols but could not evaluate the typed Objective-C getters: LLDB failed to resolve selector references. After detach,
+native backboardd **12708** exited with `EXC_BREAKPOINT` / `SIGTRAP` at native address `0x19fc4c700`; the other recorded
+frame was `0x19fc42910`, eight bytes past this run's native workqueue entry. The exact detach/exception interaction is
+unresolved. This interruption occurred after the black-frame measurements and must not be treated as PosterBoard's
+original failure. No valid backboardd display-state getter result was obtained.
+
+Only the owned simulator session was restarted for recovery: native host **12792**, backboardd **12822**, SpringBoard
+**12824**. No debugger/debugserver remained and the temporary secure marker was absent. The user then reported that all
+apps failed to open. The original simple V1 FLEX bootstrap was restored, preserving V3 outside RuntimeRoot, and a fresh
+session started under native host **12870**, backboardd **12907**, SpringBoard **12901**. The user confirmed Contacts
+opened normally again. This rollback/restart establishes recovery, not which diagnostic action caused the regression.
+FLEX itself consumes ordinary touches in Select/Move mode; that mode was not recorded, so interception is also unproven.
+Only the simple FLEX injection remains active; no window-state monitor or secure-marker experiment remains installed.
+Device evidence is under
+`tmp/lsd-metadata-default/results/`: `flex-secure-enabled.log`, `flex-secure-restored.log`,
+`poster-black-host-baseline.png` and `.json`, `backboard-debugger-detach-crash.json`, and
+`poster-recovery-flex-screen.png`. The separate bootstrap rollback copies are recorded in
+`tmp/lsd-metadata-default/flex-springboard/v3/device-activation.json`; the V1 restoration receipt is
+`results/flex-v1-restored.json`.
+
+The user subsequently confirmed that **Home Screen → Edit → Edit Wallpaper** opens the wallpaper editor successfully.
+This is a different entry path from directly activating PosterBoard. The screenshot
+`results/wallpaper-editor-done-visible.png` independently shows its Home Screen preview, Cancel/Done controls, and
+Pair/Color/Gradient/Photo/Blur choices with FLEX visible. Done extends beyond the right edge of the guest display;
+the user identifies a drawing-position problem, not an offset tap target. The central preview and bottom controls fit.
+The user also confirmed that color and gradient wallpapers render through this editor. Do not treat the direct-launch
+black screen as proof that this intended editor flow or the entire compositor is broken. Saving wallpapers and every
+wallpaper extension are not established by these observations.
+
+### Done-button measurement and PosterBoard FLEX
+
+A bounded read-only startup probe then ran in native PosterBoard **12997**, without LLDB. It resolved the named rack-controller
+ivars through the Objective-C runtime and sampled on the main queue; it did not change constraints or request layout.
+The visible Home Screen editor's root and window were both **430×932**, with identity transforms. Its Done button had alpha 1,
+frame **{366, 9, 92, 42}**, and an active trailing-to-root-trailing constraint of **+16**. Its `topButtonsEdgeInsets` remained
+zero. A separate inactive switcher rack had already received the normal **−50** trailing constraint and hid its Done button.
+This distinguishes the editor's uncorrected default from a host framebuffer width mismatch.
+
+In the original 23A343 loose PosterBoard framework, UUID `8F1D23B9-955D-3DC6-A3D1-E863DFD6C49F`, the initializer at
+file/VM offset `0x144bb4` uses `fmov d0, #16.0` for that trailing constraint. The later inset observer at `0x1376b4` negates
+the left inset when it changes; that correction was absent in the measured editor. The user deferred the fix: **no framework
+instruction or layout behavior was changed**. Exact original-byte/context pins and the live snapshots are retained under
+`tmp/lsd-metadata-default/wallpaper-done-layout-review.md`, `wallpaper-done-initializer-pin.json`, and
+`results/wallpaper-done-live.log` for a later controlled test.
+
+At the user's request, the read-only probe was replaced with a small FLEX bootstrap for PosterBoard. Only its guest launchd
+job was booted out and restarted; the native host **12870**, backboardd **12907**, and SpringBoard **12901** remained running.
+New native PosterBoard **13039** loaded the supplied signed FLEX library and reported its explorer visible. The user confirmed
+FLEX was available in **Home Screen → Edit → Edit Wallpaper**. This was a no-debugger test; relevant processes were running,
+and no LLDB/debugserver remained at completion. The same cache/build/signing setup described above was retained.
+
+The temporary bootstrap uses FLEX's declared public `showExplorerFromScene:` API on the main queue. Initial attempts stop
+after showing it; scene-activation notifications move an already-visible explorer to the newly active PosterBoard scene.
+It excludes FLEX's own window from readiness checks and respects the user's FLEX Hide action. Scene dismissal is left to
+UIKit: the bootstrap does not hide the explorer on editor dismissal. No polling monitor, secure-window adjustment, production
+shim change, or wallpaper layout patch remains active. SpringBoard's simple FLEX injection remains available too.
+
+The diagnostic main executable still uses the previously validated dependency path `/usr/local/lib/PosterSceneProbeV3.dylib`;
+that file now contains only the PosterBoard FLEX bootstrap. The preserved original executable and completed layout probe
+remain outside RuntimeRoot. With PosterBoard stopped, restore its preserved original main and archive that bootstrap to
+remove this injection; keep the shared `/usr/local/lib/libFLEX.sim.dylib` while SpringBoard still uses it. Local build,
+signing, activation and verification receipts are under `tmp/lsd-metadata-default/flex-posterboard/`. Files were staged
+inactive before replacement, and post-copy checksums were skipped as requested. These temporary inspection artifacts are
+not part of normal runtime setup.
+
+### Current wallpaper status
+
+On 2026-10-27, after the FLEX inspection, the user confirmed that PosterBoard's lock-screen path still shows black output
+and explicitly asked to stop investigating it for now. Treat this as a **known broken, deferred feature**, not a successful
+wallpaper bring-up. Direct PosterBoard activation also remains black. No root cause or compositor fix has been established.
+
+The separately verified path is **Home Screen → Edit → Edit Wallpaper**: the editor opens, and color/gradient wallpaper
+rendering works. Its Done button remains clipped on the right, with the live constraint evidence recorded above; that fix
+is independently deferred. Saving every wallpaper type, lock-screen wallpaper presentation and all wallpaper providers
+are not established by the working Home Screen editor. FLEX remains a temporary inspection aid in SpringBoard and
+PosterBoard; loading it did not establish a lock-screen rendering fix. No additional runtime changes or restarts were made
+when recording this deferral.
