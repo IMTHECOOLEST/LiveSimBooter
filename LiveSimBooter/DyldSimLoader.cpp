@@ -800,6 +800,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     static bool entered = false;
     static LSBDyldSimLaunch launch = {};
     if (entered) { fprintf(stderr, "dyld_sim can only be entered once per process\n"); return 1; }
+    const bool traceHandoff = LSBTraceHandoffRequested(envp);
     uintptr_t stackTop = 0;
     size_t stackSize = 0;
     std::string stackError;
@@ -837,11 +838,11 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         fprintf(stderr, "Cannot prepare simulator main stack: %s\n", stackError.c_str());
         return 1;
     }
-    if (relocatedStack.top)
+    if (traceHandoff && relocatedStack.top)
         fprintf(stderr, "Relocated simulator main stack: top 0x%llx, size 0x%llx; cache reservation 0x%llx-0x%llx\n",
                 static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize),
                 static_cast<unsigned long long>(cache.address), static_cast<unsigned long long>(cache.address + cache.size));
-    else if (nativeStackExclusion.size)
+    else if (traceHandoff && nativeStackExclusion.size)
         fprintf(stderr, "Preserved native argument stack: top 0x%llx, size 0x%llx; outside simulator cache\n",
                 static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize));
     if (!LSBInitializeSimProcessInfo(image->header, dyldPath)) {
@@ -897,10 +898,12 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     launch = {entry, argc, startup.argv, startup.envp, startup.apple, executable, image->header, image->slide, helpers, thread,
               relocatedStack.top, cache.address, cache.size, retainHostCacheRequested(startup.envp)};
     entered = true;
-    fprintf(stderr, "%s host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n",
-            launch.retainHostCache ? "Retaining" : "Detaching", reinterpret_cast<void *>(image->entry), image->header,
-            static_cast<unsigned long long>(image->slide));
-    fflush(stderr);
+    if (traceHandoff) {
+        fprintf(stderr, "%s host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n",
+                launch.retainHostCache ? "Retaining" : "Detaching", reinterpret_cast<void *>(image->entry), image->header,
+                static_cast<unsigned long long>(image->slide));
+        fflush(stderr);
+    }
     int workerError = LSBValidateHostThreadCount();
     if (workerError) {
         fprintf(stderr, "Refusing host-cache detachment with native workers: %s\n", strerror(workerError));

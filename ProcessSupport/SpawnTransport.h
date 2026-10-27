@@ -8,15 +8,16 @@
 #include <mach/mach.h>
 
 #define LSB_BROKER_PORT_ENV "LSB_BROKER_PORT"
+#define LSB_TRANSPORT_VERSION 2
 
-// Bootstrap-only metadata; ordinary guest spawn/exec transport stays at its existing wire version.
+// Bootstrap-only metadata is versioned independently from the outer transport envelope.
 #define LSB_BOOTSTRAP_VERSION 1
 enum LSBExecutionRole { LSB_EXECUTION_SIMULATOR = 0, LSB_EXECUTION_NATIVE_METAL_PROBE = 1, LSB_EXECUTION_NATIVE_METAL_SERVICE = 2 };
 
 enum LSBRequestKind {
     LSB_REQUEST_SPAWN = 1, LSB_REQUEST_CHECKIN = 2, LSB_REQUEST_READY = 3, LSB_REQUEST_KILL = 4, LSB_REQUEST_EXEC = 5,
     LSB_REQUEST_RESOLVE_AUDIT_PID = 6, LSB_REQUEST_COPY_ENTITLEMENTS = 7, LSB_REQUEST_COPY_PROCESS_IDENTITY = 8,
-    LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID = 9
+    LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID = 9, LSB_REQUEST_REBOOT_USERSPACE = 10
 };
 typedef struct {
     uint64_t requestID;
@@ -76,6 +77,9 @@ int LSBTransportReadyOnPort(mach_port_t broker, uint64_t requestID, int error);
 // Exact positive PID of a running broker-managed child. Signal 0 validates identity without sending a signal.
 // Returns an errno value. A successful launchd fallback means submitted; waitpid observes actual termination.
 int LSBTransportKill(pid_t targetPID, int signalNumber);
+// Simulator launchd only: request a replacement userspace after an accepted guest reboot reaches its terminal exit.
+// Carries no payload or rights. Returns an errno value; success means broker acceptance, not completion of the replacement boot.
+int LSBTransportRebootUserspace(void);
 // Simulator launchd only: resolve the complete kernel audit identity of a request sender to its committed stable guest PID.
 // Unmanaged native identities retain their native PID unless they alias a known managed identity. Never changes the audit token.
 // Returns an errno value and clears *pid on failure; rejected or retired identities must not fall back to their native PID.

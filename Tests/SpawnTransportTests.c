@@ -26,7 +26,8 @@ extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *, mach_por
 static unsigned openDescriptorCount(void);
 enum { MalformedPortsCount = 10, MalformedIdentityCount = 12, MalformedRoleCount = 11, MalformedRoleRequestCount = 8,
        MalformedBootstrapCount = 14 + MalformedPortsCount + MalformedIdentityCount + MalformedRoleCount,
-       MalformedKillCount = 14, MalformedAuditCount = 16, MalformedEntitlementCount = 25, PortRoundTripCount = 7 };
+       MalformedKillCount = 14, MalformedAuditCount = 16, MalformedEntitlementCount = 25, PortRoundTripCount = 7,
+       MalformedRebootCount = 30, RebootReplyCount = 23 };
 static volatile sig_atomic_t childSignals;
 static volatile sig_atomic_t signalAcknowledgementFD = -1;
 
@@ -72,6 +73,7 @@ static void readyUsingHeldPort(uint64_t requestID) {
     assert(!task_set_bootstrap_port(mach_task_self(), MACH_PORT_NULL));
     mach_port_t unavailable = MACH_PORT_NULL;
     assert(LSBTransportCopyBrokerPort(&unavailable) == ENOENT && unavailable == MACH_PORT_NULL);
+    assert(LSBTransportRebootUserspace() == ENOENT);
     mach_port_urefs_t before, after;
     assert(!mach_port_get_refs(mach_task_self(), broker, MACH_PORT_RIGHT_SEND, &before));
     assert(!LSBTransportReadyOnPort(broker, requestID, 0));
@@ -141,7 +143,7 @@ static void testMalformedPorts(const LSBSpawnPlan *plan, int fd, mach_port_t sen
     assert(!LSBTestCopyBrokerPort(&port));
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
     assert(pipe && request);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", variant % 2 ? LSB_REQUEST_EXEC : LSB_REQUEST_SPAWN);
     xpc_dictionary_set_uint64(request, "request-id", 0);
     xpc_dictionary_set_int64(request, "error", 0);
@@ -172,7 +174,7 @@ static void testRoleRequestInjection(const LSBSpawnPlan *plan, int fd, unsigned 
     assert(!LSBTestCopyBrokerPort(&port));
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
     assert(pipe && request);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", kinds[variant]);
     xpc_dictionary_set_uint64(request, "request-id", kinds[variant] == LSB_REQUEST_READY ? 77 : 0);
     xpc_dictionary_set_int64(request, "error", 0);
@@ -328,7 +330,7 @@ static void testMalformedRequest(const LSBSpawnPlan *plan, unsigned variant) {
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0);
     assert(pipe);
     xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_SPAWN);
     xpc_dictionary_set_uint64(request, "request-id", 0);
     xpc_dictionary_set_int64(request, "error", 0);
@@ -362,7 +364,7 @@ static void testMalformedKill(unsigned variant) {
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0);
     xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
     assert(pipe && request);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_KILL);
     xpc_dictionary_set_uint64(request, "request-id", variant == 10 ? 77 : 0);
     xpc_dictionary_set_int64(request, "error", variant == 11 ? EACCES : 0);
@@ -400,6 +402,137 @@ static void testMalformedKill(unsigned variant) {
     assert(!LSBRequireSingleThread());
 }
 
+static void setUnexpectedFD(xpc_object_t dictionary, const char *key, int fd) {
+    xpc_object_t descriptor = xpc_fd_create(fd);
+    assert(descriptor);
+    xpc_dictionary_set_value(dictionary, key, descriptor);
+    xpc_release(descriptor);
+}
+
+static void testMalformedReboot(unsigned variant, int fd, mach_port_t sentPort) {
+    mach_port_t port;
+    assert(!LSBTestCopyBrokerPort(&port));
+    xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
+    assert(pipe && request);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
+    xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_REBOOT_USERSPACE);
+    xpc_dictionary_set_uint64(request, "request-id", 0);
+    xpc_dictionary_set_int64(request, "error", 0);
+    switch (variant) {
+        case 0: xpc_dictionary_set_uint64(request, "version", 1); break; // Old producers cannot silently use the new operation.
+        case 1: xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION + 1); break;
+        case 2: xpc_dictionary_set_int64(request, "version", LSB_TRANSPORT_VERSION); break;
+        case 3: xpc_dictionary_set_string(request, "version", "2"); break;
+        case 4: xpc_dictionary_set_value(request, "version", NULL); break;
+        case 5: xpc_dictionary_set_string(request, "kind", "10"); break;
+        case 6: xpc_dictionary_set_uint64(request, "kind", LSB_REQUEST_REBOOT_USERSPACE + 1); break;
+        case 7: xpc_dictionary_set_uint64(request, "request-id", 1); break;
+        case 8: xpc_dictionary_set_int64(request, "request-id", 0); break;
+        case 9: xpc_dictionary_set_int64(request, "error", EACCES); break;
+        case 10: xpc_dictionary_set_uint64(request, "error", 0); break;
+        case 11: xpc_dictionary_set_data(request, "plan", "unexpected", 10); break;
+        case 12: setUnexpectedFD(request, "fds", fd); break;
+        case 13: setWirePorts(request, sentPort, -1); break;
+        case 14: xpc_dictionary_set_mach_send(request, "bootstrap-port", sentPort); break;
+        case 15: xpc_dictionary_set_mach_send(request, "native-service-port", sentPort); break;
+        case 16: xpc_dictionary_set_data(request, "target-audit", "unexpected", 10); break;
+        case 17: xpc_dictionary_set_uint64(request, "operation", 16); break;
+        case 18: xpc_dictionary_set_data(request, "self-short-info", "unexpected", 10); break;
+        case 19: xpc_dictionary_set_mach_send(request, "self-task-name", sentPort); break;
+        case 20: xpc_dictionary_set_int64(request, "target-pid", 4242); break;
+        case 21: xpc_dictionary_set_int64(request, "signal", 0); break;
+        case 22: xpc_dictionary_set_uint64(request, "execution-role", LSB_EXECUTION_SIMULATOR); break;
+        case 23: xpc_dictionary_set_uint64(request, "bootstrap-version", LSB_BOOTSTRAP_VERSION); break;
+        case 24: xpc_dictionary_set_string(request, "runtime-root", "/tmp/RuntimeRoot"); break;
+        case 25: setUnexpectedFD(request, "child-status-fd", fd); break;
+        case 26: xpc_dictionary_set_string(request, "peer-path", "/sbin/launchd_sim"); break;
+        case 27: xpc_dictionary_set_mach_send(request, "unknown-port", sentPort); break;
+        case 28: setUnexpectedFD(request, "unknown-fd", fd); break;
+        case 29: xpc_dictionary_set_string(request, "unknown-metadata", "unexpected"); break;
+        default: assert(false);
+    }
+    xpc_object_t reply = NULL;
+    assert(!xpc_pipe_routine(pipe, request, &reply));
+    assert(reply && xpc_dictionary_get_int64(reply, "error") == EPROTO && xpc_dictionary_get_int64(reply, "pid") == 0);
+    assert(xpc_dictionary_get_uint64(reply, "version") == LSB_TRANSPORT_VERSION);
+    xpc_release(reply);
+    xpc_release(request);
+    xpc_release(pipe);
+    assert(!mach_port_deallocate(mach_task_self(), port));
+    assert(!LSBRequireSingleThread());
+}
+
+static void rebootClient(mach_port_t sentPort) {
+    for (unsigned variant = 0; variant < RebootReplyCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        mach_port_urefs_t beforeRights, afterRights;
+        assert(!mach_port_get_refs(mach_task_self(), sentPort, MACH_PORT_RIGHT_SEND, &beforeRights));
+        int expected = variant == 0 ? 0 : variant == 1 ? EACCES : EPROTO;
+        assert(LSBTransportRebootUserspace() == expected);
+        assert(openDescriptorCount() == before);
+        assert(!mach_port_get_refs(mach_task_self(), sentPort, MACH_PORT_RIGHT_SEND, &afterRights) && beforeRights == afterRights);
+    }
+    assert(!LSBRequireSingleThread());
+}
+
+static void rebootHost(mach_port_t port, pid_t child, int fd, mach_port_t sentPort) {
+    for (unsigned variant = 0; variant < RebootReplyCount; ++variant) {
+        LSBReceivedMessage message;
+        assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_REBOOT_USERSPACE);
+        assert(message.audit.val[5] == (unsigned)child && !message.requestID && !message.error && !message.targetPID && !message.signalNumber);
+        assert(!message.plan.version && !message.nativeServicePort && !message.peerIdentity.taskName);
+        assert(!message.ports.registeredPresent && !message.ports.bootstrapPresent && !message.ports.count);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        if (variant < 2) {
+            assert(!LSBTransportReply(&message, variant ? EACCES : 0, 0, 0, NULL, NULL, NULL));
+            LSBTransportDisposeMessage(&message);
+            continue;
+        }
+        xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message.object);
+        assert(reply);
+        xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
+        xpc_dictionary_set_uint64(reply, "request-id", 0);
+        xpc_dictionary_set_int64(reply, "error", 0);
+        xpc_dictionary_set_int64(reply, "pid", 0);
+        switch (variant) {
+            case 2: xpc_dictionary_set_uint64(reply, "version", 1); break;
+            case 3: xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION + 1); break;
+            case 4: xpc_dictionary_set_string(reply, "version", "2"); break;
+            case 5: xpc_dictionary_set_uint64(reply, "request-id", 1); break;
+            case 6: xpc_dictionary_set_int64(reply, "request-id", 0); break;
+            case 7: xpc_dictionary_set_int64(reply, "pid", child); break;
+            case 8: xpc_dictionary_set_int64(reply, "pid", -1); break;
+            case 9: xpc_dictionary_set_uint64(reply, "pid", 0); break;
+            case 10: xpc_dictionary_set_int64(reply, "error", -1); break;
+            case 11: xpc_dictionary_set_int64(reply, "error", (int64_t)INT_MAX + 1); break;
+            case 12: xpc_dictionary_set_uint64(reply, "error", EACCES); break;
+            case 13: xpc_dictionary_set_value(reply, "error", NULL); break;
+            case 14: xpc_dictionary_set_value(reply, "pid", NULL); break;
+            case 15: xpc_dictionary_set_data(reply, "plan", "unexpected", 10); break;
+            case 16: setUnexpectedFD(reply, "unknown-fd", fd); break;
+            case 17: xpc_dictionary_set_mach_send(reply, "unknown-port", sentPort); break;
+            case 18: xpc_dictionary_set_uint64(reply, "bootstrap-version", LSB_BOOTSTRAP_VERSION); break;
+            case 19: xpc_dictionary_set_uint64(reply, "kind", LSB_REQUEST_REBOOT_USERSPACE); break;
+            case 20:
+                xpc_dictionary_set_int64(reply, "error", EACCES);
+                xpc_dictionary_set_int64(reply, "pid", child);
+                break;
+            case 21:
+                xpc_dictionary_set_int64(reply, "error", EACCES);
+                xpc_dictionary_set_uint64(reply, "request-id", 1);
+                break;
+            case 22:
+                xpc_dictionary_set_int64(reply, "error", EACCES);
+                setUnexpectedFD(reply, "child-status-fd", fd);
+                break;
+            default: assert(false);
+        }
+        assert(!xpc_pipe_routine_reply(reply));
+        xpc_release(reply);
+        LSBTransportDisposeMessage(&message);
+    }
+}
+
 static audit_token_t ownerAudit(void) { return (audit_token_t){{1, 2, 3, 4, 5, 4242, 7, 8}}; }
 
 static void auditResolutionClient(void) {
@@ -434,7 +567,7 @@ static void auditResolutionHost(mach_port_t port, pid_t child) {
         if (variant == 6) {
             xpc_object_t reply = xpc_dictionary_create_reply(message.object);
             assert(reply);
-            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
             xpc_dictionary_set_uint64(reply, "request-id", 0);
             xpc_dictionary_set_int64(reply, "error", 0);
             xpc_dictionary_set_uint64(reply, "pid", 4242);
@@ -543,7 +676,7 @@ static void entitlementHost(mach_port_t port, pid_t child, unsigned operation) {
         } else {
             xpc_object_t reply = xpc_dictionary_create_reply(message.object);
             assert(reply);
-            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
             xpc_dictionary_set_uint64(reply, "request-id", 0);
             xpc_dictionary_set_int64(reply, "error", 0);
             xpc_dictionary_set_int64(reply, "pid", 0);
@@ -560,7 +693,7 @@ static void entitlementHost(mach_port_t port, pid_t child, unsigned operation) {
                 case EntitlementErrorPayload: xpc_dictionary_set_int64(reply, "error", ESRCH); break;
                 case EntitlementMissingData: xpc_dictionary_set_value(reply, "entitlements", NULL); break;
                 case EntitlementWrongType: xpc_dictionary_set_string(reply, "entitlements", "not data"); break;
-                case EntitlementWrongVersion: xpc_dictionary_set_uint64(reply, "version", 2); break;
+                case EntitlementWrongVersion: xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION + 1); break;
                 case EntitlementWrongError: xpc_dictionary_set_uint64(reply, "error", EACCES); break;
                 case EntitlementNegativeError: xpc_dictionary_set_int64(reply, "error", -1); break;
                 case EntitlementWrongPID: xpc_dictionary_set_int64(reply, "pid", 4242); break;
@@ -663,7 +796,7 @@ static void codeHashHost(mach_port_t port, pid_t child) {
         } else {
             xpc_object_t reply = xpc_dictionary_create_reply(message.object);
             assert(reply);
-            xpc_dictionary_set_uint64(reply, "version", 1);
+            xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
             xpc_dictionary_set_uint64(reply, "request-id", variant == CodeHashWrongID ? 77 : 0);
             xpc_dictionary_set_int64(reply, "error", variant == CodeHashErrorPayload ? EACCES : 0);
             xpc_dictionary_set_int64(reply, "pid", variant == CodeHashWrongPID ? 4242 : 0);
@@ -700,7 +833,7 @@ static void testMalformedAudit(unsigned variant, uint32_t kind) {
     assert(!LSBTestCopyBrokerPort(&port));
     xpc_object_t pipe = xpc_pipe_create_from_port(port, 0), request = xpc_dictionary_create(NULL, NULL, 0);
     assert(pipe && request);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", variant == 15 ? LSB_REQUEST_CHECKIN : kind);
     xpc_dictionary_set_uint64(request, "request-id", variant == 6 ? 77 : 0);
     xpc_dictionary_set_int64(request, "error", variant == 7 ? EACCES : 0);
@@ -879,6 +1012,8 @@ static int client(void) {
     entitlementClient(16);
     entitlementClient(7);
     codeHashClient();
+    rebootClient(tankAnchor);
+    for (unsigned variant = 0; variant < MalformedRebootCount; ++variant) testMalformedReboot(variant, fd, tankAnchor);
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         unsigned before = openDescriptorCount();
         assert(LSBTransportCheckIn(&reply, received) == EPROTO);
@@ -927,7 +1062,7 @@ static int client(void) {
             statistics.sentInline, statistics.sentOOL, statistics.receivedInline, statistics.receivedOOL, statistics.receiveRetries);
     assert(statistics.sentInline && statistics.receivedInline);
 #endif
-    puts("SpawnTransport child: spawn/exec, stable identity, FD/Mach ownership, kill/SIGCHLD, malformed-message and single-thread checks passed");
+    puts("SpawnTransport child: spawn/exec, stable identity, FD/Mach ownership, kill/SIGCHLD, reboot and malformed-message checks passed");
     return 0;
 }
 
@@ -976,7 +1111,7 @@ static void replyMalformedBootstrap(LSBReceivedMessage *message, const LSBSpawnP
                                     const BootstrapFDs *fds, mach_port_t tank, unsigned variant) {
     xpc_object_t reply = xpc_dictionary_create_reply((xpc_object_t)message->object);
     assert(reply);
-    xpc_dictionary_set_uint64(reply, "version", 1);
+    xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(reply, "request-id", 77);
     xpc_dictionary_set_int64(reply, "error", 0);
     xpc_dictionary_set_int64(reply, "pid", 4242);
@@ -1219,6 +1354,16 @@ static int host(const char *executable) {
     entitlementHost(port, child, 16);
     entitlementHost(port, child, 7);
     codeHashHost(port, child);
+    rebootHost(port, child, pending.fds[0], tank);
+    for (unsigned variant = 0; variant < MalformedRebootCount; ++variant) {
+        unsigned before = openDescriptorCount();
+        assert(LSBTransportReceive(port, &message) == EPROTO && !message.object && !message.nativeServicePort && !message.peerIdentity.taskName);
+        assert(!message.ports.registeredPresent && !message.ports.bootstrapPresent && !message.ports.count);
+        for (unsigned i = 0; i < LSB_MAX_FDS; ++i) assert(message.fds[i] == -1);
+        mach_port_urefs_t references;
+        assert(!mach_port_get_refs(mach_task_self(), tank, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(openDescriptorCount() == before);
+    }
     for (unsigned variant = 0; variant < MalformedBootstrapCount; ++variant) {
         assert(!LSBTransportReceive(port, &message) && message.kind == LSB_REQUEST_CHECKIN);
         unsigned before = openDescriptorCount();
@@ -1281,6 +1426,7 @@ static int host(const char *executable) {
 }
 
 int main(int argc, char **argv) {
+    _Static_assert(LSB_TRANSPORT_VERSION == 2 && LSB_BOOTSTRAP_VERSION == 1, "reboot changes only the outer transport version");
     // Bound a failed regression test without adding a signal handler to the production transport.
     alarm(20);
     return argc == 2 && !strcmp(argv[1], "--client") ? client() : host(argv[0]);

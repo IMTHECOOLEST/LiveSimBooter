@@ -20,8 +20,6 @@
 #include <stdio.h>
 #endif
 
-#define LSB_TRANSPORT_VERSION 1
-
 // The simulator SDK omits libproc.h; the same native ABI is exported by both libSystem variants.
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int size);
 
@@ -508,6 +506,24 @@ int LSBTransportKill(pid_t targetPID, int signalNumber) {
     return error;
 }
 
+int LSBTransportRebootUserspace(void) {
+    xpc_object_t request = createRequest(LSB_REQUEST_REBOOT_USERSPACE, 0, 0);
+    if (!request) return ENOMEM;
+    xpc_object_t reply = NULL;
+    int error = callBroker(request, &reply);
+    xpc_release(request);
+    if (!error) {
+        int remoteError = 0;
+        pid_t pid = 0;
+        uint64_t requestID = 0;
+        error = decodeReplyHeader(reply, &remoteError, &pid, &requestID);
+        if (!error && (pid || requestID || xpc_dictionary_get_count(reply) != 4)) error = EPROTO;
+        if (!error) error = remoteError;
+    }
+    if (reply) xpc_release(reply);
+    return error;
+}
+
 int LSBTransportResolveAuditPID(const audit_token_t *audit, pid_t *result) {
     if (result) *result = 0;
     if (!audit || !result || !audit->val[5] || audit->val[5] > INT_MAX) return EINVAL;
@@ -808,13 +824,15 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) {
     uint64_t version = 0, kind = 0;
     int64_t childError = 0;
     if (!unsignedValue(request, "version", &version) || version != LSB_TRANSPORT_VERSION ||
-        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_RESOLVE_NATIVE_CHILD_PID ||
+        !unsignedValue(request, "kind", &kind) || kind < LSB_REQUEST_SPAWN || kind > LSB_REQUEST_REBOOT_USERSPACE ||
         !unsignedValue(request, "request-id", &message->requestID) || !signedValue(request, "error", &childError) ||
         childError < 0 || childError > INT_MAX) error = EPROTO;
     if (!error) {
         message->kind = (uint32_t)kind;
         message->error = (int)childError;
         if (xpc_dictionary_get_value(request, "execution-role") || xpc_dictionary_get_value(request, "bootstrap-version")) error = EPROTO;
+        // This control request must carry only its four-field envelope, including no capabilities under unknown keys.
+        if (kind == LSB_REQUEST_REBOOT_USERSPACE && xpc_dictionary_get_count(request) != 4) error = EPROTO;
     }
     if (!error) {
         if (kind == LSB_REQUEST_READY) {

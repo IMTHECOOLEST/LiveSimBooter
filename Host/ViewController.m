@@ -31,7 +31,12 @@ static void showStatus(UIViewController *controller, NSString *text) {
 }
 
 @interface LSBSurfaceViewController : UIViewController
-@property int startupError;
+@property BOOL visible;
+@property BOOL startupAttempted;
+@property (nonatomic, copy) void (^startupResultHandler)(int);
+@property (nonatomic, strong) UIStackView *startOverlay;
+@property (nonatomic, strong) UILabel *startupStatus;
+@property (nonatomic, strong) UIButton *startButton;
 @property (nonatomic, strong) id indigoObserver;
 @property (nonatomic, strong) id framebufferObserver;
 @property (nonatomic, strong) LSBSimulatorDisplayView *simulatorDisplay;
@@ -66,6 +71,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
 }
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    self.visible = YES;
     self.simulatorDisplay.presentationEnabled = YES;
     self.simulatorDisplay.userInteractionEnabled = YES;
 }
@@ -74,6 +80,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
     [self.simulatorDisplay becomeFirstResponder];
 }
 - (void)viewWillDisappear:(BOOL)animated {
+    self.visible = NO;
     self.simulatorDisplay.userInteractionEnabled = NO; // Cancels active contacts before another tab can receive touches.
     self.simulatorDisplay.presentationEnabled = NO;
     [super viewWillDisappear:animated];
@@ -81,16 +88,59 @@ static void showStatus(UIViewController *controller, NSString *text) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
-    if (self.startupError) {
-        showStatus(self, [NSString stringWithFormat:@"Could not start runtime: %s", strerror(self.startupError)]);
+    UILabel *status = [UILabel new];
+    status.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    status.adjustsFontForContentSizeCategory = YES;
+    status.numberOfLines = 0;
+    status.textAlignment = NSTextAlignmentCenter;
+    status.hidden = YES;
+    UIButtonConfiguration *configuration = UIButtonConfiguration.filledButtonConfiguration;
+    configuration.title = @"Start";
+    configuration.buttonSize = UIButtonConfigurationSizeLarge;
+    __weak LSBSurfaceViewController *weakSelf = self;
+    UIButton *button = [UIButton buttonWithConfiguration:configuration primaryAction:[UIAction actionWithHandler:^(UIAction *action) {
+        (void)action;
+        [weakSelf startInitialRuntime];
+    }]];
+    button.accessibilityIdentifier = @"runtime-start";
+    UIStackView *overlay = [[UIStackView alloc] initWithArrangedSubviews:@[status, button]];
+    overlay.axis = UILayoutConstraintAxisVertical;
+    overlay.alignment = UIStackViewAlignmentCenter;
+    overlay.spacing = 16;
+    overlay.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:overlay];
+    self.startOverlay = overlay;
+    self.startupStatus = status;
+    self.startButton = button;
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [overlay.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:24],
+        [overlay.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
+        [overlay.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor]
+    ]];
+}
+- (void)startInitialRuntime {
+    if (self.startupAttempted) return;
+    self.startupAttempted = YES;
+    self.startButton.enabled = NO;
+    int error = LSBStartInitialGuest();
+    if (self.startupResultHandler) self.startupResultHandler(error);
+    if (error) {
+        self.startupStatus.text = [NSString stringWithFormat:@"Could not start runtime: %s. Close and reopen the app to try again.", strerror(error)];
+        self.startupStatus.hidden = NO;
+        self.startButton.hidden = YES;
         return;
     }
+    [self.startOverlay removeFromSuperview];
+    self.startOverlay = nil;
+    self.startupStatus = nil;
+    self.startButton = nil;
     if (!LSBHostUsesSimulatorDisplay()) { showStatus(self, @"This runtime has no simulator display."); return; }
     LSBSimulatorDisplayView *display = [[LSBSimulatorDisplayView alloc] initWithFrame:CGRectZero];
     display.translatesAutoresizingMaskIntoConstraints = NO;
     display.indigoServer = LSBHostIndigoHIDServer();
-    display.presentationEnabled = NO;
-    display.userInteractionEnabled = NO;
+    display.presentationEnabled = self.visible;
+    display.userInteractionEnabled = self.visible;
     [self.view addSubview:display];
     hostDisplay = display;
     self.simulatorDisplay = display;
@@ -115,6 +165,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
         [display.heightAnchor constraintLessThanOrEqualToAnchor:safe.heightAnchor multiplier:0.94],
         preferredWidth
     ]];
+    if (self.visible) [display becomeFirstResponder];
 }
 @end
 
@@ -134,6 +185,14 @@ static void showStatus(UIViewController *controller, NSString *text) {
     if (_closeObserver) [NSNotificationCenter.defaultCenter removeObserver:_closeObserver];
     _session.outputHandler = nil;
 }
+- (NSString *)waitingStatus {
+    if (self.startupError) return [NSString stringWithFormat:@"Runtime startup failed: %s. Close and reopen the app to try again.", strerror(self.startupError)];
+    return LSBInitialGuestStartupWasAttempted() ? @"Waiting for launchd to start Fish…" : @"Start the simulator from the IOSurface tab.";
+}
+- (void)runtimeStartupFinished:(int)error {
+    self.startupError = error;
+    if (!self.session) self.terminal.statusText = [self waitingStatus];
+}
 - (void)bindTerminal {
     LSBTerminalSession *session = LSBHostTerminal();
     if (_session == session) {
@@ -145,7 +204,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
     self.receivedTerminalOutput = NO;
     self.terminal.inputHandler = nil;
     self.terminal.resizeHandler = nil;
-    self.terminal.statusText = session ? @"Terminal attached." : @"Waiting for launchd to start Fish…";
+    self.terminal.statusText = session ? @"Terminal attached." : [self waitingStatus];
     if (!session) return;
     __weak LSBFishViewController *weakSelf = self;
     self.terminal.inputHandler = ^(NSData *data) {
@@ -176,11 +235,6 @@ static void showStatus(UIViewController *controller, NSString *text) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.blackColor;
-    if (self.startupError) {
-        self.view.backgroundColor = UIColor.systemBackgroundColor;
-        showStatus(self, [NSString stringWithFormat:@"Could not start runtime: %s", strerror(self.startupError)]);
-        return;
-    }
     LSBTerminalView *terminal = [[LSBTerminalView alloc] initWithFrame:CGRectZero];
     terminal.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:terminal];
@@ -196,7 +250,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
         [terminal.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor],
         preferredBottom
     ]];
-    terminal.statusText = @"Waiting for launchd to start Fish…";
+    terminal.statusText = [self waitingStatus];
     [self bindTerminal];
     __weak LSBFishViewController *weakSelf = self;
     self.terminalObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostTerminalDidChangeNotification object:nil
@@ -225,12 +279,11 @@ static void showStatus(UIViewController *controller, NSString *text) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     // The scene keeps the display and terminal connections. Tab selection never starts or stops a process.
-    int startupError = LSBStartInitialGuest();
     LSBSurfaceViewController *surface = [LSBSurfaceViewController new];
-    surface.startupError = startupError;
     surface.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"IOSurface" image:[UIImage systemImageNamed:@"iphone"] tag:0];
     LSBFishViewController *fish = [LSBFishViewController new];
-    fish.startupError = startupError;
+    __weak LSBFishViewController *weakFish = fish;
+    surface.startupResultHandler = ^(int error) { [weakFish runtimeStartupFinished:error]; };
     fish.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Fish" image:[UIImage systemImageNamed:@"terminal"] tag:1];
     LSBSettingsViewController *settings = [LSBSettingsViewController new];
     UINavigationController *settingsNavigation = [[UINavigationController alloc] initWithRootViewController:settings];
@@ -242,5 +295,6 @@ static void showStatus(UIViewController *controller, NSString *text) {
     // Install both consumers before asynchronous check-in/output, without focusing the hidden terminal.
     [surface loadViewIfNeeded];
     [fish loadViewIfNeeded];
+    if (LSBInitialGuestStartsAutomatically() || LSBInitialGuestStartupWasAttempted()) [surface startInitialRuntime];
 }
 @end

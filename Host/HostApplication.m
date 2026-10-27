@@ -54,6 +54,12 @@ static BOOL initialGuestStarted;
 }
 @end
 
+bool LSBInitialGuestStartsAutomatically(void) {
+    return LSBHostArgumentsRequestAutomaticStart(launchArgumentCount, launchArguments);
+}
+
+bool LSBInitialGuestStartupWasAttempted(void) { return initialGuestStarted; }
+
 int LSBStartInitialGuest(void) {
     if (initialGuestStarted) return startupError;
     initialGuestStarted = YES;

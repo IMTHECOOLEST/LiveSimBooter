@@ -1214,6 +1214,17 @@ static void oversizedEntryTest() {
 }
 
 int main() {
+    check(!LSBTraceHandoffRequested(nullptr), "successful handoff diagnostics are disabled by default");
+    const char *trace[] = {"LSB_TRACE_HANDOFF_EXTRA=1", "LSB_TRACE_HANDOFF=1", "LSB_TRACE_HANDOFF=0", nullptr};
+    const char *noTrace[] = {"LSB_TRACE_HANDOFF=0", "LSB_TRACE_HANDOFF=1", nullptr};
+    const char *missingTrace[] = {"LSB_TRACE_HANDOFF", "LSB_TRACE_HANDOFF_EXTRA=1", nullptr};
+    check(LSBTraceHandoffRequested(trace) && !LSBTraceHandoffRequested(noTrace) && !LSBTraceHandoffRequested(missingTrace),
+          "handoff tracing requires the first exact environment key to equal one");
+    for (const char *value : {"", "01", "true", "1=extra", "-1"}) {
+        std::string entry = std::string("LSB_TRACE_HANDOFF=") + value;
+        const char *environment[] = {entry.c_str(), "LSB_TRACE_HANDOFF=1", nullptr};
+        check(!LSBTraceHandoffRequested(environment), "invalid explicit trace values do not enable success logging");
+    }
     check(retainHostCacheRequested(nullptr), "native cache retention is enabled by default");
     const char *retain[] = {"LSB_RETAIN_HOST_CACHE_EXTRA=1", "LSB_RETAIN_HOST_CACHE=1", "LSB_RETAIN_HOST_CACHE=0", nullptr};
     const char *disabled[] = {"LSB_RETAIN_HOST_CACHE=0", "LSB_RETAIN_HOST_CACHE=1", nullptr};

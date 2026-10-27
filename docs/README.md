@@ -19,7 +19,7 @@ Historical sections below describe earlier cache layouts and failures; use the s
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.
 - [Simulator launchd](launchd.md): empty bootstrap, tank handoff without execve, workqueue startup, and device findings.
-- [Guest launchctl](guest-control.md): restart individual simulator jobs over SSH through the guest bootstrap namespace.
+- [Guest launchctl](guest-control.md): restart individual jobs and reboot the simulator session through the guest bootstrap namespace.
 - [Guest SSH with Fish](sshdog.md): sshdog staging, keys, authenticated device connection, and remaining shell/PTY work.
 - [Backboardd](backboardd.md): the expanded runtime cache, service identity, and boot progress.
 - [Keyboard haptics](keyboard-haptics.md): the pinned system-pattern URL correction and verified iOS 27 host keyboard input.

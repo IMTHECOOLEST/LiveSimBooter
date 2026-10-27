@@ -254,7 +254,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     environment[count++] = guestPIDEnvironment;
     environment[count++] = parentPIDEnvironment;
     environment[count] = NULL;
-    fprintf(stderr, "[LiveProcess] pid=%d entering %s with %u arguments\n", getpid(), executablePath, launch.plan.argc);
+    if (LSBTraceHandoffRequested(environment))
+        fprintf(stderr, "[LiveProcess] pid=%d entering %s with %u arguments\n", getpid(), executablePath, launch.plan.argc);
     if (stopBeforeHandoff) {
         fprintf(stderr, "[LiveProcess] pid=%d waiting for LLDB before simulator handoff\n", getpid());
         fflush(stderr);

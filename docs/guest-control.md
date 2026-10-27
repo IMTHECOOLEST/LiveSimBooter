@@ -70,6 +70,57 @@ Records are under `tmp/app-launch-fix/promoted-results`: `91db0a23abba4d2f9e5e03
 and `d9b31729d60b48249caa3e5553d99099` (probe bootout). Those completed requests have zero spawn/wait errors and no timeout.
 This validates job control; it does not imply that every bootstrapped program completed its intended work.
 
+## Restart the simulator session
+
+With the matching host, LiveProcess and guest shim installed, `launchctl reboot userspace` requests a new simulator session
+inside the existing native host. The persistent tabs remain open. The host regenerates the launchd bootstrap configuration,
+boot UUID, Metal helpers, IOSurface/framebuffer/HID services and launchd-owned Fish using the original host arguments and environment.
+It preserves SimulatorData; this is a restart, not a data reset. A normal launchd exit or crash does not trigger automatic restart.
+
+The 23A343 launchd adapter pins UUID `C3EC5C45-8C85-3D11-B59C-62C4248F5EF9`, instruction contexts and exact callsites. It records
+an accepted reboot only at the successful routine-821 reply, then notifies the broker at launchd's final clean `exit(0)`.
+The stock simulator launchctl does not recognize the literal `userspace` argument and falls back to its SYSTEM reboot flag;
+the adapter accepts that and the USERSPACE form, while excluding halt, recovery and dry-run flags. This never calls a native
+phone reboot API. The broker authenticates the current root launchd's full audit token and waits for actual process-death
+notifications before constructing new services. Missing exit evidence or an unresolved extension launch stops the restart
+and requires reopening the host; it does not create an overlapping session.
+
+After the old generation has exited, the host locks the control queue and archives interrupted `active`, `request` and
+`client.lock` entries under `SimulatorData/var/run/launchctl-control/reboot-interrupted.<UUID>/`. It preserves logs and receipts
+and never replays the old command or fabricates success. The client issuing the reboot may therefore lose its result; inspect
+the new boot UUID, launchd PID and output independently instead of resubmitting the reboot. Other interrupted-worker cases
+still require the inspection described below. Wire protocol version 2 requires rebuilding the host, extension and shim together.
+
+### Device verification (2026-10-27)
+
+Pinned 23A343 arm64 guest on iPhone18,2 / iOS 27.0 build 24A435, retaining the native cache, with no LLDB attachment.
+The existing 1,353-image cache stayed at base `0x110000000`, UUID `73ED978A-FD25-3166-A57A-34E21BB7E5B8`;
+no runtime/cache rebuild was needed. Rebuilt host/extension and wire-v2 shim were signed and installed together. The shim's
+previous device copy was retained outside RuntimeRoot; transfers followed the requested no-checksum policy. The deployed shim
+UUID is `EE703BAB-57F0-39D1-B644-3539B4B2438C`, host UUID `DB9F467F-F2B8-3D3E-8846-EA47123C6953`, and extension UUID
+`830129AF-ED8E-396A-B2E5-F175A42EDDD3`.
+
+A no-argument cold launch displayed Start on IOSurface and had only native host PID **13152**, with no LiveProcess guests.
+The explicit `--launchd-services` route started automatically. Native host **13156** then survived two sequential
+`launchctl reboot userspace` commands:
+
+| Session | Native launchd PID | Boot UUID |
+| --- | --- | --- |
+| Initial | 13160 | CAE85E1B-91B6-4690-BF3C-F022F54A2C50 |
+| First reboot | 13244 | F5A939A8-9B3A-4D84-8B43-DE31EBA37835 |
+| Second reboot | 13341 | A0BA9040-7F2F-4F6B-98BC-C7FEB54E8B21 |
+
+Each root launchd armed the broker and exited with wait status zero. Process inventories after each reboot shared only the
+native host PID with the previous inventory. New framebuffer surfaces and Indigo registration succeeded; a screenshot and
+the user confirmed black → spinner → SpringBoard. Post-reboot control queries completed with exit zero and showed SpringBoard,
+backboardd, Fish and the control worker running. These launchctl listings expose logical guest PIDs; the table above uses native PIDs.
+Both issuing control workers were interrupted, and their request/client-lock evidence was archived without replay; a new control
+request worked after each reboot. The three handoff banners occurred zero times with default tracing disabled.
+
+Local validation includes the integrated suite, focused reboot authentication/drain/callback tests, control-queue preservation
+and lock tests, startup policy, handoff-flag propagation, and iPhoneOS build/signature checks. Evidence and packages are under
+ignored `tmp/userspace-reboot/`; the setup does not depend on these experiment files.
+
 ## Results and interrupted requests
 
 Each call prints a fresh request ID and saves `<ID>.request.json`, `<ID>.json`, and `<ID>.log` under `--output-dir`. The final

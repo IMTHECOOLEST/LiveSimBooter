@@ -74,9 +74,10 @@ static void testDeviceProfile(LSBReceivedMessage *message, NSString *root, NSStr
     }
 }
 
-static void testWorkqueueHardwareBreakpoint(LSBReceivedMessage *message, NSString *root, NSString *configPath, const char *name) {
+static void testRuntimeBooleanEnvironment(LSBReceivedMessage *message, NSString *root, NSString *configPath, const char *name,
+                                         BOOL enabledByDefault) {
     const struct { const char *first, *second; BOOL enabled; } cases[] = {
-        {NULL, NULL, YES}, {"0", NULL, NO}, {"1", NULL, YES}, {"", NULL, NO}, {"01", NULL, NO}, {"true", NULL, NO},
+        {NULL, NULL, enabledByDefault}, {"0", NULL, NO}, {"1", NULL, YES}, {"", NULL, NO}, {"01", NULL, NO}, {"true", NULL, NO},
         {"1=extra", NULL, NO}, {"1", "0", YES}, {"0", "1", NO}, {"", "1", NO}, {"01", "1", NO}, {"1", "1", YES}
     };
     int (*prepare[])(LSBReceivedMessage *, const char *, const char *const[]) = {LSBPrepareLaunchdPlan, LSBPrepareLaunchdDFPlan};
@@ -115,11 +116,11 @@ static void testWorkqueueHardwareBreakpoint(LSBReceivedMessage *message, NSStrin
             dispose(message);
         }
     }
-    // Regeneration without an inherited environment restores enabled defaults in both bootstrap scopes.
+    // A fresh plan restores the documented default in both bootstrap scopes, without retaining a prior test's opt-in/out.
     assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
-    assert(!strcmp(environmentValue(&message->plan, name), "1"));
+    assert(!strcmp(environmentValue(&message->plan, name), enabledByDefault ? "1" : "0"));
     NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
-    for (NSString *scope in @[@"Self", @"Child"]) assert([bootstrap[scope][@(name)] isEqualToString:@"1"]);
+    for (NSString *scope in @[@"Self", @"Child"]) assert([bootstrap[scope][@(name)] isEqualToString:enabledByDefault ? @"1" : @"0"]);
     dispose(message);
 }
 
@@ -881,8 +882,9 @@ int main(void) {
         assert([[NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"stdout\nstderr\nagain\n"]);
         testDeviceProfile(message, root, configPath);
         testDFMode(message, root, dataPath, configPath, inherited);
-        testWorkqueueHardwareBreakpoint(message, root, configPath, "LSB_WORKQUEUE_HARDWARE_BREAKPOINT");
-        testWorkqueueHardwareBreakpoint(message, root, configPath, "LSB_RETAIN_HOST_CACHE");
+        testRuntimeBooleanEnvironment(message, root, configPath, "LSB_WORKQUEUE_HARDWARE_BREAKPOINT", YES);
+        testRuntimeBooleanEnvironment(message, root, configPath, "LSB_RETAIN_HOST_CACHE", YES);
+        testRuntimeBooleanEnvironment(message, root, configPath, "LSB_TRACE_HANDOFF", NO);
         testLegacyDetachmentMode(message, root, configPath);
         testAdditionalJobs(message, root, dataPath, configPath);
 

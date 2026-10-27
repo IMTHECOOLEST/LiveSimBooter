@@ -88,7 +88,7 @@ static void replyVariant(LSBReceivedMessage *message, const LSBPeerProcessIdenti
     }
     xpc_object_t reply = xpc_dictionary_create_reply(message->object);
     assert(reply);
-    xpc_dictionary_set_uint64(reply, "version", 1);
+    xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(reply, "request-id", 0);
     xpc_dictionary_set_int64(reply, "error", 0);
     xpc_dictionary_set_int64(reply, "pid", identity->audit.val[5]);
@@ -97,7 +97,7 @@ static void replyVariant(LSBReceivedMessage *message, const LSBPeerProcessIdenti
     unsigned char info[LSB_PEER_SHORT_INFO_BYTES + 1] = {0};
     memcpy(info, identity->shortInfo, sizeof(identity->shortInfo));
     switch (variant) {
-        case WrongVersion: xpc_dictionary_set_uint64(reply, "version", 2); break;
+        case WrongVersion: xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION + 1); break;
         case WrongError: xpc_dictionary_set_string(reply, "error", "0"); break;
         case WrongReplyPID: xpc_dictionary_set_int64(reply, "pid", 1); break;
         case WrongID: xpc_dictionary_set_uint64(reply, "request-id", 1); break;
@@ -143,12 +143,12 @@ static void resolveReplyVariant(LSBReceivedMessage *message, mach_port_t task, u
     }
     xpc_object_t reply = xpc_dictionary_create_reply(message->object);
     assert(reply);
-    xpc_dictionary_set_uint64(reply, "version", 1);
+    xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(reply, "request-id", 0);
     xpc_dictionary_set_int64(reply, "error", 0);
     xpc_dictionary_set_int64(reply, "pid", getpid() + 100000);
     switch (variant) {
-        case ResolveVersion: xpc_dictionary_set_uint64(reply, "version", 2); break;
+        case ResolveVersion: xpc_dictionary_set_uint64(reply, "version", LSB_TRANSPORT_VERSION + 1); break;
         case ResolveErrorType: xpc_dictionary_set_string(reply, "error", "0"); break;
         case ResolveRequestID: xpc_dictionary_set_uint64(reply, "request-id", 1); break;
         case ResolveMissingPID: xpc_dictionary_set_value(reply, "pid", NULL); break;
@@ -171,7 +171,7 @@ static void malformedRequest(const LSBPeerProcessIdentity *identity, unsigned va
     assert(!LSBTestCopyBrokerPort(&broker));
     xpc_object_t pipe = xpc_pipe_create_from_port(broker, 0), request = xpc_dictionary_create(NULL, NULL, 0), reply = NULL;
     assert(pipe && request);
-    xpc_dictionary_set_uint64(request, "version", 1);
+    xpc_dictionary_set_uint64(request, "version", LSB_TRANSPORT_VERSION);
     xpc_dictionary_set_uint64(request, "kind", kind);
     xpc_dictionary_set_uint64(request, "request-id", 0);
     xpc_dictionary_set_int64(request, "error", 0);

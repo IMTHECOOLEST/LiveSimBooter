@@ -380,7 +380,7 @@ Install the staged app using the current device identifier, with the phone unloc
 xcrun devicectl device install app --device "$LSB_DEVICE" "$LSB_STAGED_APP" --json-output "$LSB_WORK/install.json"
 ```
 
-For a **fresh App Group without RuntimeRoot**, copy through the app's data container and let the first host launch move it:
+For a **fresh App Group without RuntimeRoot**, copy through the app's data container and let the first runtime start move it:
 
 ```sh
 xcrun devicectl device copy to --device "$LSB_DEVICE" --source "$LSB_WORK/runtime/RuntimeRoot" \
@@ -428,11 +428,20 @@ The later cache/helper metadata-name patch resolved the observed lsd failure and
 iPhone18,2 / iOS 27.0 / 24A435 without LLDB. The full migration initially omitted SimulatorHID; restoring it also restored touch delivery, verified by Home Screen
 page swipes and opening Contacts. The home screen is not proof that every staged application works.
 
-The host may remain open after the guest exits; inspect its broker exit record. Then launch the app normally, or use the same
-command with no arguments after the bundle identifier, to start graphical launchd. The default selection comes from
+The host may remain open after the guest exits; inspect its broker exit record. A normal icon launch, or a command with no
+arguments after the bundle identifier, now waits for **Start** on the IOSurface tab. Tap it to boot graphical launchd. The tabs
+remain available before startup and persist afterward. For an unattended development test, pass `--launchd-services` with no
+labels to start the same default selection automatically. Other explicit guest arguments, such as `/bin/df` or `--terminal`,
+also retain automatic startup. The default selection comes from
 `Host/Broker.m`: it includes SpringBoard, assistantd, configd_sim, systemstatusd, kbd, and the on-demand PosterBoard LaunchAngel.
 The generator adds backboardd, cfprefsd, the launchd-owned Fish helper, and the display-settings worker. Explicit `--launchd-services LABEL...` **replaces**
 the additional default list. Keep the native app foregrounded for baseline tests.
+
+Handoff success logs are disabled by default. To inspect guest entry, main-stack relocation, and the retained/detached cache
+choice, prefix the development launch command with `DEVICECTL_CHILD_LSB_TRACE_HANDOFF=1`. Launchd propagates this exact opt-in to
+its children; preparation failures remain visible without it. The Start policy and trace propagation have focused local tests;
+[device verification](guest-control.md#device-verification-2026-10-27) also covers the Start screen and default-off banners.
+Repeat the boot checks below on your destination device.
 
 For app icons, the staged registration manifest is `RuntimeRoot/usr/share/LiveSimBooter/applications.json`. Run the signed
 `/usr/libexec/app-registration --manifest /usr/share/LiveSimBooter/applications.json` as a job **inside the existing simulator

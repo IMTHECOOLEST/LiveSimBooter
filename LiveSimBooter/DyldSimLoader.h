@@ -17,6 +17,17 @@ typedef struct {
     uintptr_t entry;
 } LSBMappedImage;
 
+// Read the planned guest environment during native preparation, before changing TLS or entering the simulator.
+static inline bool LSBTraceHandoffRequested(const char *const environment[]) {
+    const char prefix[] = "LSB_TRACE_HANDOFF=";
+    for (const char *const *entry = environment; entry && *entry; ++entry) {
+        size_t index = 0;
+        while (prefix[index] && (*entry)[index] == prefix[index]) ++index;
+        if (!prefix[index]) return (*entry)[index] == '1' && (*entry)[index + 1] == '\0';
+    }
+    return false;
+}
+
 bool LSBMapDyldSim(const char *path, LSBMappedImage *image, char *error, size_t errorSize);
 bool LSBMapSimExecutable(const char *path, LSBMappedImage *image, char *error, size_t errorSize);
 // With a cache present, reserve images below its declared range and below the host executable shared region.

@@ -50,8 +50,10 @@ static RecordedReply replies[4 * BrokerJobCapacity];
 static unsigned replyCount, disposedMessages, submittedLaunches, releasedLaunches, objectSequence;
 static uint32_t submittedLaunchOptions;
 static pid_t reportedPID;
-static int submitError, readySendError, launchdBootstrapSendError, monitorCreateError, identityCheckError, runningBoardError;
+static int submitError, readySendError, rebootSendError, launchdBootstrapSendError, monitorCreateError, identityCheckError, runningBoardError;
 static unsigned deliveredSignals, identityChecks, runningBoardStarts, runningBoardCancels;
+static int monitorReadError, monitorWaitStatus;
+static unsigned monitorReads;
 static unsigned submittedExtensionSignals;
 static uint64_t signaledRequest;
 static int directSignalError, extensionSignalError, lastSignal;
@@ -239,8 +241,10 @@ int LSBChildMonitorCreate(pid_t pid, int *descriptor) {
     return 0;
 }
 int LSBChildMonitorRead(int descriptor, pid_t pid, int *status) {
-    (void)descriptor; (void)pid; (void)status;
-    return EAGAIN;
+    assert(descriptor >= 0 && pid > 0 && status);
+    ++monitorReads;
+    *status = monitorWaitStatus;
+    return monitorReadError;
 }
 int LSBChildSignal(const audit_token_t *audit, int signal) {
     assert(audit && signal > 0 && signal < NSIG);
@@ -281,7 +285,7 @@ int LSBTransportReceive(mach_port_t port, LSBReceivedMessage *message) { (void)p
 int LSBTransportReply(LSBReceivedMessage *message, int error, pid_t pid, uint64_t requestID, const char *root,
                       const LSBSpawnPlan *plan, const int fds[LSB_MAX_FDS]) {
     assert(message && message->object && replyCount < sizeof(replies) / sizeof(replies[0]));
-    int sendError = message->kind == LSB_REQUEST_READY ? readySendError : 0;
+    int sendError = message->kind == LSB_REQUEST_READY ? readySendError : message->kind == LSB_REQUEST_REBOOT_USERSPACE ? rebootSendError : 0;
     if (plan) {
         assert(root && !strcmp(root, runtimeRoot.fileSystemRepresentation) && fds);
         for (unsigned i = 0; i < plan->fdCount; ++i) assert(fcntl(fds[i], F_GETFD) >= 0);
@@ -359,6 +363,15 @@ void LSBTransportDisposeMessage(LSBReceivedMessage *message) {
 }
 
 static void resetBroker(void) {
+    // Invalidate queued timeout/death callbacks from a prior fixture instead of recycling its generation.
+    ++rebootGeneration;
+    sessionDraining = rebootDrainFailed = NO;
+    rebootArguments = rebootEnvironment = nil;
+    rebootPendingDeaths = nil;
+    for (LSBRunningBoardMonitor *monitor in rebootDeathMonitors) LSBRunningBoardMonitorCancel(monitor);
+    rebootDeathMonitors = nil;
+    for (dispatch_source_t source in rebootExitSources) dispatch_source_cancel(source);
+    rebootExitSources = nil;
     if (adoptionRetrySource) dispatch_source_cancel(adoptionRetrySource);
     adoptionRetrySource = nil;
     pendingAdoptions = [NSMutableArray new];
@@ -417,8 +430,11 @@ static void resetBroker(void) {
     memset(registeredAudits, 0, sizeof(registeredAudits));
     memset(registeredTimeouts, 0, sizeof(registeredTimeouts));
     reportedPID = getpid();
-    submitError = readySendError = launchdBootstrapSendError = monitorCreateError = identityCheckError = 0;
+    submitError = readySendError = rebootSendError = launchdBootstrapSendError = monitorCreateError = identityCheckError = 0;
     runningBoardError = EACCES;
+    monitorReadError = EAGAIN;
+    monitorWaitStatus = 0;
+    monitorReads = 0;
     deliveredSignals = identityChecks = finishingDepth = 0;
     runningBoardStarts = runningBoardCancels = 0;
     submittedExtensionSignals = 0;
@@ -3539,6 +3555,252 @@ static void testLaunchdCancellationAndFailedBootstrap(void) {
     }
 }
 
+static void rememberRebootInputs(void) {
+    const char *arguments[] = {"LiveSimBooter", "--launchd", NULL};
+    const char *environment[] = {"LSB_RETAIN_HOST_CACHE=0", "LSB_WORKQUEUE_HARDWARE_BREAKPOINT=0", NULL};
+    assert(!snapshotRebootInputs(2, arguments, environment));
+}
+
+static RecordedReply *requestReboot(LSBJob *sender) {
+    LSBReceivedMessage *request = messageFor(LSB_REQUEST_REBOOT_USERSPACE, sender.pid, sender.pidVersion, 0);
+    request->audit = sender.audit;
+    unsigned object = ((TestMessageObject *)request->object)->identifier;
+    handleMessage(request);
+    RecordedReply *reply = replyFor(object);
+    assert(reply && !reply->pid && !reply->requestID && !reply->deliveredPlan);
+    return reply;
+}
+
+static void testRebootInputSnapshot(void) {
+    resetBroker();
+    char argument[] = "--launchd", environmentValue[] = "LSB_RETAIN_HOST_CACHE=0";
+    const char *arguments[] = {"LiveSimBooter", argument, NULL};
+    const char *environment[] = {environmentValue, NULL};
+    assert(!snapshotRebootInputs(2, arguments, environment));
+    memset(argument, 'x', sizeof(argument) - 1);
+    memset(environmentValue, 'x', sizeof(environmentValue) - 1);
+    assert(rebootArguments.count == 2 && rebootEnvironment.count == 1);
+    assert(!strcmp(rebootArguments[1].bytes, "--launchd"));
+    assert(!strcmp(rebootEnvironment[0].bytes, "LSB_RETAIN_HOST_CACHE=0"));
+    NSArray *savedArguments = rebootArguments, *savedEnvironment = rebootEnvironment;
+    assert(snapshotRebootInputs(0, arguments, environment) == E2BIG);
+    assert(snapshotRebootInputs(LSB_MAX_VECTOR + 1, arguments, environment) == E2BIG);
+    const char *missing[] = {"LiveSimBooter", NULL};
+    assert(snapshotRebootInputs(2, missing, NULL) == E2BIG);
+    char *oversized = malloc(LSB_STRING_BYTES + 1);
+    assert(oversized);
+    memset(oversized, 'x', LSB_STRING_BYTES);
+    oversized[LSB_STRING_BYTES] = 0;
+    const char *largeEnvironment[] = {oversized, NULL};
+    assert(snapshotRebootInputs(1, arguments, largeEnvironment) == E2BIG);
+    free(oversized);
+    const char *tooMany[LSB_MAX_VECTOR + 2];
+    for (unsigned i = 0; i <= LSB_MAX_VECTOR; ++i) tooMany[i] = "X=1";
+    tooMany[LSB_MAX_VECTOR + 1] = NULL;
+    assert(snapshotRebootInputs(1, arguments, tooMany) == E2BIG);
+    assert(rebootArguments == savedArguments && rebootEnvironment == savedEnvironment);
+}
+
+static void testRebootAuthentication(void) {
+    for (unsigned scenario = 0; scenario < 15; ++scenario) {
+        resetBroker();
+        rememberRebootInputs();
+        LSBJob *launchd = terminalLaunchd();
+        LSBReceivedMessage *request = messageFor(LSB_REQUEST_REBOOT_USERSPACE, launchd.pid, launchd.pidVersion, 0);
+        request->audit = launchd.audit;
+        int expected = EACCES;
+        switch (scenario) {
+            case 0: ++request->audit.val[5]; break;
+            case 1: ++request->audit.val[7]; break;
+            case 2: ++request->audit.val[1]; break; // Same PID/version is insufficient: require the complete audit token.
+            case 3: launchd.parentIdentifier = 99; break;
+            case 4: launchd.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE; break;
+            case 5: launchd.simulatorLaunchd = NO; break;
+            case 6: launchd.peerIdentityError = EINVAL; break;
+            case 7: {
+                LSBPeerProcessIdentity identity = launchd.peerIdentity;
+                strcpy(identity.executablePath, "/sbin/other");
+                launchd.peerIdentity = identity;
+                break;
+            }
+            case 8: launchd.retiredForExec = YES; break;
+            case 9: launchd.finishing = YES; break;
+            case 10: launchd.phase = JobDispatched; break;
+            case 11: rebootArguments = nil; expected = ENOTSUP; break;
+            case 12: rebootSendError = EPIPE; expected = 0; break;
+            case 13: sessionDraining = YES; expected = ECANCELED; break;
+            case 14: expected = 0; break;
+        }
+        unsigned object = ((TestMessageObject *)request->object)->identifier;
+        uint64_t generation = rebootGeneration;
+        handleMessage(request);
+        RecordedReply *reply = replyFor(object);
+        assert(reply && reply->error == expected && reply->sendError == rebootSendError);
+        assert(!reply->pid && !reply->requestID && !reply->deliveredPlan);
+        assert(launchd.rebootRequested == (scenario == 14));
+        assert(jobs.count == 1 && rebootGeneration == generation && !submittedLaunches && !deliveredSignals);
+        assert(disposedMessages == 1);
+    }
+}
+
+static void testRebootRequiresCleanLaunchdExit(void) {
+    for (unsigned scenario = 0; scenario < 4; ++scenario) {
+        resetBroker();
+        rememberRebootInputs();
+        LSBJob *launchd = terminalLaunchd();
+        if (scenario) assert(!requestReboot(launchd)->error && launchd.rebootRequested);
+        uint64_t generation = rebootGeneration;
+        if (scenario == 3) recordMonitorError(launchd.identifier, EIO);
+        else recordChildExit(launchd.identifier, scenario == 1 ? 1 << 8 : scenario == 2 ? SIGTERM : 0);
+        assert(!jobs.count && !sessionDraining && rebootGeneration == generation && !submittedLaunches);
+    }
+}
+
+static NSString *makeRebootRuntime(void) {
+    char temporary[] = "/tmp/LSBReboot.XXXXXX", canonical[PATH_MAX];
+    assert(mkdtemp(temporary) && realpath(temporary, canonical));
+    NSString *directory = [NSString stringWithUTF8String:canonical];
+    runtimeRoot = [directory stringByAppendingPathComponent:@"RuntimeRoot"];
+    assert([NSFileManager.defaultManager createDirectoryAtPath:runtimeRoot withIntermediateDirectories:YES attributes:nil error:NULL]);
+    return directory;
+}
+
+static NSDictionary *rebootConfiguration(void) {
+    NSString *data = [runtimeRoot.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"SimulatorData"];
+    return [NSDictionary dictionaryWithContentsOfFile:[data stringByAppendingPathComponent:@"var/run/LiveSimBooter-launchd-bootstrap.plist"]][@"Bootstrap"];
+}
+
+static void testRebootWaitsForOldGenerationAndRegeneratesConfiguration(void) {
+    resetBroker();
+    NSString *directory = makeRebootRuntime();
+    rememberRebootInputs();
+    const char *arguments[] = {"LiveSimBooter", "--launchd", NULL};
+    const char *environment[] = {"LSB_RETAIN_HOST_CACHE=0", "LSB_WORKQUEUE_HARDWARE_BREAKPOINT=0", NULL};
+    LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
+    assert(initial && !initialPlan(initial, 2, arguments, environment));
+    NSString *oldUUID = rebootConfiguration()[@"Self"][@"LSB_SIMULATOR_BOOT_UUID"];
+    assert([[NSUUID alloc] initWithUUIDString:oldUUID]);
+    disposeMessage(initial);
+    LSBJob *launchd = terminalLaunchd(), *child = managedJob(launchd, 6601), *nativeHelper = managedJob(nil, 6602);
+    nativeHelper.executionRole = LSB_EXECUTION_NATIVE_METAL_SERVICE;
+    LSBJob *queued = managedJob(nil, 6603);
+    queued.phase = JobQueued; queued.pid = 0; queued.audit = (audit_token_t){{0}};
+    uint64_t childID = child.identifier;
+    runningBoardError = 0;
+    LSBRunningBoardMonitor *existing = nil;
+    audit_token_t childAudit = child.audit;
+    assert(!LSBRunningBoardMonitorStart(&childAudit, ^(int status, int error) {
+        if (error) recordMonitorError(childID, error);
+        else recordChildExit(childID, status);
+    }, &existing));
+    child.runningBoardMonitor = existing;
+    LSBRunningBoardExitHandler queuedExit = existing.completion;
+    // Simulate an exit callback already queued before the broker receives launchd's clean exit.
+    dispatch_async(dispatch_get_main_queue(), ^{ queuedExit(SIGKILL, 0); });
+    assert(!requestReboot(launchd)->error && !sessionDraining);
+    uint64_t generation = rebootGeneration;
+    recordChildExit(launchd.identifier, 0);
+    assert(sessionDraining && !rebootDrainFailed && rebootGeneration == generation + 1);
+    assert(!jobs.count && !startingJob && !submittedLaunches && rebootPendingDeaths.count == 2);
+    assert(rebootDeathMonitors.count == 2 && rebootDeathMonitors[0] == existing && existing.completion);
+    assert(runningBoardStarts == 2 && deliveredSignals == 2 && lastSignal == SIGKILL);
+    assert(retiredIdentityCount && !hostTerminal);
+    LSBRunningBoardExitHandler fallbackExit = ((LSBRunningBoardMonitor *)rebootDeathMonitors[1]).completion;
+    assert(fallbackExit);
+    // Neither releasing the extension assertion nor an unrelated/stale completion proves this generation has exited.
+    extensionEvent(nativeHelper.identifier, nativeHelper.pid, ECANCELED, NULL);
+    completeUserspaceReboot(generation);
+    assert(sessionDraining && !submittedLaunches && rebootPendingDeaths.count == 2);
+    runMainQueueUntil(^BOOL{ return rebootPendingDeaths.count == 1; });
+    assert(sessionDraining && !submittedLaunches && existing.completion != nil);
+    LSBReceivedMessage *blocked = messageFor(LSB_REQUEST_SPAWN, child.pid, child.pidVersion, 0);
+    unsigned blockedObject = ((TestMessageObject *)blocked->object)->identifier;
+    handleMessage(blocked);
+    assert(replyFor(blockedObject)->error == ECANCELED);
+    fallbackExit(SIGKILL, 0);
+    assert(!sessionDraining && !rebootDrainFailed && !rebootPendingDeaths.count);
+    assert(jobs.count == 1 && startingJob && submittedLaunches == 1 && startingJob.simulatorLaunchd);
+    assert(startingJob.identifier > queued.identifier && !retiredIdentityCount && !retiredIdentitiesFull);
+    assert(!existing.completion && !rebootDeathMonitors.count && !rebootExitSources.count);
+    NSDictionary *bootstrap = rebootConfiguration();
+    NSString *newUUID = bootstrap[@"Self"][@"LSB_SIMULATOR_BOOT_UUID"];
+    assert([[NSUUID alloc] initWithUUIDString:newUUID] && ![newUUID isEqual:oldUUID]);
+    assert([bootstrap[@"Child"][@"LSB_SIMULATOR_BOOT_UUID"] isEqual:newUUID]);
+    assert([bootstrap[@"Self"][@"LSB_RETAIN_HOST_CACHE"] isEqual:@"0"]);
+    assert([bootstrap[@"Child"][@"LSB_WORKQUEUE_HARDWARE_BREAKPOINT"] isEqual:@"0"]);
+    queuedExit(SIGKILL, 0); fallbackExit(SIGKILL, 0);
+    assert(jobs.count == 1 && submittedLaunches == 1); // Late old callbacks cannot restart the new generation again.
+    resetBroker();
+    assert([NSFileManager.defaultManager removeItemAtPath:directory error:NULL]);
+}
+
+static void testRebootDrainFailureGuards(void) {
+    for (unsigned scenario = 0; scenario < 5; ++scenario) {
+        resetBroker();
+        rememberRebootInputs();
+        LSBJob *launchd = terminalLaunchd(), *child = managedJob(launchd, 6610);
+        runningBoardError = scenario == 0 ? EACCES : 0;
+        if (scenario == 2) { child.phase = JobStarting; child.pid = 0; child.audit = (audit_token_t){{0}}; startingJob = child; }
+        if (scenario == 3) {
+            uint64_t identifier = child.identifier;
+            LSBRunningBoardMonitor *existing = [LSBRunningBoardMonitor new];
+            existing.completion = ^(int status, int error) {
+                if (error) recordMonitorError(identifier, error); else recordChildExit(identifier, status);
+            };
+            child.runningBoardMonitor = existing;
+        }
+        if (scenario == 4) { directSignalError = EPERM; extensionSignalError = EPERM; }
+        assert(!requestReboot(launchd)->error);
+        recordChildExit(launchd.identifier, 0);
+        assert(sessionDraining && !jobs.count && !submittedLaunches);
+        if (scenario == 1 || scenario == 3) {
+            assert(rebootPendingDeaths.count == 1 && rebootDeathMonitors.count == 1);
+            LSBRunningBoardExitHandler completion = ((LSBRunningBoardMonitor *)rebootDeathMonitors[0]).completion;
+            completion(0, EIO);
+        }
+        if (scenario == 4) {
+            // Failed signal submission leaves the independent death barrier armed; it must not permit a concurrent new session.
+            assert(!rebootDrainFailed && rebootPendingDeaths.count == 1 && rebootDeathMonitors.count == 1);
+            completeUserspaceReboot(rebootGeneration);
+            assert(sessionDraining && !submittedLaunches && rebootPendingDeaths.count == 1);
+        } else assert(rebootDrainFailed && !rebootPendingDeaths.count && !rebootDeathMonitors.count);
+        assert(sessionDraining && !submittedLaunches && !startingJob);
+        assert(launchLaneFailed == (scenario == 2));
+    }
+}
+
+static void testRebootPreservesQueuedKqueueCallbacks(void) {
+    for (unsigned failedRead = 0; failedRead < 2; ++failedRead) {
+        resetBroker();
+        NSString *directory = makeRebootRuntime();
+        rememberRebootInputs();
+        LSBJob *launchd = terminalLaunchd(), *child = runTestJob(launchd, 71);
+        assert(child.exitMonitor && !child.runningBoardMonitor);
+        dispatch_source_t source = child.exitMonitor;
+        int descriptor = (int)dispatch_source_get_handle(source);
+        struct kevent registration;
+        EV_SET(&registration, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+        assert(!kevent(descriptor, &registration, 1, NULL, 0, NULL));
+        assert(!requestReboot(launchd)->error);
+        recordChildExit(launchd.identifier, 0);
+        assert(sessionDraining && !jobs.count && !child.exitMonitor && rebootExitSources.count == 1);
+        assert(rebootExitSources[0] == source && rebootPendingDeaths.count == 1 && !dispatch_source_testcancel(source));
+        assert(submittedLaunches == 1 && !runningBoardStarts);
+        monitorReadError = failedRead ? EIO : 0;
+        monitorWaitStatus = SIGKILL;
+        // The production event handler must read this retained monitor even though findJob now returns nil.
+        EV_SET(&registration, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+        assert(!kevent(descriptor, &registration, 1, NULL, 0, NULL));
+        runMainQueueUntil(^BOOL{ return rebootPendingDeaths.count == 0; });
+        assert(monitorReads && !rebootExitSources.count && dispatch_source_testcancel(source));
+        assert(sessionDraining == failedRead && rebootDrainFailed == failedRead);
+        assert(submittedLaunches == (failedRead ? 1 : 2) && jobs.count == (failedRead ? 0 : 1));
+        runMainQueueUntil(^BOOL{ return fcntl(descriptor, F_GETFD) < 0 && errno == EBADF; });
+        resetBroker();
+        assert([NSFileManager.defaultManager removeItemAtPath:directory error:NULL]);
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         alarm(10);
@@ -3600,6 +3862,12 @@ int main(void) {
         testLaunchdModeRequiresInitialPathAndMarker();
         testLaunchdHandshakeDispatchAndRights();
         testLaunchdCancellationAndFailedBootstrap();
+        testRebootInputSnapshot();
+        testRebootAuthentication();
+        testRebootRequiresCleanLaunchdExit();
+        testRebootWaitsForOldGenerationAndRegeneratesConfiguration();
+        testRebootDrainFailureGuards();
+        testRebootPreservesQueuedKqueueCallbacks();
         resetBroker();
         puts("Broker: authentication, FD ownership, exit/kill, orphan cleanup, graphics registration/exec gating, Mach handoff, and source cancellation passed");
     }

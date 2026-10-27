@@ -395,13 +395,13 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
                 break; // Match getenv's first occurrence; controlledEnvironment removes all inherited duplicates.
             }
         }
-        for (NSString *key in @[@"LSB_WORKQUEUE_HARDWARE_BREAKPOINT", @"LSB_RETAIN_HOST_CACHE"]) {
+        for (NSString *key in @[@"LSB_WORKQUEUE_HARDWARE_BREAKPOINT", @"LSB_RETAIN_HOST_CACHE", @"LSB_TRACE_HANDOFF"]) {
             const char *name = key.UTF8String;
             size_t length = strlen(name);
-            runtimeEnvironment[key] = @"1";
+            runtimeEnvironment[key] = [key isEqualToString:@"LSB_TRACE_HANDOFF"] ? @"0" : @"1";
             for (const char *const *entry = inheritedEnv; entry && *entry; ++entry) {
                 if (strncmp(*entry, name, length) || (*entry)[length] != '=') continue;
-                // Preserve an explicit opt-out in descendants: omission would re-enable their default. First value wins.
+                // The launchd config replaces inherited environment. Keep the first exact boolean in both self and descendants.
                 runtimeEnvironment[key] = !strcmp(*entry + length + 1, "1") ? @"1" : @"0";
                 break;
             }

@@ -3,6 +3,7 @@
 #include "ExtensionLauncher.h"
 #include "ChildMonitor.h"
 #include "RunningBoardMonitor.h"
+#include "SessionControlQueue.h"
 #include "ChildStatus.h"
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
@@ -49,6 +50,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property int statusFD, wakeReadFD, wakeWriteFD;
 @property BOOL terminalSession;
 @property BOOL simulatorLaunchd;
+@property BOOL rebootRequested;
 @property LSBLaunchdHandshake *launchdHandshake;
 @property dispatch_source_t launchdSource;
 @property (nonatomic, strong) LSBIndigoHIDServer *indigo;
@@ -120,6 +122,12 @@ static BOOL initialTerminalPending;
 static BOOL initialNativeConfigdPending;
 static BOOL enableIndigo;
 static BOOL enableSpringBoardMetal;
+static NSArray<NSData *> *rebootArguments, *rebootEnvironment;
+static BOOL sessionDraining, rebootDrainFailed;
+static uint64_t rebootGeneration;
+static NSMutableSet<NSNumber *> *rebootPendingDeaths;
+static NSMutableArray<LSBRunningBoardMonitor *> *rebootDeathMonitors;
+static NSMutableArray<dispatch_source_t> *rebootExitSources;
 // Allow every launchd child to overlap its exec replacement, plus launchd and the backboardd, SpringBoard and public Metal helpers.
 enum { BrokerJobCapacity = 2 * LSB_CHILD_STATUS_CAPACITY + 4, DisplayRegistrationTimeoutSeconds = 30,
        RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
@@ -134,6 +142,8 @@ NSString *const LSBHostIndigoDidChangeNotification = @"LSBHostIndigoDidChange";
 NSString *const LSBHostFramebufferDidChangeNotification = @"LSBHostFramebufferDidChange";
 NSString *const LSBHostTerminalDidChangeNotification = @"LSBHostTerminalDidChange";
 static void startNextJob(void);
+static void beginUserspaceReboot(LSBJob *exitedLaunchd);
+static void completeUserspaceReboot(uint64_t generation);
 static int signalJob(LSBJob *child, int signalNumber);
 static int signalTerminal(pid_t foreground, int signalNumber);
 static BOOL launchdOwnsChildIdentity(LSBJob *job);
@@ -732,6 +742,12 @@ static void finishJob(LSBJob *job, int error) {
 }
 
 static void recordChildExit(uint64_t identifier, int waitStatus) {
+    if (sessionDraining && [rebootPendingDeaths containsObject:@(identifier)]) {
+        if (!WIFEXITED(waitStatus) && !WIFSIGNALED(waitStatus)) rebootDrainFailed = YES;
+        [rebootPendingDeaths removeObject:@(identifier)];
+        completeUserspaceReboot(rebootGeneration);
+        return;
+    }
     LSBJob *job = findJob(identifier);
     if (!job) return;
     fprintf(stderr, "[broker] request=%llu pid=%d exited wait-status=0x%x\n", identifier, job.pid, waitStatus);
@@ -751,7 +767,19 @@ static void recordChildExit(uint64_t identifier, int waitStatus) {
             else { job.parentStatusPublished = YES; signalChildExit(parent); }
         }
     }
+    if (job.rebootRequested && job.simulatorLaunchd && job.phase == JobRunning && WIFEXITED(waitStatus) && !WEXITSTATUS(waitStatus)) {
+        beginUserspaceReboot(job);
+        return;
+    }
     finishJob(job, job.phase == JobRunning ? 0 : ECHILD);
+}
+
+static void recordMonitorError(uint64_t identifier, int error) {
+    if (sessionDraining && [rebootPendingDeaths containsObject:@(identifier)]) {
+        rebootDrainFailed = YES;
+        [rebootPendingDeaths removeObject:@(identifier)];
+        completeUserspaceReboot(rebootGeneration);
+    } else finishJob(findJob(identifier), error);
 }
 
 static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *context) {
@@ -778,7 +806,7 @@ static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *cont
 }
 
 static void startNextJob(void) {
-    if (startingJob || finishingDepth) return;
+    if (startingJob || finishingDepth || sessionDraining) return;
     if (launchLaneFailed) {
         for (LSBJob *job in [jobs copy]) if (job.phase == JobQueued) { finishJob(job, EBUSY); return; }
         return;
@@ -1270,7 +1298,22 @@ static void handleMessage(LSBReceivedMessage *message) {
     uint32_t generation = message->audit.val[7];
     LSBJob *sender = nil;
     for (LSBJob *job in jobs) if (job.pid == pid && job.pidVersion == generation) { sender = job; break; }
+    if (sessionDraining) { replyError(message, ECANCELED); return; }
     switch (message->kind) {
+        case LSB_REQUEST_REBOOT_USERSPACE: {
+            audit_token_t expected = sender.audit;
+            if (!sender || sender.phase != JobRunning || sender.retiredForExec || sender.finishing || sender.parentIdentifier ||
+                sender.executionRole != LSB_EXECUTION_SIMULATOR || !launchdOwnsChildIdentity(sender) ||
+                memcmp(&message->audit, &expected, sizeof(expected))) { replyError(message, EACCES); return; }
+            int error = rebootArguments.count ? 0 : ENOTSUP;
+            int sent = LSBTransportReply(message, error, 0, 0, NULL, NULL, NULL);
+            if (!error && !sent) {
+                sender.rebootRequested = YES;
+                fprintf(stderr, "[broker] Simulator reboot armed by launchd pid=%d; waiting for clean exit\n", sender.pid);
+            }
+            disposeMessage(message);
+            return;
+        }
         case LSB_REQUEST_SPAWN:
             if (!sender || sender.phase != JobRunning || sender.executionRole != LSB_EXECUTION_SIMULATOR) { replyError(message, EACCES); return; }
             enqueueSpawn(message, sender);
@@ -1408,9 +1451,7 @@ static void handleMessage(LSBReceivedMessage *message) {
             if (error == EACCES || error == EPERM) {
                 LSBRunningBoardMonitor *fallback = nil;
                 error = LSBRunningBoardMonitorStart(&identity, ^(int waitStatus, int monitorError) {
-                    LSBJob *exited = findJob(identifier);
-                    if (!exited) return;
-                    if (monitorError) finishJob(exited, monitorError);
+                    if (monitorError) recordMonitorError(identifier, monitorError);
                     else recordChildExit(identifier, waitStatus);
                 }, &fallback);
                 if (error) { replyError(message, error); finishJob(job, error); return; }
@@ -1425,14 +1466,13 @@ static void handleMessage(LSBReceivedMessage *message) {
                 if (!job.exitMonitor) { close(monitor); replyError(message, ENOMEM); finishJob(job, ENOMEM); return; }
                 dispatch_source_set_cancel_handler(job.exitMonitor, ^{ close(monitor); });
                 dispatch_source_set_event_handler(job.exitMonitor, ^{
-                    LSBJob *exited = findJob(identifier);
-                    if (!exited) return;
+                    if (!findJob(identifier) && ![rebootPendingDeaths containsObject:@(identifier)]) return;
                     int waitStatus = 0;
                     int monitorError = LSBChildMonitorRead(monitor, pid, &waitStatus);
                     if (!monitorError) recordChildExit(identifier, waitStatus);
                     else if (monitorError != EAGAIN) {
                         fprintf(stderr, "[broker] Exit monitor failed: %s\n", strerror(monitorError));
-                        finishJob(exited, monitorError);
+                        recordMonitorError(identifier, monitorError);
                     }
                 });
                 dispatch_resume(job.exitMonitor);
@@ -1767,12 +1807,144 @@ static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole
     return launchd ? 0 : error ? error : EIO;
 }
 
+// Keep owned bytes, not pointers into the original main stack or mutable process environment.
+static int snapshotRebootInputs(int argc, const char *argv[], const char *envp[]) {
+    if (argc < 1 || argc > LSB_MAX_VECTOR) return E2BIG;
+    NSMutableArray<NSData *> *arguments = [NSMutableArray new], *environment = [NSMutableArray new];
+    size_t total = 0;
+    for (unsigned vector = 0; vector < 2; ++vector) {
+        const char *const *items = vector ? envp : argv;
+        NSMutableArray<NSData *> *destination = vector ? environment : arguments;
+        for (unsigned index = 0; items && (vector ? items[index] != NULL : index < (unsigned)argc); ++index) {
+            if (index == LSB_MAX_VECTOR || !items[index]) return E2BIG;
+            size_t length = strnlen(items[index], LSB_STRING_BYTES);
+            if (length == LSB_STRING_BYTES || total + length + 1 > LSB_STRING_BYTES) return E2BIG;
+            total += length + 1;
+            [destination addObject:[NSData dataWithBytes:items[index] length:length + 1]];
+        }
+    }
+    rebootArguments = arguments;
+    rebootEnvironment = environment;
+    return 0;
+}
+
+static void completeUserspaceReboot(uint64_t generation) {
+    if (!sessionDraining || generation != rebootGeneration || finishingDepth || rebootPendingDeaths.count) return;
+    for (LSBRunningBoardMonitor *monitor in rebootDeathMonitors) LSBRunningBoardMonitorCancel(monitor);
+    rebootDeathMonitors = nil;
+    for (dispatch_source_t source in rebootExitSources) dispatch_source_cancel(source);
+    rebootExitSources = nil;
+    if (rebootDrainFailed || launchLaneFailed || jobs.count) {
+        fprintf(stderr, "[broker] Simulator reboot stopped: old session could not be fully retired; reopen host\n");
+        return;
+    }
+    NSString *data = [runtimeRoot.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"SimulatorData"];
+    int queueError = LSBQuarantineSessionControlQueue(data.fileSystemRepresentation);
+    if (queueError) {
+        rebootDrainFailed = YES;
+        fprintf(stderr, "[broker] Could not preserve the old launchctl queue: %s; reopen host\n", strerror(queueError));
+        return;
+    }
+    const char *arguments[LSB_MAX_VECTOR + 1] = {0}, *environment[LSB_MAX_VECTOR + 1] = {0};
+    for (NSUInteger i = 0; i < rebootArguments.count; ++i) arguments[i] = rebootArguments[i].bytes;
+    for (NSUInteger i = 0; i < rebootEnvironment.count; ++i) environment[i] = rebootEnvironment[i].bytes;
+    LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
+    int error = initial ? 0 : ENOMEM;
+    uint32_t role = LSB_EXECUTION_SIMULATOR;
+    enableIndigo = enableSpringBoardMetal = NO;
+    if (!error) error = initialExecutionRole((int)rebootArguments.count, arguments, &role);
+    if (!error) error = initialPlan(initial, (int)rebootArguments.count, arguments, environment);
+    if (error) {
+        if (initial) disposeMessage(initial);
+        rebootDrainFailed = YES;
+        fprintf(stderr, "[broker] Fresh simulator plan failed: %s; reopen host\n", strerror(error));
+        return;
+    }
+    // The old session's tracked processes have exited. New requests still require the new generation's full audit identity.
+    memset(retiredIdentities, 0, sizeof(retiredIdentities));
+    retiredIdentityCount = 0;
+    retiredIdentitiesFull = NO;
+    sessionDraining = NO;
+    fprintf(stderr, "[broker] Starting fresh simulator session after userspace reboot\n");
+    error = enqueueInitialJob(initial, role);
+    if (error) fprintf(stderr, "[broker] Fresh simulator service setup failed: %s\n", strerror(error));
+}
+
+static void beginUserspaceReboot(LSBJob *exitedLaunchd) {
+    if (sessionDraining) return;
+    sessionDraining = YES;
+    rebootDrainFailed = NO;
+    uint64_t generation = ++rebootGeneration;
+    rebootPendingDeaths = [NSMutableSet new];
+    rebootDeathMonitors = [NSMutableArray new];
+    rebootExitSources = [NSMutableArray new];
+    NSArray<LSBJob *> *oldJobs = [jobs copy];
+    // Transfer existing death monitors out of finishJob's recursive cleanup, preserving already queued death evidence.
+    // Removing a job or accepting a signal does not prove exit. Never overlap services from two generations.
+    for (LSBJob *job in oldJobs) {
+        if (job == exitedLaunchd || job.phase == JobQueued) continue;
+        if (!job.pid || !job.audit.val[5]) { rebootDrainFailed = YES; continue; }
+        NSNumber *identifier = @(job.identifier);
+        [rebootPendingDeaths addObject:identifier];
+        if (job.runningBoardMonitor) {
+            [rebootDeathMonitors addObject:job.runningBoardMonitor];
+            job.runningBoardMonitor = nil;
+            continue;
+        }
+        if (job.exitMonitor) {
+            [rebootExitSources addObject:job.exitMonitor];
+            job.exitMonitor = nil;
+            continue;
+        }
+        LSBRunningBoardMonitor *monitor = nil;
+        audit_token_t audit = job.audit;
+        int error = LSBRunningBoardMonitorStart(&audit, ^(int status, int monitorError) {
+            (void)status;
+            if (generation != rebootGeneration || !sessionDraining) return;
+            if (monitorError) rebootDrainFailed = YES;
+            [rebootPendingDeaths removeObject:identifier];
+            completeUserspaceReboot(generation);
+        }, &monitor);
+        if (error) {
+            rebootDrainFailed = YES;
+            [rebootPendingDeaths removeObject:identifier];
+            fprintf(stderr, "[broker] Reboot death monitor pid=%d failed: %s\n", job.pid, strerror(error));
+        } else [rebootDeathMonitors addObject:monitor];
+    }
+    ++finishingDepth;
+    for (LSBJob *job in oldJobs) if (job != exitedLaunchd && job.pid > 0) {
+        int error = signalJob(job, SIGKILL);
+        if (error && error != ESRCH) fprintf(stderr, "[broker] Reboot termination pid=%d failed: %s\n", job.pid, strerror(error));
+    }
+    for (LSBJob *job in oldJobs) finishJob(job, job == exitedLaunchd ? 0 : ECANCELED);
+    if (adoptionRetrySource) dispatch_source_cancel(adoptionRetrySource);
+    adoptionRetrySource = nil;
+    [pendingAdoptions removeAllObjects];
+    [hostTerminal close];
+    hostTerminal = nil;
+    [NSNotificationCenter.defaultCenter postNotificationName:LSBHostTerminalDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter postNotificationName:LSBHostIndigoDidChangeNotification object:nil];
+    --finishingDepth;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (generation != rebootGeneration || !sessionDraining || !rebootPendingDeaths.count) return;
+        rebootDrainFailed = YES;
+        fprintf(stderr, "[broker] Simulator reboot timed out waiting for %lu old processes; reopen host\n",
+                (unsigned long)rebootPendingDeaths.count);
+        for (LSBRunningBoardMonitor *monitor in rebootDeathMonitors) LSBRunningBoardMonitorCancel(monitor);
+        rebootDeathMonitors = nil;
+        for (dispatch_source_t source in rebootExitSources) dispatch_source_cancel(source);
+        rebootExitSources = nil;
+    });
+    completeUserspaceReboot(generation);
+}
+
 int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
     @autoreleasepool {
         if (![NSThread isMainThread]) return EPERM;
         if (jobs) return EALREADY;
         if (argc < 1 || !argv || !argv[0]) return EINVAL;
-        int error = prepareRuntimeRoot();
+        int error = snapshotRebootInputs(argc, argv, envp);
+        if (!error) error = prepareRuntimeRoot();
         if (error) { fprintf(stderr, "[broker] Startup failed: %s\n", strerror(error)); return error; }
         LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
         if (!initial) return ENOMEM;

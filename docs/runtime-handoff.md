@@ -5,6 +5,10 @@ receives its launch plan, locates `RuntimeRoot` in the App Group, maps `usr/lib/
 enters the simulator runtime. LiveProcess uses C for its native startup and releases native XPC objects before detachment.
 The original starter delegates, controller, and storyboards remain in `unused/`; the new host UI lives in `Host/`.
 
+A normal icon launch waits for **Start** on the IOSurface tab before starting the broker and graphical runtime. Explicit guest
+arguments, including `--launchd-services`, `/bin/df`, and `--terminal`, retain automatic startup for development tests. Startup is
+once-only; the IOSurface, Fish, and Settings tabs persist after it, and changing tabs does not start another guest.
+
 ## Before host-cache removal
 
 [DyldSimLoader.cpp](../LiveSimBooter/DyldSimLoader.cpp) validates the Mach-O role, registers the embedded signature through
@@ -16,6 +20,11 @@ It sets `DYLD_ROOT_PATH` and `DYLD_SHARED_CACHE_DIR` to RuntimeRoot paths, remov
 inherited `ptr_munge` values with a fresh nonzero random token. The apple vector is writable because simulator libpthread
 consumes and clears the token. [Dyld diagnostics](debugging.md#simulator-dyld-diagnostics) are disabled by default; explicit
 diagnostic variables and output destinations are copied unchanged into the simulator environment. Native launch settings are untouched.
+
+Successful handoff messages are also quiet by default. Set `LSB_TRACE_HANDOFF=1` to print the LiveProcess entry message, main-stack
+relocation/preservation details, and the retaining/detaching-cache banner. Only the first exact value `1` enables this trace;
+launchd preserves the normalized setting in its own configuration and child environment. The loader captures it before changing
+TLS or crossing the cache handoff. Preparation failures and an explicitly requested LLDB-stop message remain visible.
 
 [MainThreadBootstrap.cpp](../LiveSimBooter/MainThreadBootstrap.cpp) supplies an aligned, zeroed 16 KiB app-owned block for
 the main pthread and TSD. It initializes only self, errno, and the kernel thread ID after validating the host layout.
@@ -103,6 +112,9 @@ xcodebuild -project LiveSimBooter.xcodeproj -scheme LiveSimBooter -configuration
 The host tests use synthetic images and substitute dangerous handoff operations. They do not detach the Mac test process's
 cache or establish device signing acceptance. The import audit checks the local callback/handoff code at `-O0` and `-O2`;
 it can also inspect an actual Xcode arm64 object directory. Device behavior requires the separate [debugging workflow](debugging.md).
+Focused local tests cover the icon/explicit-argument startup decision and default-off handoff tracing, including launchd
+configuration regeneration and duplicate or malformed environment values. The iPhone 17 cold-launch screenshot showed Start
+with no guests, and two unattended reboots returned to SpringBoard with no handoff banners; see [device verification](guest-control.md#device-verification-2026-10-27).
 
 The loader tests also exercise short and large Fish-shaped startup vectors in isolated host test processes. They verify
 the argc/header prefix, contiguous argv/environment/apple layout, exact counts and null terminators, root overrides,
