@@ -14,15 +14,18 @@
 static int testCopyXMLFromDEREntitlements(const void *, size_t, void **, size_t *);
 static int testReadMachOCodeDirectoryHash(int, unsigned char [20]);
 static kern_return_t testTaskInfo(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
+static kern_return_t testBootstrapLookup(mach_port_t, const char *, mach_port_t *);
 #define LSBCopyXMLFromDEREntitlements testCopyXMLFromDEREntitlements
 #define LSBReadMachOCodeDirectoryHash testReadMachOCodeDirectoryHash
 #define LSBLaunchdRegisterEndpointWithTimeout LSBTestRegisterEndpoint
 #define LSBLaunchdUnregisterEndpointWithTimeout LSBTestUnregisterEndpoint
 #define task_info testTaskInfo
+#define bootstrap_look_up testBootstrapLookup
 #define handleMessage brokerHandleMessage
 #include "../Host/Broker.m"
 #undef handleMessage
 #undef task_info
+#undef bootstrap_look_up
 #undef LSBLaunchdRegisterEndpointWithTimeout
 #undef LSBLaunchdUnregisterEndpointWithTimeout
 #undef LSBCopyXMLFromDEREntitlements
@@ -59,12 +62,15 @@ static void (^readyReplyHook)(void);
 static void (^checkInReplyHook)(void);
 static unsigned endpointCalls;
 static NSMutableArray<NSNumber *> *publicTestEndpoints;
-static int endpointErrors[6];
-static char registeredEndpoints[6][128];
-static mach_port_t registeredPorts[6];
-static audit_token_t registeredAudits[6];
-static uint32_t registeredTimeouts[6];
+static int endpointErrors[7];
+static char registeredEndpoints[7][128];
+static mach_port_t registeredPorts[7];
+static audit_token_t registeredAudits[7];
+static uint32_t registeredTimeouts[7];
 static void (^endpointHook)(unsigned index);
+static unsigned nativeConfigdLookupCalls;
+static kern_return_t nativeConfigdLookupError;
+static mach_port_t nativeConfigdEndpoint;
 static unsigned unregisterCalls;
 static int unregisterError;
 static uint32_t unregisterTimeout;
@@ -125,9 +131,21 @@ static int testCopyXMLFromDEREntitlements(const void *der, size_t size, void **x
     return LSBCopyXMLFromDEREntitlements(der, size, xml, xmlSize);
 }
 
+static kern_return_t testBootstrapLookup(mach_port_t bootstrap, const char *name, mach_port_t *port) {
+    assert(!NSThread.isMainThread && bootstrap == bootstrap_port);
+    assert(!strcmp(name, "com.apple.SystemConfiguration.configd") && port);
+    ++nativeConfigdLookupCalls;
+    *port = MACH_PORT_NULL;
+    if (nativeConfigdLookupError) return nativeConfigdLookupError;
+    if (MACH_PORT_VALID(nativeConfigdEndpoint))
+        assert(!mach_port_mod_refs(mach_task_self(), nativeConfigdEndpoint, MACH_PORT_RIGHT_SEND, 1));
+    *port = nativeConfigdEndpoint;
+    return KERN_SUCCESS;
+}
+
 int LSBTestRegisterEndpoint(mach_port_t service, const audit_token_t *audit, const char *name,
                             mach_port_t endpoint, uint32_t timeoutMilliseconds, kern_return_t *status) {
-    assert(!NSThread.isMainThread && MACH_PORT_VALID(service) && audit && name && status && endpointCalls < 6);
+    assert(!NSThread.isMainThread && MACH_PORT_VALID(service) && audit && name && status && endpointCalls < 7);
     unsigned index = endpointCalls++;
     assert(strlen(name) < sizeof(registeredEndpoints[index]));
     strcpy(registeredEndpoints[index], name);
@@ -365,6 +383,7 @@ static void resetBroker(void) {
     runtimeRoot = @"/tmp/RuntimeRoot";
     [hostTerminal close]; hostTerminal = nil;
     initialTerminalPending = NO;
+    initialNativeConfigdPending = NO;
     nextIdentifier = 1;
     launchLaneFailed = NO;
     enableIndigo = NO;
@@ -385,6 +404,9 @@ static void resetBroker(void) {
     codeDirectoryHashError = 0;
     afterCodeDirectoryRead = nil;
     endpointCalls = 0;
+    nativeConfigdLookupCalls = 0;
+    nativeConfigdLookupError = KERN_SUCCESS;
+    nativeConfigdEndpoint = MACH_PORT_NULL;
     unregisterCalls = unregisterTimeout = 0;
     unregisterError = 0;
     memset(unregisteredEndpoint, 0, sizeof(unregisteredEndpoint));
@@ -1636,6 +1658,96 @@ static mach_port_t newServiceEndpoint(void) {
     return endpoint;
 }
 
+static void testNativeConfigdBridgeRegistration(void) {
+    enum { Success, Unselected, LookupFailure, RegistrationFailure, UnknownTimeout, MissingEndpoint };
+    for (unsigned test = Success; test <= MissingEndpoint; ++test) {
+        resetBroker();
+        LSBJob *launchd = runTestJob(nil, 797);
+        launchd.simulatorLaunchd = YES;
+        launchd.nativeConfigdSelected = test != Unselected;
+        launchd.indigo = [RecordedIndigoServer new];
+        launchd.framebuffer = [RecordedFramebufferServer new];
+        launchd.iosurface = [RecordedIOSurfaceServer new];
+        launchd.servicesPending = YES;
+        mach_port_t service = newServiceEndpoint(), native = newServiceEndpoint();
+        nativeConfigdEndpoint = test == MissingEndpoint ? MACH_PORT_NULL : native;
+        if (test == LookupFailure) nativeConfigdLookupError = KERN_FAILURE;
+        if (test == RegistrationFailure) endpointErrors[0] = EACCES;
+        if (test == UnknownTimeout) endpointErrors[0] = ETIMEDOUT;
+        endpointHook = ^(unsigned index) {
+            if (index || test == Unselected) return;
+            mach_port_urefs_t references = 0;
+            assert(nativeConfigdLookupCalls == 1 && registeredPorts[0] == native);
+            assert(!strcmp(registeredEndpoints[0], "com.apple.SystemConfiguration.configd"));
+            assert(!mach_port_get_refs(mach_task_self(), native, MACH_PORT_RIGHT_SEND, &references) && references == 2);
+            usleep(20000); // The following display registrations share this request's original startup budget.
+        };
+        registerDisplayServices(launchd, service);
+        assert(launchd.servicesPending && !launchd.servicesError);
+        runMainQueueUntil(^BOOL { return !launchd.servicesPending; });
+        int expectedError = test == LookupFailure ? EIO : test == RegistrationFailure ? EACCES :
+                            test == UnknownTimeout ? ETIMEDOUT : test == MissingEndpoint ? EPIPE : 0;
+        unsigned expectedCalls = test == Success ? 4 : test == Unselected ? 3 :
+                                 test == RegistrationFailure || test == UnknownTimeout ? 1 : 0;
+        assert(launchd.servicesError == expectedError && endpointCalls == expectedCalls);
+        assert(nativeConfigdLookupCalls == (test == Unselected ? 0u : 1u));
+        if (!expectedError) {
+            unsigned first = test == Success ? 1 : 0;
+            assert(!strcmp(registeredEndpoints[first], "IndigoHIDRegistrationPort"));
+            assert(!strcmp(registeredEndpoints[first + 1], "com.apple.IOSurface.Remote"));
+            assert(!strcmp(registeredEndpoints[first + 2], "com.apple.CoreSimulator.SimFramebufferServer"));
+            if (test == Success) assert(registeredTimeouts[1] < registeredTimeouts[0]);
+            for (unsigned i = 0; i < endpointCalls; ++i) {
+                audit_token_t expected = launchd.audit;
+                assert(!memcmp(&registeredAudits[i], &expected, sizeof(expected)));
+            }
+        }
+        mach_port_urefs_t references = 0;
+        assert(!mach_port_get_refs(mach_task_self(), native, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        assert(!mach_port_get_refs(mach_task_self(), service, MACH_PORT_RIGHT_SEND, &references) && references == 1);
+        registerDisplayServices(launchd, service);
+        assert(endpointCalls == expectedCalls && nativeConfigdLookupCalls == (test == Unselected ? 0u : 1u)); // Never retry an unknown result.
+        finishJob(launchd, ECANCELED);
+        assert(!mach_port_deallocate(mach_task_self(), native));
+        assert(!mach_port_mod_refs(mach_task_self(), native, MACH_PORT_RIGHT_RECEIVE, -1));
+        assert(!mach_port_deallocate(mach_task_self(), service));
+        assert(!mach_port_mod_refs(mach_task_self(), service, MACH_PORT_RIGHT_RECEIVE, -1));
+    }
+}
+
+static void testDirectConfigdWaitsForSelectedBridge(void) {
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        resetBroker();
+        LSBJob *launchd = runTestJob(nil, 798);
+        launchd.simulatorLaunchd = YES;
+        launchd.nativeConfigdSelected = variant != 3;
+        launchd.servicesPending = YES;
+        int fd;
+        unsigned object;
+        LSBReceivedMessage *request = spawnRequest(&fd, &object);
+        NSString *physical = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec/configd_sim"];
+        setRequestProgram(request, variant == 1 ? physical.fileSystemRepresentation : "/usr/libexec/configd_sim");
+        unsigned launches = submittedLaunches;
+        enqueueSpawn(request, launchd);
+        if (variant != 3) {
+            assert(!startingJob && submittedLaunches == launches && !replyFor(object));
+            launchd.servicesPending = NO;
+            launchd.servicesError = variant == 2 ? EACCES : 0;
+            startNextJob();
+        }
+        if (variant == 2) {
+            assert(!startingJob && submittedLaunches == launches && replyFor(object)->error == EACCES);
+            assertClosed(fd);
+        } else {
+            LSBJob *child = startingJob;
+            assert(child && submittedLaunches == launches + 1 && !child.nativeConfigdSelected);
+            handleMessage(messageFor(LSB_REQUEST_CHECKIN, getpid(), 799, 0));
+            handleMessage(messageFor(LSB_REQUEST_READY, getpid(), 799, child.identifier));
+            assert(child.phase == JobRunning && !replyFor(object)->error);
+        }
+    }
+}
+
 static LSBJob *queueNativeMetalSessionWithSpringBoard(LSBJob **launchd, const LSBNativeMetalControl **reader, BOOL springBoard) {
     resetBroker();
     enableIndigo = YES;
@@ -1997,13 +2109,33 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
     assert([manager createDirectoryAtPath:daemons withIntermediateDirectories:YES attributes:nil error:NULL]);
     NSArray *selected = @[@"com.apple.notifyd", @"com.apple.lsd", @"com.apple.runningboardd", @"com.apple.containermanagerd",
         @"com.apple.fontservicesd", @"com.apple.containermanagerd.system", @"com.apple.distnoted.xpc.daemon", @"com.apple.configd_sim",
-        @"com.apple.sleepd", @"com.apple.systemstatusd", @"com.apple.SpringBoard", @"com.apple.iconservices.iconservicesagent"];
+        @"com.apple.sleepd", @"com.apple.systemstatusd", @"com.apple.SpringBoard", @"com.apple.iconservices.iconservicesagent", @"com.apple.TextInput.kbd",
+        @"com.apple.assistantd"];
     NSDictionary *enabled = @{@"#IfFeatureFlagEnabled": @"SystemStatus/EmbeddedDaemon", @"#Then": @YES};
     NSDictionary *disabled = @{@"#IfFeatureFlagDisabled": @"SystemStatus/EmbeddedDaemon", @"#Then": @YES};
     NSArray *statusServices = @[@"com.apple.systemstatus", @"com.apple.systemstatus.publisher", @"com.apple.systemstatus.activityattribution"];
+    // iOS 26.0 23A343 LaunchDaemons/com.apple.assistantd.plist: preserve its service declarations, including dictation.
+    NSArray *assistantServiceNames = @[@"com.apple.aps.assistantd.fmip", @"com.apple.assistant.analytics",
+        @"com.apple.assistant.analytics-observation", @"com.apple.assistant.audio-session-assertion", @"com.apple.assistant.client",
+        @"com.apple.assistant.device-context", @"com.apple.assistant.dictation", @"com.apple.assistant.flow_service",
+        @"com.apple.assistant.security", @"com.apple.assistant.settings", @"com.apple.assistant.sync", @"com.apple.assistantd.aps",
+        @"com.apple.assistantd.managedstorage", @"com.apple.private.alloy.siri.device-idswake", @"com.apple.private.alloy.siri.icloud-idswake",
+        @"com.apple.private.alloy.siri.location-idswake", @"com.apple.private.alloy.siri.proxy-idswake", @"com.apple.siri.analytics.assistant",
+        @"com.apple.siri.client_lite", @"com.apple.siri.external_request", @"com.apple.siri.location",
+        @"com.apple.siri.orchestration.capabilities", @"com.apple.siri.orchestration.intelligencesession", @"com.apple.siri.pairedsync",
+        @"com.apple.siri.pommes_search_xpc_service", @"com.apple.siri.tether", @"com.apple.siri.vocabularyupdates"];
+    NSMutableDictionary *assistantServices = [NSMutableDictionary dictionary];
+    for (NSString *name in assistantServiceNames) assistantServices[name] = @YES;
     for (NSString *label in selected) {
         NSString *program = [label isEqual:@"com.apple.SpringBoard"] ? @"/System/Library/CoreServices/SpringBoard.app/SpringBoard" : @"/bin/df";
         NSDictionary *job = @{@"Label": label, @"ProgramArguments": @[program]};
+        if ([label isEqual:@"com.apple.TextInput.kbd"]) job = @{@"Label": label, @"ProgramArguments": @[@"/System/Library/TextInput/kbd"],
+            @"MachServices": @{@"com.apple.TextInput": @YES, @"com.apple.TextInput.preferences": @YES},
+            @"EnvironmentVariables": @{@"MallocNanoZone": @"0"}};
+        if ([label isEqual:@"com.apple.assistantd"]) job = @{@"Label": label,
+            @"ProgramArguments": @[@"/System/Library/PrivateFrameworks/AssistantServices.framework/assistantd"],
+            @"MachServices": assistantServices, @"RunAtLoad": @YES, @"KeepAlive ": @YES, @"EnableTransactions": @YES,
+            @"ProcessType": @"Adaptive", @"UserName": @"mobile"};
         if ([label isEqual:@"com.apple.systemstatusd"] || [label isEqual:@"com.apple.SpringBoard"]) {
             BOOL separate = [label isEqual:@"com.apple.systemstatusd"];
             NSString *statusProgram = separate ? @"/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" : program;
@@ -2026,7 +2158,7 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
         const char *environment[] = {"LSB_FAKE_PTY_STATE=/untrusted", NULL};
         LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
         assert(!initialPlan(initial, explicitMode ? 2 : 1, arguments, environment));
-        assert(enableIndigo && enableSpringBoardMetal && !hostTerminal && !initialTerminalPending);
+        assert(enableIndigo && enableSpringBoardMetal && initialNativeConfigdPending && !hostTerminal && !initialTerminalPending);
         assert(!strcmp(initial->plan.strings + initial->plan.path, "/sbin/launchd_sim"));
         NSString *configuration = [NSString stringWithUTF8String:initial->plan.strings + initial->plan.argv[1]];
         NSDictionary *bootstrap = [NSDictionary dictionaryWithContentsOfFile:configuration][@"Bootstrap"];
@@ -2043,6 +2175,19 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
             [jobDirectory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.terminal-fish.plist"]];
         assert(([terminal[@"ProgramArguments"] isEqual:@[@"/usr/libexec/terminal-fish"]]));
         assert([terminal[@"RunAtLoad"] boolValue] && ![terminal[@"KeepAlive"] boolValue]);
+        NSDictionary *keyboard = [NSDictionary dictionaryWithContentsOfFile:
+            [jobDirectory stringByAppendingPathComponent:@"com.apple.TextInput.kbd.plist"]];
+        assert(([keyboard[@"ProgramArguments"] isEqual:@[@"/System/Library/TextInput/kbd"]]));
+        assert([keyboard[@"MachServices"][@"com.apple.TextInput"] boolValue]);
+        assert([keyboard[@"MachServices"][@"com.apple.TextInput.preferences"] boolValue]);
+        assert([keyboard[@"EnvironmentVariables"][@"MallocNanoZone"] isEqual:@"0"]);
+        assert([keyboard[@"RunAtLoad"] boolValue] && ![keyboard[@"KeepAlive"] boolValue]);
+        NSDictionary *assistant = [NSDictionary dictionaryWithContentsOfFile:
+            [jobDirectory stringByAppendingPathComponent:@"com.apple.assistantd.plist"]];
+        assert(([assistant[@"ProgramArguments"] isEqual:@[@"/System/Library/PrivateFrameworks/AssistantServices.framework/assistantd"]]));
+        assert([assistant[@"MachServices"] isEqual:assistantServices] && [assistant[@"MachServices"][@"com.apple.assistant.dictation"] boolValue]);
+        assert([assistant[@"RunAtLoad"] boolValue] && ![assistant[@"KeepAlive"] boolValue] && ![assistant[@"EnableTransactions"] boolValue]);
+        assert(!assistant[@"UserName"] && !assistant[@"ProcessType"] && !assistant[@"KeepAlive "]);
         NSDictionary *status = [NSDictionary dictionaryWithContentsOfFile:
             [jobDirectory stringByAppendingPathComponent:@"com.apple.systemstatusd.plist"]];
         NSDictionary *springBoard = [NSDictionary dictionaryWithContentsOfFile:
@@ -2053,8 +2198,19 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
             assert([springBoard[@"MachServices"][name] isEqual:disabled]);
         }
         assert([status[@"RunAtLoad"] boolValue] && ![status[@"KeepAlive"] boolValue] && ![status[@"EnableTransactions"] boolValue]);
-        disposeMessage(initial);
+        assert(!enqueueInitialJob(initial, LSB_EXECUTION_SIMULATOR));
+        assert(jobs.lastObject.simulatorLaunchd && jobs.lastObject.nativeConfigdSelected);
+        assert(!initialNativeConfigdPending); // Native helper plans reset the temporary flag; the launchd snapshot must survive them.
+        for (LSBJob *job in jobs) if (job != jobs.lastObject) assert(!job.nativeConfigdSelected);
     }
+    resetBroker();
+    runtimeRoot = root;
+    const char *arguments[] = {"LiveSimBooter", "--launchd-services", "com.apple.notifyd", NULL};
+    const char *environment[] = {"LSB_NATIVE_CONFIGD=1", "com.apple.SystemConfiguration.configd=1", NULL};
+    LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
+    assert(!initialPlan(initial, 3, arguments, environment) && !initialNativeConfigdPending);
+    assert(!enqueueInitialJob(initial, LSB_EXECUTION_SIMULATOR));
+    assert(jobs.lastObject.simulatorLaunchd && !jobs.lastObject.nativeConfigdSelected); // Guest environment cannot request a native bridge.
     resetBroker();
     assert([manager removeItemAtPath:directory error:NULL]);
 }
@@ -3388,6 +3544,8 @@ int main(void) {
         testDirectBackboardWaitsForServices();
         testDisplayEndpointRegistrationCompletesAll();
         testDisplayRegistrationSharesStartupBudget();
+        testNativeConfigdBridgeRegistration();
+        testDirectConfigdWaitsForSelectedBridge();
         testNativeMetalReadyGatesLaunchd();
         testNativeMetalOwnerLifecycle();
         testNativeProbeAssertionLoss();

@@ -53,6 +53,16 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
 #import "SimulatorDisplayView.h"
 #import "IndigoHIDServer.h"
 #import "MetalDisplayRenderer.h"
+#include "SimulatorKeyboardInput.h"
+
+static int LSBDisplaySendKey(void *context, uint32_t usage, bool pressed) {
+    return [(__bridge LSBIndigoHIDServer *)context sendKeyboardUsage:usage pressed:pressed];
+}
+
+static uint8_t LSBDisplayKeyboardModifiers(UIKeyModifierFlags flags) {
+    return ((flags & UIKeyModifierControl) ? 1 : 0) | ((flags & UIKeyModifierShift) ? 2 : 0) |
+           ((flags & UIKeyModifierAlternate) ? 4 : 0) | ((flags & UIKeyModifierCommand) ? 8 : 0);
+}
 
 @interface LSBSimulatorDisplayView () {
     CAMetalLayer *_displayLayer;
@@ -62,6 +72,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     CGSize _pixelSize;
     CGRect _viewport;
     uint64_t _nextTouchIdentifier, _presentationGeneration;
+    LSBKeyboardInput _keyboard;
     BOOL _applicationActive, _captureFirstFrame, _captureAttempted, _presentationEnabled;
 }
 @end
@@ -115,6 +126,27 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
 - (void)dealloc {
     [NSNotificationCenter.defaultCenter removeObserver:self];
     if (_touches.count) [_indigoServer cancelTouches];
+    [_indigoServer releaseAllKeys];
+}
+
+- (void)releaseKeyboard {
+    // The server retains failed key-up deliveries and retries them before accepting more keys.
+    [_indigoServer releaseAllKeys];
+    LSBKeyboardInputReset(&_keyboard);
+}
+
+- (BOOL)canBecomeFirstResponder {
+    return _indigoServer && _presentationEnabled && _applicationActive && self.window && !self.hidden && self.userInteractionEnabled;
+}
+
+- (BOOL)resignFirstResponder {
+    [self releaseKeyboard];
+    return [super resignFirstResponder];
+}
+
+- (void)stopKeyboardInput {
+    [self releaseKeyboard];
+    if (self.isFirstResponder) [self resignFirstResponder];
 }
 
 - (void)cancelActiveTouches {
@@ -126,14 +158,16 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     NSAssert(NSThread.isMainThread, @"Simulator display must be used on the main thread");
     if (_indigoServer == indigoServer) return;
     [self cancelActiveTouches];
+    [self stopKeyboardInput];
     _indigoServer = indigoServer;
+    if (self.canBecomeFirstResponder) [self becomeFirstResponder];
 }
 
 - (void)setPresentationEnabled:(BOOL)enabled {
     NSAssert(NSThread.isMainThread, @"Simulator display must be used on the main thread");
     if (!NSThread.isMainThread || _presentationEnabled == enabled) return;
     _presentationEnabled = enabled;
-    if (!enabled) [self cancelActiveTouches];
+    if (!enabled) { [self cancelActiveTouches]; [self stopKeyboardInput]; }
     _renderer.presentationEnabled = enabled;
 }
 
@@ -141,6 +175,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     NSAssert(NSThread.isMainThread, @"Simulator display must be used on the main thread");
     ++_presentationGeneration;
     [self cancelActiveTouches];
+    [self releaseKeyboard];
     [_renderer reset];
     // GPU completion is not display completion. Retire the layer as well as its composition baseline between sessions.
     [_displayLayer removeFromSuperlayer];
@@ -199,6 +234,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
         } else {
             if (!renderer.hasFrame) {
                 [view cancelActiveTouches];
+                [view releaseKeyboard];
                 view->_pixelSize = CGSizeZero;
             }
             [view setNeedsLayout];
@@ -220,22 +256,22 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
 }
 
 - (void)willMoveToWindow:(UIWindow *)window {
-    if (!window) [self cancelActiveTouches];
+    if (!window) { [self cancelActiveTouches]; [self stopKeyboardInput]; }
     [super willMoveToWindow:window];
 }
 
 - (void)willMoveToSuperview:(UIView *)superview {
-    if (!superview) [self cancelActiveTouches];
+    if (!superview) { [self cancelActiveTouches]; [self stopKeyboardInput]; }
     [super willMoveToSuperview:superview];
 }
 
 - (void)setHidden:(BOOL)hidden {
-    if (hidden) [self cancelActiveTouches];
+    if (hidden) { [self cancelActiveTouches]; [self stopKeyboardInput]; }
     [super setHidden:hidden];
 }
 
 - (void)setUserInteractionEnabled:(BOOL)enabled {
-    if (!enabled) [self cancelActiveTouches];
+    if (!enabled) { [self cancelActiveTouches]; [self stopKeyboardInput]; }
     [super setUserInteractionEnabled:enabled];
 }
 
@@ -243,11 +279,46 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
     (void)notification;
     _applicationActive = NO;
     [self cancelActiveTouches];
+    [self stopKeyboardInput];
 }
 
 - (void)applicationActive:(NSNotification *)notification {
     (void)notification;
     _applicationActive = YES;
+    if (self.canBecomeFirstResponder) [self becomeFirstResponder];
+}
+
+- (NSSet<UIPress *> *)forwardKeyPresses:(NSSet<UIPress *> *)presses event:(UIPressesEvent *)event pressed:(BOOL)pressed {
+    if (!self.isFirstResponder || !self.canBecomeFirstResponder || !_renderer.hasFrame) return presses;
+    uint16_t usages[0xe8];
+    size_t count = 0;
+    NSMutableSet<UIPress *> *unhandled = [NSMutableSet new];
+    for (UIPress *press in presses) {
+        UIKey *key = press.key;
+        if (!key || key.keyCode < 4 || key.keyCode > 0xe7 || count == sizeof(usages) / sizeof(usages[0])) [unhandled addObject:press];
+        else usages[count++] = (uint16_t)key.keyCode;
+    }
+    if (count) {
+        int error = LSBKeyboardInputApply(&_keyboard, usages, count, pressed, LSBDisplayKeyboardModifiers(event.modifierFlags),
+                                          LSBDisplaySendKey, (__bridge void *)_indigoServer);
+        if (error) [self releaseKeyboard];
+    }
+    return unhandled;
+}
+
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    NSSet<UIPress *> *unhandled = [self forwardKeyPresses:presses event:event pressed:YES];
+    if (unhandled.count) [super pressesBegan:unhandled withEvent:event];
+}
+
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    NSSet<UIPress *> *unhandled = [self forwardKeyPresses:presses event:event pressed:NO];
+    if (unhandled.count) [super pressesEnded:unhandled withEvent:event];
+}
+
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self releaseKeyboard];
+    [super pressesCancelled:presses withEvent:event];
 }
 
 - (uint64_t)nextTouchIdentifier {
@@ -270,6 +341,7 @@ static int LSBCaptureDisplayImage(CGImageRef image, const char *directory) {
         CGPoint normalized;
         CGPoint location = [touch locationInView:self];
         if (!LSBDisplayNormalize(_viewport, location, true, &normalized)) continue;
+        [self becomeFirstResponder]; // Focus only a touch beginning inside the displayed simulator image.
         uint64_t identifier = [self nextTouchIdentifier];
         LSBIndigoTouchEdge edge = LSBDisplayBeginningEdge(_viewport, location);
         if (![_indigoServer sendTouch:identifier phase:LSBIndigoTouchBegan x:normalized.x y:normalized.y edge:edge]) {

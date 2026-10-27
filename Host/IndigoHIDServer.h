@@ -26,5 +26,11 @@ typedef NS_ENUM(unsigned, LSBIndigoTouchPhase) {
 - (int)sendTouch:(uint64_t)identifier phase:(LSBIndigoTouchPhase)phase x:(double)x y:(double)y edge:(LSBIndigoTouchEdge)edge;
 // EAGAIN schedules nonblocking retries until delivery or disconnection, so a disappearing view can discard its local touch records.
 - (int)cancelTouches;
+// USB HID keyboard/keypad page 7 usages, 4...0xe7, including the eight modifier keys. Guest-only target; no host HID APIs.
+// Repeated downs return EALREADY (the guest owns repeat); unmatched ups return ENOENT. Only accepted downs are tracked.
+// A queued key release blocks new keyboard events with EBUSY until its automatic retry succeeds or the client disconnects.
+- (int)sendKeyboardUsage:(uint32_t)usage pressed:(BOOL)pressed;
+// Release every accepted key on focus/window/tab loss. EAGAIN schedules generation-bound, nonblocking retries.
+- (int)releaseAllKeys;
 - (void)close;
 @end

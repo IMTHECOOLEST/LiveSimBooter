@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { TouchCapacity = 16, IndigoDigitizer = 11, IndigoBuiltinTouch = 50, IndigoDynamicTouch = 0x40000001,
+enum { TouchCapacity = 16, KeyboardCapacity = 0xe8, IndigoDigitizer = 11, IndigoBuiltinTouch = 50, IndigoDynamicTouch = 0x40000001,
        DigitizerRange = 1, DigitizerTouch = 2, DigitizerPosition = 4, DigitizerCancel = 128 };
 
 // SimulatorHID 1171.7's Indigo wire format: target at 76, parent index at 144, timestamp flags at 145.
@@ -46,6 +46,18 @@ typedef struct {
     uint8_t timestampFlags;
     uint16_t tail;
 } IndigoCreateDigitizer;
+typedef struct {
+    mach_msg_header_t header;
+    uint32_t stride;
+    uint8_t count, padding[3];
+    uint32_t type;
+    uint64_t timestamp;
+    uint32_t flags, subtype, operation, target, usage, keyboardType, usagePage;
+    uint8_t unused[104];
+    int8_t parentIndex;
+    uint8_t timestampFlags;
+    uint16_t reserved;
+} IndigoKeyboard;
 #pragma pack(pop)
 _Static_assert(sizeof(IndigoPayload) == 148 && offsetof(IndigoPayload, x) == 28 && offsetof(IndigoPayload, transducerType) == 84 &&
                offsetof(IndigoPayload, target) == 76 && offsetof(IndigoPayload, parentIndex) == 144 &&
@@ -55,6 +67,10 @@ _Static_assert(offsetof(IndigoTouches, payloads) == 32, "Indigo message payload 
 _Static_assert(sizeof(IndigoCreateDigitizer) == 32 + sizeof(IndigoPayload) && offsetof(IndigoCreateDigitizer, command) == 48 &&
                offsetof(IndigoCreateDigitizer, target) == 64 && offsetof(IndigoCreateDigitizer, builtIn) == 68 &&
                offsetof(IndigoCreateDigitizer, displayUID) == 69, "Indigo create-digitizer command layout");
+_Static_assert(sizeof(IndigoKeyboard) == 32 + 148 && offsetof(IndigoKeyboard, subtype) == 48 &&
+               offsetof(IndigoKeyboard, target) == 56 && offsetof(IndigoKeyboard, usage) == 60 &&
+               offsetof(IndigoKeyboard, usagePage) == 68 && offsetof(IndigoKeyboard, parentIndex) == 32 + 144,
+               "Indigo generic keyboard payload layout");
 
 typedef struct { uint64_t identifier; uint32_t identity; double x, y; LSBIndigoTouchEdge edge; bool active; } Touch;
 
@@ -75,6 +91,9 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
     pid_t _clientPID;
     uint32_t _nextIdentity;
     Touch _touches[TouchCapacity];
+    bool _pressedKeys[KeyboardCapacity], _pendingKeyReleases[KeyboardCapacity];
+    BOOL _keyReleasePending;
+    uint64_t _keyReleaseGeneration;
 }
 - (void)drainRegistrations;
 - (void)dropClient;
@@ -83,6 +102,10 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
 - (int)sendTouches:(const Touch *)touches changed:(unsigned)changed phase:(LSBIndigoTouchPhase)phase cancellingAll:(BOOL)cancelAll;
 - (void)scheduleCancellationRetry:(uint64_t)generation;
 - (void)retryCancellation:(uint64_t)generation;
+- (int)sendKeyboardPacket:(uint32_t)usage pressed:(BOOL)pressed;
+- (int)flushKeyReleases;
+- (void)scheduleKeyReleaseRetry:(uint64_t)generation;
+- (void)retryKeyReleases:(uint64_t)generation;
 @end
 
 @implementation LSBIndigoHIDServer
@@ -143,6 +166,10 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
     _cancelPending = NO;
     ++_cancelGeneration;
     memset(_touches, 0, sizeof(_touches));
+    memset(_pressedKeys, 0, sizeof(_pressedKeys));
+    memset(_pendingKeyReleases, 0, sizeof(_pendingKeyReleases));
+    _keyReleasePending = NO;
+    ++_keyReleaseGeneration;
 }
 
 - (void)authorizeClientWithAuditToken:(const audit_token_t *)audit {
@@ -323,6 +350,76 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
         memset(_touches, 0, sizeof(_touches));
         _cancelPending = NO;
     }
+}
+
+- (int)sendKeyboardPacket:(uint32_t)usage pressed:(BOOL)pressed {
+    // SimulatorKit 1171.7 IndigoHIDMessageForHIDArbitrary(target, page, usage, operation), decoded by SimulatorHID +0x67b4.
+    // Its generic subtype bypasses _IndigoHIDUpdateKeyboardType: typing must not toggle the host's keyboard attachment state.
+    IndigoKeyboard message = {.stride = 148, .count = 1, .type = 2, .timestamp = mach_absolute_time(),
+        .subtype = 10001, .operation = pressed ? 1 : 2, .target = 100, .usage = usage, .usagePage = 7, .parentIndex = -1};
+    return [self sendMessage:&message.header size:sizeof(message)];
+}
+
+- (int)sendKeyboardUsage:(uint32_t)usage pressed:(BOOL)pressed {
+    if (usage < 4 || usage >= KeyboardCapacity) return EINVAL;
+    __block int result = 0;
+    [self serialized:^{
+        if (self->_closed) { result = EBADF; return; }
+        if (!MACH_PORT_VALID(self->_eventPort)) { result = ENOTCONN; return; }
+        if (self->_keyReleasePending) { result = EBUSY; return; }
+        if (self->_pressedKeys[usage] == !!pressed) { result = pressed ? EALREADY : ENOENT; return; }
+        result = [self sendKeyboardPacket:usage pressed:pressed];
+        if (!result) self->_pressedKeys[usage] = !!pressed;
+        else if (!pressed && result == EAGAIN) {
+            self->_pendingKeyReleases[usage] = true;
+            self->_keyReleasePending = YES;
+            [self scheduleKeyReleaseRetry:++self->_keyReleaseGeneration];
+        }
+    }];
+    return result;
+}
+
+- (int)flushKeyReleases {
+    for (unsigned usage = 4; usage < KeyboardCapacity; ++usage) {
+        if (!_pendingKeyReleases[usage]) continue;
+        int result = [self sendKeyboardPacket:usage pressed:NO];
+        if (result) return result;
+        _pressedKeys[usage] = false;
+        _pendingKeyReleases[usage] = false;
+    }
+    _keyReleasePending = NO;
+    return 0;
+}
+
+- (int)releaseAllKeys {
+    __block int result = 0;
+    [self serialized:^{
+        BOOL active = NO;
+        for (unsigned usage = 4; usage < KeyboardCapacity; ++usage) {
+            self->_pendingKeyReleases[usage] |= self->_pressedKeys[usage];
+            active |= self->_pendingKeyReleases[usage];
+        }
+        if (!active) return;
+        if (self->_keyReleasePending) { result = EAGAIN; return; }
+        result = [self flushKeyReleases];
+        if (result == EAGAIN) {
+            self->_keyReleasePending = YES;
+            [self scheduleKeyReleaseRetry:++self->_keyReleaseGeneration];
+        } else if (result) [self dropClient];
+    }];
+    return result;
+}
+
+- (void)scheduleKeyReleaseRetry:(uint64_t)generation {
+    __weak LSBIndigoHIDServer *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), _queue, ^{ [weakSelf retryKeyReleases:generation]; });
+}
+
+- (void)retryKeyReleases:(uint64_t)generation {
+    if (_closed || !_keyReleasePending || generation != _keyReleaseGeneration) return;
+    int error = [self flushKeyReleases];
+    if (error == EAGAIN) [self scheduleKeyReleaseRetry:generation];
+    else if (error) [self dropClient];
 }
 
 - (void)close {

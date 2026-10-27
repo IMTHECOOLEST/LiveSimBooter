@@ -56,6 +56,7 @@ enum { JobQueued, JobStarting, JobDispatched, JobRunning };
 @property (nonatomic, strong) LSBIOSurfaceServer *iosurface;
 @property BOOL servicesPending;
 @property int servicesError;
+@property BOOL nativeConfigdSelected;
 @property uint64_t indigoAuthorizedIdentifier;
 @property uint64_t framebufferAuthorizedIdentifier;
 @property uint64_t nativeMetalServiceIdentifier, nativeMetalAuthorizedIdentifier;
@@ -116,6 +117,7 @@ static BOOL launchLaneFailed;
 static unsigned finishingDepth;
 static LSBTerminalSession *hostTerminal;
 static BOOL initialTerminalPending;
+static BOOL initialNativeConfigdPending;
 static BOOL enableIndigo;
 static BOOL enableSpringBoardMetal;
 // Allow every launchd child to overlap its exec replacement, plus launchd and the backboardd, SpringBoard and public Metal helpers.
@@ -167,6 +169,13 @@ static BOOL isSpringBoardProgram(const LSBReceivedMessage *request) {
     static const char path[] = "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
     if (!strcmp(program, path)) return YES;
     NSString *physical = [runtimeRoot stringByAppendingString:@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"];
+    return !strcmp(program, physical.fileSystemRepresentation);
+}
+
+static BOOL isConfigdProgram(const LSBReceivedMessage *request) {
+    const char *program = request->plan.strings + request->plan.path;
+    if (!strcmp(program, "/usr/libexec/configd_sim")) return YES;
+    NSString *physical = [runtimeRoot stringByAppendingPathComponent:@"usr/libexec/configd_sim"];
     return !strcmp(program, physical.fileSystemRepresentation);
 }
 
@@ -795,7 +804,7 @@ static void startNextJob(void) {
         LSBJob *parent = findJob(old ? old.parentIdentifier : job.parentIdentifier);
         // Let xpcproxy return READY so launchd can answer registration before SETEXEC or a direct backboardd launch.
         BOOL springBoard = parent.springBoardMetalSelected && isSpringBoardProgram(job.request);
-        BOOL needsServices = old || isBackboardProgram(job.request) || springBoard;
+        BOOL needsServices = old || isBackboardProgram(job.request) || springBoard || (parent.nativeConfigdSelected && isConfigdProgram(job.request));
         if (needsServices && parent.servicesPending) continue;
         if (needsServices && parent.servicesError) { finishJob(job, parent.servicesError); return; }
         if (springBoard && parent.springBoardMetalRestartAllowed) {
@@ -1114,15 +1123,29 @@ static void registerDisplayServices(LSBJob *active, mach_port_t service) {
     LSBIndigoHIDServer *indigo = active.indigo;
     LSBFramebufferServer *framebuffer = active.framebuffer;
     LSBIOSurfaceServer *iosurface = active.iosurface;
+    BOOL nativeConfigdSelected = active.nativeConfigdSelected;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         // Launchd can spend several seconds synchronously spawning its initial xpcproxy batch before servicing the final registration.
         // Keep each original request/reply alive within one bounded startup budget; timeout is an unknown outcome, not retry permission.
         struct timespec now = {0};
         int clockError = clock_gettime(CLOCK_MONOTONIC, &now) ? errno : 0;
         int64_t deadline = ((int64_t)now.tv_sec + DisplayRegistrationTimeoutSeconds) * NSEC_PER_SEC + now.tv_nsec;
+        kern_return_t configdLookupStatus = -1, configdStatus = -1;
+        int configdError = clockError;
+        if (!configdError && nativeConfigdSelected) {
+            // CoreSimulator supplies this host mirror endpoint to configd_sim's SimulatorSupport plugin.
+            // Only the host-selected fixed service is bridged; configd_sim still owns its three suffixed guest services.
+            const char *name = "com.apple.SystemConfiguration.configd";
+            mach_port_t endpoint = MACH_PORT_NULL;
+            configdLookupStatus = bootstrap_look_up(bootstrap_port, name, &endpoint);
+            configdError = configdLookupStatus ? EIO : !MACH_PORT_VALID(endpoint) ? EPIPE :
+                registerDisplayEndpoint(service, &expected, name, endpoint, deadline, &configdStatus);
+            // Registration borrows the right with COPY_SEND. Lookup's owned reference is released even on error/unknown timeout.
+            if (MACH_PORT_VALID(endpoint)) mach_port_deallocate(mach_task_self(), endpoint);
+        }
         kern_return_t indigoStatus = -1, iosurfaceStatus = -1, framebufferStatus = -1, metalStatus = -1, backboardMetalStatus = -1;
-        int indigoError = clockError ? clockError : indigo ? registerDisplayEndpoint(service, &expected, "IndigoHIDRegistrationPort",
-                                                                                    indigo.registrationPort, deadline, &indigoStatus) : 0;
+        int indigoError = configdError ? configdError : indigo ? registerDisplayEndpoint(service, &expected, "IndigoHIDRegistrationPort",
+                                                                                       indigo.registrationPort, deadline, &indigoStatus) : 0;
         int endpointError = indigoError, iosurfaceError = ECANCELED, framebufferError = ECANCELED;
         if (!endpointError && iosurface) {
             iosurfaceError = registerDisplayEndpoint(service, &expected, "com.apple.IOSurface.Remote",
@@ -1154,6 +1177,8 @@ static void registerDisplayServices(LSBJob *active, mach_port_t service) {
             BOOL helperLost = (helperIdentifier && (!currentHelper || currentHelper.phase != JobRunning)) ||
                 (publicHelperIdentifier && (!currentPublicHelper || currentPublicHelper.phase != JobRunning));
             if (!current.servicesError) current.servicesError = helperLost ? EPIPE : endpointError;
+            if (nativeConfigdSelected) fprintf(stderr, "[configd] native bridge error=%d lookup=%d bootstrap=%d\n",
+                                               configdError, configdLookupStatus, configdStatus);
             if (indigo) fprintf(stderr, "[Indigo] registration error=%d bootstrap=%d\n", indigoError, indigoStatus);
             if (iosurface) fprintf(stderr, "[IOSurface] registration error=%d bootstrap=%d\n", iosurfaceError, iosurfaceStatus);
             if (framebuffer) fprintf(stderr, "[framebuffer] registration error=%d bootstrap=%d\n", framebufferError, framebufferStatus);
@@ -1186,6 +1211,7 @@ static void registerDisplayServices(LSBJob *active, mach_port_t service) {
 }
 
 static int prepareLaunchdHandshake(LSBJob *job) {
+    if (job.nativeConfigdSelected) job.servicesPending = YES;
     if (enableIndigo) {
         int error = 0;
         job.indigo = [[LSBIndigoHIDServer alloc] initWithError:&error];
@@ -1597,6 +1623,7 @@ static int initialExecutionRole(int argc, const char *argv[], uint32_t *role) {
 
 static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[], const char *envp[]) {
     initialTerminalPending = NO;
+    initialNativeConfigdPending = NO;
     LSBSpawnPlan *plan = &message->plan;
     for (unsigned i = 0; i < LSB_MAX_FDS; ++i) message->fds[i] = -1;
     uint32_t executionRole;
@@ -1616,10 +1643,13 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
         const char *defaults[] = {"com.apple.notifyd", "com.apple.lsd", "com.apple.runningboardd", "com.apple.containermanagerd",
                                   "com.apple.fontservicesd", "com.apple.containermanagerd.system", "com.apple.distnoted.xpc.daemon",
                                   "com.apple.configd_sim", "com.apple.sleepd", "com.apple.systemstatusd", "com.apple.SpringBoard",
-                                  "com.apple.iconservices.iconservicesagent", NULL};
+                                  "com.apple.iconservices.iconservicesagent", "com.apple.TextInput.kbd", "com.apple.assistantd",
+                                  NULL};
         enableIndigo = YES;
         const char *const *labels = argc > 2 ? argv + 2 : defaults;
         int error = LSBPrepareLaunchdServicesPlan(message, runtimeRoot.fileSystemRepresentation, envp, labels);
+        if (!error) for (const char *const *label = labels; *label; ++label)
+            if (!strcmp(*label, "com.apple.configd_sim")) initialNativeConfigdPending = YES;
         enableSpringBoardMetal = NO;
         return error ? error : configuredSpringBoardMetal(plan, labels, &enableSpringBoardMetal);
     }
@@ -1713,6 +1743,7 @@ static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole
     // Only host-selected graphics jobs provision services. Each helper has its own control page, endpoint and process-reference namespace.
     // Install every dependency before submitting an extension, including synchronous launch-error paths.
     ++finishingDepth;
+    BOOL nativeConfigdSelected = initialNativeConfigdPending;
     int error = 0, springBoardError = 0;
     LSBJob *helper = enqueueNativeMetalHelper(NO, &error);
     LSBJob *springBoard = helper && enableSpringBoardMetal ? enqueueNativeMetalHelper(NO, &springBoardError) : nil;
@@ -1720,6 +1751,7 @@ static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole
     LSBJob *launchd = publicHelper ? enqueueJob(initial, nil, executionRole) : nil;
     if (!publicHelper) disposeMessage(initial);
     if (launchd) {
+        launchd.nativeConfigdSelected = nativeConfigdSelected;
         launchd.nativeMetalServiceIdentifier = helper.identifier;
         launchd.publicMetalServiceIdentifier = publicHelper.identifier;
         launchd.springBoardMetalSelected = enableSpringBoardMetal;

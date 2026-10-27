@@ -287,6 +287,12 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/IndigoHIDServerTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoHIDServer"
 "$test_directory/IndigoHIDServer"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/IndigoKeyboardTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoKeyboard"
+"$test_directory/IndigoKeyboard"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/SimulatorKeyboardInputTests.c -o "$test_directory/SimulatorKeyboardInput"
+"$test_directory/SimulatorKeyboardInput"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/FramebufferServerTests.m Host/FramebufferServer.m -framework Foundation -framework IOSurface -framework CoreGraphics \
     -o "$test_directory/FramebufferServer"
 "$test_directory/FramebufferServer"

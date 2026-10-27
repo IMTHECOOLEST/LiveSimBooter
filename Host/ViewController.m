@@ -69,6 +69,10 @@ static void showStatus(UIViewController *controller, NSString *text) {
     self.simulatorDisplay.presentationEnabled = YES;
     self.simulatorDisplay.userInteractionEnabled = YES;
 }
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self.simulatorDisplay becomeFirstResponder];
+}
 - (void)viewWillDisappear:(BOOL)animated {
     self.simulatorDisplay.userInteractionEnabled = NO; // Cancels active contacts before another tab can receive touches.
     self.simulatorDisplay.presentationEnabled = NO;
