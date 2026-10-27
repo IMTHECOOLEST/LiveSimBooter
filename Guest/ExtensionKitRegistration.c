@@ -41,11 +41,17 @@ int LSBRegisterExtensionKitForExecutable(const char *enabled, const char *runtim
     struct stat metadata;
     if (stat(root, &metadata)) return errno;
     if (!S_ISDIR(metadata.st_mode)) return ENOTDIR;
-    int error = appendPath(expected, root, "System/Library/CoreServices/SpringBoard.app/SpringBoard");
-    if (error) return error;
     if (!realpath(executablePath, executable)) return errno;
     // An inherited option cannot register a domain for launchd, xpcproxy, the service, or an unrelated executable.
-    if (strcmp(executable, expected)) return 0;
+    const char *roles[] = {"System/Library/CoreServices/SpringBoard.app/SpringBoard", "Applications/PosterBoard.app/PosterBoard"};
+    bool recognized = false;
+    int error;
+    for (unsigned i = 0; i < sizeof(roles) / sizeof(*roles); ++i) {
+        error = appendPath(expected, root, roles[i]);
+        if (error) return error;
+        if (!strcmp(executable, expected)) { recognized = true; break; }
+    }
+    if (!recognized) return 0;
     if (stat(executable, &metadata)) return errno;
     if (!S_ISREG(metadata.st_mode)) return EINVAL;
     error = appendPath(expected, root, "System/Library/Frameworks/ExtensionFoundation.framework/XPCServices/extensionkitservice.xpc");

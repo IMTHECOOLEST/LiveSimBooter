@@ -370,8 +370,9 @@ static void schedulerHints(void) {
     assert(!sigaddset(&mask, SIGUSR1) && !sigaddset(&defaults, SIGTERM));
     assert(!posix_spawnattr_setsigmask(&attributes, &mask) && !posix_spawnattr_setsigdefault(&attributes, &defaults));
     static const struct { uint32_t type, role; int error; } cases[] = {
-        {0, 0, 0}, {0x600, 0, 0}, {0x100, 0, 0}, {0x100, 1, 0},
-        {0, 1, ENOTSUP}, {0x600, 1, ENOTSUP}, {0x100, 2, ENOTSUP}, {0x100, 7, ENOTSUP},
+        {0, 0, 0}, {0x600, 0, 0}, {0x100, 0, 0}, {0x100, 1, 0}, {0x100, 2, 0},
+        {0, 1, ENOTSUP}, {0, 2, ENOTSUP}, {0x600, 1, ENOTSUP}, {0x600, 2, ENOTSUP},
+        {0x100, 3, ENOTSUP}, {0x100, 4, ENOTSUP}, {0x100, 5, ENOTSUP}, {0x100, 6, ENOTSUP}, {0x100, 7, ENOTSUP},
         {0x101, 1, ENOTSUP}, {0x200, 0, ENOTSUP}, {0x300, 0, ENOTSUP}, {0x700, 0, ENOTSUP}, {UINT32_MAX, 0, ENOTSUP}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
@@ -399,9 +400,10 @@ static void allocatorHintAndInheritedAppRole(void) {
     assert(!posix_spawnattr_init(&attributes));
     assert(POSIX_SPAWN_SETSID == 0x0400 && NativeSpawnNanoAllocator == 0x0200);
     static const struct { short flags; uint32_t type, role; int error; } cases[] = {
-        {0x0200, 0, 0, 0}, {0x420c, 0x100, 1, 0}, {0x4240, 0, 1, 0},
-        {0x4200, 0, 1, ENOTSUP}, {0x4240, 0x600, 1, ENOTSUP}, {0x4240, 0, 2, ENOTSUP},
-        {0x4440, 0, 1, ENOTSUP}, {0x42c0, 0, 1, ENOTSUP}
+        {0x0200, 0, 0, 0}, {0x420c, 0x100, 1, 0}, {0x420c, 0x100, 2, 0}, {0x4240, 0, 1, 0}, {0x4240, 0, 2, 0},
+        {0x4200, 0, 1, ENOTSUP}, {0x4200, 0, 2, ENOTSUP}, {0x4240, 0x600, 1, ENOTSUP}, {0x4240, 0x600, 2, ENOTSUP},
+        {0x4240, 0, 3, ENOTSUP}, {0x4240, 0, 4, ENOTSUP}, {0x4240, 0, 7, ENOTSUP},
+        {0x4440, 0, 1, ENOTSUP}, {0x42c0, 0, 1, ENOTSUP}, {0x4440, 0, 2, ENOTSUP}, {0x42c0, 0, 2, ENOTSUP}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         assert(!posix_spawnattr_setflags(&attributes, cases[i].flags));
@@ -410,7 +412,7 @@ static void allocatorHintAndInheritedAppRole(void) {
         assert(readAttributes(plan, &attributes, &additional) == cases[i].error);
         if (!cases[i].error) assert(plan->spawnFlags == ((uint16_t)cases[i].flags & ~NativeSpawnNanoAllocator));
     }
-    // The exact Contacts/WidgetRenderer xpcproxy request reaches exec transport with only CLOEXEC_DEFAULT left.
+    // Contacts/WidgetRenderer use UI_FOCAL; stock App LaunchAngels use UI. Both replacements retain only CLOEXEC_DEFAULT.
     assert(!posix_spawnattr_setflags(&attributes, 0x4240));
     uint32_t type = 0, role = 1;
     memcpy((char *)attributes + 0x24, &type, sizeof(type));
@@ -420,15 +422,22 @@ static void allocatorHintAndInheritedAppRole(void) {
     memcpy((char *)attributes + 0x98, &datalessPolicy, sizeof(datalessPolicy));
     pid_t session = 0, group = 0, afterSession = 0, afterGroup = 0;
     int sessionError = LSBProcessSessionSnapshot(&session, &group);
-    pid_t nativeSession = getsid(0), nativeGroup = getpgrp(), pid = 123;
-    unsigned calls = execCalls;
+    pid_t nativeSession = getsid(0), nativeGroup = getpgrp();
     char *argv[] = {"tool", NULL}, *environment[] = {NULL};
     transportFailure = EACCES;
-    errno = EDOM;
-    assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, &attributes, argv, environment) == EACCES && errno == EDOM && pid == 123);
-    assert(execCalls == calls + 1 && capturedSpawnFlags == POSIX_SPAWN_CLOEXEC_DEFAULT);
-    assert(LSBProcessSessionSnapshot(&afterSession, &afterGroup) == sessionError);
-    assert(session == afterSession && group == afterGroup && getsid(0) == nativeSession && getpgrp() == nativeGroup);
+    for (role = 1; role <= 2; ++role) {
+        memcpy((char *)attributes + 0x58, &role, sizeof(role));
+        unsigned char snapshot[0x100];
+        memcpy(snapshot, attributes, sizeof(snapshot));
+        pid_t pid = 123;
+        unsigned calls = execCalls;
+        errno = EDOM;
+        assert(LSBPosixSpawn(&pid, "/bin/tool", NULL, &attributes, argv, environment) == EACCES && errno == EDOM && pid == 123);
+        assert(execCalls == calls + 1 && capturedSpawnFlags == POSIX_SPAWN_CLOEXEC_DEFAULT);
+        assert(!memcmp(snapshot, attributes, sizeof(snapshot)));
+        assert(LSBProcessSessionSnapshot(&afterSession, &afterGroup) == sessionError);
+        assert(session == afterSession && group == afterGroup && getsid(0) == nativeSession && getpgrp() == nativeGroup);
+    }
     transportFailure = 0;
     assert(!posix_spawnattr_destroy(&attributes));
     free(plan);

@@ -13,7 +13,7 @@
 
 // Keep the initial service selection bounded independently of slots needed later for apps, helpers and adopted children.
 // Backboardd, cfprefsd and the terminal helper are direct launchd children alongside the selected services.
-enum { BaselineLaunchdChildren = 3, MaximumSelectedServices = 14 };
+enum { BaselineLaunchdChildren = 3, MaximumSelectedServices = 16 };
 _Static_assert(BaselineLaunchdChildren + MaximumSelectedServices < LSB_CHILD_STATUS_CAPACITY, "leave child-ledger slots for dynamic jobs");
 
 static int openDirectory(int parent, const char *name) {
@@ -149,6 +149,38 @@ static BOOL validGuestProgram(NSString *path) {
     return path.length > 1;
 }
 
+static int addLaunchAngelPolicy(NSDictionary *stock, NSMutableDictionary *job) {
+    // Selected LaunchAngels describe apps activated by RunningBoard, not daemons to force-start during bootstrap.
+    // Preserve the supported on-demand policy; do not silently turn an unfamiliar keepalive/transaction policy into another one.
+    for (NSString *key in @[@"RunAtLoad", @"KeepAlive", @"EnableTransactions", @"EnablePressuredExit"]) {
+        id value = stock[key];
+        if (!value) continue;
+        if (CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) return EINVAL;
+        if ([value boolValue]) return ENOTSUP;
+        job[key] = value;
+    }
+    for (NSString *key in @[@"ProcessType", @"POSIXSpawnType"]) {
+        id value = stock[key];
+        if (!value) continue;
+        if (![value isKindOfClass:NSString.class]) return EINVAL;
+        if (![value isEqual:@"App"]) return ENOTSUP;
+        job[key] = value;
+    }
+    NSDictionary *properties = stock[@"_AdditionalProperties"];
+    if (properties && ![properties isKindOfClass:NSDictionary.class]) return EINVAL;
+    NSDictionary *runningBoard = properties[@"RunningBoard"];
+    if (runningBoard && ![runningBoard isKindOfClass:NSDictionary.class]) return EINVAL;
+    NSMutableDictionary *supported = [NSMutableDictionary dictionary];
+    for (NSString *key in @[@"Managed", @"Reported"]) {
+        id value = runningBoard[key];
+        if (!value) continue;
+        if (CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) return EINVAL;
+        supported[key] = value;
+    }
+    if (supported.count) job[@"_AdditionalProperties"] = @{@"RunningBoard": supported};
+    return 0;
+}
+
 static int addServiceJobs(NSString *root, const char *const labels[], NSMutableDictionary<NSString *, NSData *> *jobs,
                          NSMutableArray<NSString *> *logs) {
     if (!labels) return EINVAL;
@@ -170,7 +202,14 @@ static int addServiceJobs(NSString *root, const char *const labels[], NSMutableD
         NSString *filename = [label stringByAppendingString:@".plist"];
         NSString *stockPath = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
         struct stat metadata;
-        if (lstat(stockPath.fileSystemRepresentation, &metadata)) return errno;
+        BOOL launchAngel = NO;
+        if (lstat(stockPath.fileSystemRepresentation, &metadata)) {
+            if (errno != ENOENT) return errno;
+            // Search only this explicitly selected label. An existing malformed/symlinked daemon must never fall through.
+            stockPath = [[root stringByAppendingPathComponent:@"System/Library/LaunchAngels"] stringByAppendingPathComponent:filename];
+            if (lstat(stockPath.fileSystemRepresentation, &metadata)) return errno;
+            launchAngel = YES;
+        }
         if (!S_ISREG(metadata.st_mode)) return S_ISLNK(metadata.st_mode) ? ELOOP : EINVAL;
         if (metadata.st_size <= 0 || metadata.st_size > 1024 * 1024) return EFBIG;
         char canonical[PATH_MAX];
@@ -204,7 +243,12 @@ static int addServiceJobs(NSString *root, const char *const labels[], NSMutableD
         NSString *logName = [label stringByAppendingString:@".log"];
         NSString *log = [@"/private/var/mobile/Library/Logs" stringByAppendingPathComponent:logName];
         NSMutableDictionary *job = [@{@"Label": label, @"WorkingDirectory": @"/private/var/mobile/",
-            @"StandardOutPath": log, @"StandardErrorPath": log, @"RunAtLoad": @YES, @"KeepAlive": @NO, @"EnableTransactions": @NO} mutableCopy];
+            @"StandardOutPath": log, @"StandardErrorPath": log, @"RunAtLoad": launchAngel ? @NO : @YES, @"KeepAlive": @NO,
+            @"EnableTransactions": @NO} mutableCopy];
+        if (launchAngel) {
+            int error = addLaunchAngelPolicy(stock, job);
+            if (error) return error;
+        }
         if (program) job[@"Program"] = program;
         if (arguments) job[@"ProgramArguments"] = arguments;
         if (services) job[@"MachServices"] = services;
@@ -234,6 +278,11 @@ static int addServiceJobs(NSString *root, const char *const labels[], NSMutableD
             // Icon rendering needs the matching simulator resources and its own PID-domain shader compiler.
             safeEnvironment[@"LSB_REGISTER_METAL_COMPILER"] = @"1";
             safeEnvironment[@"LSB_SIMULATE_FRAMEWORK_BUNDLES"] = @"1";
+        }
+        if ([label isEqualToString:@"com.apple.PosterBoard"] &&
+            [effectiveProgram isEqualToString:@"/Applications/PosterBoard.app/PosterBoard"]) {
+            // Poster provider discovery needs its own PID-domain service, just like SpringBoard's ExtensionKit clients.
+            safeEnvironment[@"LSB_REGISTER_EXTENSIONKIT"] = @"1";
         }
         if (safeEnvironment.count) job[@"EnvironmentVariables"] = safeEnvironment;
         NSData *jobData = [NSPropertyListSerialization dataWithPropertyList:job format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];

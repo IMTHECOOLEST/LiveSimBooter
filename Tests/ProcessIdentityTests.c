@@ -298,11 +298,14 @@ static void testUIFrameworkCallerIdentity(void) {
     const struct { const char *name, *install; char *configured; } frameworks[] = {
         {"UIKitCore", uiKitCoreInstallPath, nativeUIKitCorePath},
         {"FrontBoardServices", frontBoardServicesInstallPath, nativeFrontBoardServicesPath},
-        {"BackBoardServices", backBoardServicesInstallPath, nativeBackBoardServicesPath}
+        {"BackBoardServices", backBoardServicesInstallPath, nativeBackBoardServicesPath},
+        {"ExtensionFoundation", extensionFoundationInstallPath, nativeExtensionFoundationPath}
     };
     const char *root = "/private/var/mobile/Group/RuntimeRoot";
     for (unsigned framework = 0; framework < sizeof(frameworks) / sizeof(*frameworks); ++framework) {
         const char *name = frameworks[framework].name, *install = frameworks[framework].install;
+        const char *directory = strstr(install, "/PrivateFrameworks/") ? "PrivateFrameworks" : "Frameworks";
+        const char *otherDirectory = !strcmp(directory, "Frameworks") ? "PrivateFrameworks" : "Frameworks";
         char physical[PATH_MAX], unrelated[PATH_MAX];
         assert(snprintf(physical, sizeof(physical), "%s%s", root, install) < (int)sizeof(physical));
         assert(!setenv("DYLD_ROOT_PATH", root, 1));
@@ -317,14 +320,14 @@ static void testUIFrameworkCallerIdentity(void) {
             forgetNativeIdentityImage(header);
             assert(!callerNeedsNativeIdentity(0x5000));
         }
-        const char *invalidPaths[] = {"/Plugins/%1$s", "/System/Library/Frameworks/%1$s.framework/%1$s",
-            "/System/Library/PrivateFrameworks/%1$s.framework/%1$sHelper", "/System/Library/PrivateFrameworks/Other.framework/%1$s",
-            "/System/Library/PrivateFrameworks/%1$s.framework/../%1$s", "/System//Library/PrivateFrameworks/%1$s.framework/%1$s",
-            "/System/Library/PrivateFrameworks/%1$s.framework/./%1$s", "/System/Library/PrivateFrameworks/%1$s.framework/%1$s/",
-            "/private/var/mobile/Group/RuntimeRoot-other/System/Library/PrivateFrameworks/%1$s.framework/%1$s",
-            "/OtherRoot/System/Library/PrivateFrameworks/%1$s.framework/%1$s"};
+        const char *invalidPaths[] = {"/Plugins/%1$s", "/System/Library/%3$s/%1$s.framework/%1$s",
+            "/System/Library/%2$s/%1$s.framework/%1$sHelper", "/System/Library/%2$s/Other.framework/%1$s",
+            "/System/Library/%2$s/%1$s.framework/../%1$s", "/System//Library/%2$s/%1$s.framework/%1$s",
+            "/System/Library/%2$s/%1$s.framework/./%1$s", "/System/Library/%2$s/%1$s.framework/%1$s/",
+            "/private/var/mobile/Group/RuntimeRoot-other/System/Library/%2$s/%1$s.framework/%1$s",
+            "/OtherRoot/System/Library/%2$s/%1$s.framework/%1$s"};
         for (unsigned i = 0; i < sizeof(invalidPaths) / sizeof(*invalidPaths); ++i) {
-            assert(snprintf(unrelated, sizeof(unrelated), invalidPaths[i], name) < (int)sizeof(unrelated));
+            assert(snprintf(unrelated, sizeof(unrelated), invalidPaths[i], name, directory, otherDirectory) < (int)sizeof(unrelated));
             rememberNativeIdentityImage(header, 0, unrelated);
             assert(!callerNeedsNativeIdentity(0x1000) && LSBGetPID() == 123);
         }
@@ -344,7 +347,7 @@ static void testUIFrameworkCallerIdentity(void) {
     }
     assert(!unsetenv("DYLD_ROOT_PATH"));
     initializeIdentity();
-    assert(!nativeUIKitCorePath[0] && !nativeFrontBoardServicesPath[0] && !nativeBackBoardServicesPath[0] && LSBGetPID() == 123);
+    assert(!nativeUIKitCorePath[0] && !nativeFrontBoardServicesPath[0] && !nativeBackBoardServicesPath[0] && !nativeExtensionFoundationPath[0] && LSBGetPID() == 123);
 }
 
 int main(void) {

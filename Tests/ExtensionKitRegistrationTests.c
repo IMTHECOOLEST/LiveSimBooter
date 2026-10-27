@@ -100,6 +100,16 @@ int main(void) {
     expect("1", alias, candidate, 0, true);
     assert(!strcmp(registeredPath, bundle));
 
+    // PosterBoard discovers system poster providers through the same per-process ExtensionKit service.
+    char posterDirectory[PATH_MAX], poster[PATH_MAX];
+    join(posterDirectory, root, "Applications/PosterBoard.app"); makeDirectory(posterDirectory);
+    join(poster, posterDirectory, "PosterBoard"); makeFile(poster);
+    expect("1", root, poster, 0, true);
+    join(candidate, alias, "Applications/PosterBoard.app/../PosterBoard.app/PosterBoard");
+    expect("1", alias, candidate, 0, true);
+    join(candidate, posterDirectory, "PosterBoardOther"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+
     // Inherited options never register the service, proxy, launchd, unrelated, or merely prefix-matching executables.
     expect("1", root, service, 0, false);
     const char *otherRoles[] = {"launchd_sim", "xpcproxy_sim", "backboardd", "SpringBoard-other", "df"};
@@ -111,6 +121,9 @@ int main(void) {
     join(outside, canonical, "RuntimeRoot-other"); makeDirectory(outside);
     join(outsideFile, outside, "SpringBoard"); makeFile(outsideFile);
     expect("1", root, outsideFile, 0, false);
+    assert(!unlink(poster) && !symlink(outsideFile, poster));
+    expect("1", root, poster, 0, false);
+    assert(!unlink(poster)); makeFile(poster);
     assert(!unlink(executable) && !symlink(outsideFile, executable));
     expect("1", root, executable, 0, false);
     assert(!unlink(executable)); makeFile(executable);
@@ -136,7 +149,7 @@ int main(void) {
     assert(!symlink(outsideFile, service)); expect("1", root, executable, ELOOP, false);
     assert(!unlink(service)); makeFile(service);
     expect("1", root, executable, 0, true);
-    assert(registrations == 3);
+    assert(registrations == 5);
     removeTree(canonical);
     puts("ExtensionKitRegistration: opt-in, canonical executable roles, contained bundle, regular files and exact registration passed");
     return 0;

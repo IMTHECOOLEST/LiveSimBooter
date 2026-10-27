@@ -1644,7 +1644,7 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
                                   "com.apple.fontservicesd", "com.apple.containermanagerd.system", "com.apple.distnoted.xpc.daemon",
                                   "com.apple.configd_sim", "com.apple.sleepd", "com.apple.systemstatusd", "com.apple.SpringBoard",
                                   "com.apple.iconservices.iconservicesagent", "com.apple.TextInput.kbd", "com.apple.assistantd",
-                                  NULL};
+                                  "com.apple.PosterBoard", NULL};
         enableIndigo = YES;
         const char *const *labels = argc > 2 ? argv + 2 : defaults;
         int error = LSBPrepareLaunchdServicesPlan(message, runtimeRoot.fileSystemRepresentation, envp, labels);

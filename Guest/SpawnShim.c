@@ -36,7 +36,7 @@ _Static_assert(sizeof(sigset_t) == sizeof(uint32_t), "Spawn wire signal sets req
 // XNU bsd/sys/spawn_internal.h and bsd/sys/resource_private.h define these scheduler hints.
 // https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/spawn_internal.h#L328-L345
 // https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/resource_private.h#L134-L142
-enum { NativeProcessTypeAppDefault = 0x100, NativeProcessTypeDaemonAdaptive = 0x600, NativeDarwinRoleUIFocal = 1 };
+enum { NativeProcessTypeAppDefault = 0x100, NativeProcessTypeDaemonAdaptive = 0x600, NativeDarwinRoleUIFocal = 1, NativeDarwinRoleUI = 2 };
 // Private allocator hint, distinct from POSIX_SPAWN_SETSID (0x0400). XNU only adds apple[] "nanozone=1" for this bit.
 // https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_exec.c#L5987-L5999
 enum { NativeSpawnNanoAllocator = 0x0200 };
@@ -87,12 +87,15 @@ static int readAttributes(LSBSpawnPlan *plan, const posix_spawnattr_t *attribute
     }
     error = LSBReadAdditionalSpawnAttributes(attributes, additional);
     if (error) return error;
-    // The extension keeps its native scheduler policy. Accept stock launchd's daemon and foreground-app hints without applying them.
+    // The extension keeps its native scheduler policy. Accept stock launchd's daemon and visible-app hints without applying them.
+    // 23A343 launchd_sim +0x5a2c defaults App jobs to PRIO_DARWIN_ROLE_UI (2), whose focal status is unspecified.
+    // Role definitions: https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/resource_private.h#L134-L142
+    bool visibleAppRole = additional->darwinRole == NativeDarwinRoleUIFocal || additional->darwinRole == NativeDarwinRoleUI;
     bool appHints = additional->processType == NativeProcessTypeAppDefault &&
-                    (additional->darwinRole == 0 || additional->darwinRole == NativeDarwinRoleUIFocal);
+                    (additional->darwinRole == 0 || visibleAppRole);
     bool defaultHints = (additional->processType == 0 || additional->processType == NativeProcessTypeDaemonAdaptive) && additional->darwinRole == 0;
-    // xpcproxy_sim carries UI_FOCAL into SETEXEC without requesting a new process type for the replacement image.
-    bool inheritedAppHints = (flags & POSIX_SPAWN_SETEXEC) && additional->processType == 0 && additional->darwinRole == NativeDarwinRoleUIFocal;
+    // xpcproxy_sim carries the app's role into SETEXEC without requesting a new process type for the replacement image.
+    bool inheritedAppHints = (flags & POSIX_SPAWN_SETEXEC) && additional->processType == 0 && visibleAppRole;
     if (!appHints && !defaultHints && !inheritedAppHints) {
         SPAWN_TRACE("[spawn-trace] unsupported process-type=0x%x darwin-role=0x%x flags=0x%x\n",
                     additional->processType, additional->darwinRole, plan->spawnFlags);

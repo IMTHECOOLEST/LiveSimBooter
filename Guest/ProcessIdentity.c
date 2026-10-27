@@ -23,6 +23,7 @@ static char nativeFrontBoardPath[PATH_MAX];
 static char nativeUIKitCorePath[PATH_MAX];
 static char nativeFrontBoardServicesPath[PATH_MAX];
 static char nativeBackBoardServicesPath[PATH_MAX];
+static char nativeExtensionFoundationPath[PATH_MAX];
 static const char baseBoardInstallPath[] = "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
 static const char runningBoardServicesInstallPath[] =
     "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
@@ -30,7 +31,7 @@ static const char frontBoardInstallPath[] = "/System/Library/PrivateFrameworks/F
 static const char uiKitCoreInstallPath[] = "/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore";
 static const char frontBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices";
 static const char backBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices";
-
+static const char extensionFoundationInstallPath[] = "/System/Library/Frameworks/ExtensionFoundation.framework/ExtensionFoundation";
 static void configureNativeImagePath(char path[PATH_MAX], const char *suffix) {
     path[0] = '\0';
     const char *root = getenv("DYLD_ROOT_PATH");
@@ -86,8 +87,12 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
     // Those identities, and the delivery-policy self comparison at +0x183f0, must match the kernel audit PID used by the event client.
     bool backBoardServices = !strcmp(path, backBoardServicesInstallPath) ||
         (nativeBackBoardServicesPath[0] && !strcmp(path, nativeBackBoardServicesPath));
+    // 23A343 ExtensionFoundation +0x5c658 feeds getpid into the RBS host identifier for _EXHostConfiguration.rbsProcessIdentity.
+    // Its extension identity must name the same native process that RunningBoard resolves from audit tokens and task handles.
+    bool extensionFoundation = !strcmp(path, extensionFoundationInstallPath) ||
+        (nativeExtensionFoundationPath[0] && !strcmp(path, nativeExtensionFoundationPath));
     if (strcmp(leaf + 1, "libxpc.dylib") && !notifyd && !baseBoard && !runningBoard && !frontBoard &&
-        !uiKitCore && !frontBoardServices && !backBoardServices) return;
+        !uiKitCore && !frontBoardServices && !backBoardServices && !extensionFoundation) return;
     const struct mach_header_64 *header = (const struct mach_header_64 *)image;
     const unsigned char *command = (const unsigned char *)(header + 1), *end = command + header->sizeofcmds;
     forgetNativeIdentityImage(image);
@@ -162,6 +167,7 @@ __attribute__((constructor)) static void initializeIdentity(void) {
     configureNativeImagePath(nativeUIKitCorePath, uiKitCoreInstallPath);
     configureNativeImagePath(nativeFrontBoardServicesPath, frontBoardServicesInstallPath);
     configureNativeImagePath(nativeBackBoardServicesPath, backBoardServicesInstallPath);
+    configureNativeImagePath(nativeExtensionFoundationPath, extensionFoundationInstallPath);
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);

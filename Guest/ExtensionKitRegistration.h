@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 
-// Register the fixed runtime ExtensionKit service bundle only for an explicitly enabled, canonical SpringBoard executable.
+// Register the fixed runtime ExtensionKit bundle only for explicitly enabled, canonical SpringBoard or PosterBoard executables.
 // Returns errno on validation failure; requested means the void XPC call returned, not that the service was launched.
 int LSBRegisterExtensionKitForExecutable(const char *enabled, const char *runtimeRoot, const char *executablePath, bool *requested);
 

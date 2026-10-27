@@ -41,6 +41,12 @@ static NSDictionary *readPlist(NSString *path) {
     return [NSPropertyListSerialization propertyListWithData:[NSData dataWithContentsOfFile:path] options:NSPropertyListImmutable format:NULL error:NULL];
 }
 
+static void assertPlistBoolean(id value, BOOL expected) {
+    // NSNumber's boolValue/isEqual accept integer 0/1 too, but launchd requires the serialized Boolean type.
+    assert(value && CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID());
+    assert([value boolValue] == expected);
+}
+
 static void testDeviceProfile(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
     const char *overrides[] = {"SIMULATOR_PRODUCT_CLASS=D83", "SIMULATOR_MODEL_IDENTIFIER=iPhone16,1", "SIMULATOR_PRODUCT_CLASS=ignored", NULL};
     assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, overrides));
@@ -99,7 +105,8 @@ static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *da
     assert([job[@"WorkingDirectory"] isEqualToString:@"/private/var/mobile/"]);
     assert([job[@"StandardOutPath"] isEqualToString:@"/private/var/mobile/Library/Logs/df.log"] &&
            [job[@"StandardErrorPath"] isEqualToString:job[@"StandardOutPath"]]);
-    assert([job[@"RunAtLoad"] boolValue] && ![job[@"KeepAlive"] boolValue]);
+    assertPlistBoolean(job[@"RunAtLoad"], YES);
+    assertPlistBoolean(job[@"KeepAlive"], NO);
     struct stat originalJob, originalConfig, status;
     assert(!stat(jobPath.fileSystemRepresentation, &originalJob) && S_ISREG(originalJob.st_mode));
     assert(originalJob.st_uid == geteuid() && (originalJob.st_mode & 0777) == 0600);
@@ -280,7 +287,7 @@ static NSDictionary *snapshotDirectory(NSString *directory) {
 }
 
 static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
-    enum { capacity = 14 };
+    enum { capacity = 16 };
     assert(capacity + 3 < LSB_CHILD_STATUS_CAPACITY);
     NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
     char names[capacity + 1][64];
@@ -384,6 +391,115 @@ static void testIconServicesGraphics(LSBReceivedMessage *message, NSString *root
     }
 }
 
+static void testPosterBoardDiscovery(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    NSString *program = @"/Applications/PosterBoard.app/PosterBoard";
+    NSArray<NSDictionary *> *cases = @[
+        @{@"Label": @"com.apple.PosterBoard", @"ProgramArguments": @[program], @"expected": @YES},
+        @{@"Label": @"com.apple.PosterBoard", @"Program": program, @"expected": @YES},
+        @{@"Label": @"com.apple.PosterBoard", @"Program": program, @"ProgramArguments": @[@"different-argv0"], @"expected": @YES},
+        @{@"Label": @"com.apple.PosterBoard", @"Program": @"/bin/df", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": @"com.apple.PosterBoard", @"ProgramArguments": @[[program stringByAppendingString:@"Other"]], @"expected": @NO},
+        @{@"Label": @"com.apple.posterboard", @"ProgramArguments": @[program], @"expected": @NO},
+        @{@"Label": @"com.kdt.other-poster", @"ProgramArguments": @[program], @"expected": @NO}
+    ];
+    for (NSDictionary *test in cases) {
+        NSString *label = test[@"Label"], *filename = [label stringByAppendingString:@".plist"];
+        NSString *path = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
+        NSMutableDictionary *stock = test.mutableCopy;
+        [stock removeObjectForKey:@"expected"];
+        stock[@"EnvironmentVariables"] = @{@"LSB_REGISTER_EXTENSIONKIT": @"untrusted", @"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS": @"1"};
+        assert([stock writeToFile:path atomically:YES]);
+        const char *selected[] = {label.UTF8String, NULL};
+        assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+        NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+        NSString *directory = [bootstrap[@"Paths"] firstObject];
+        NSDictionary *environment = readPlist([directory stringByAppendingPathComponent:filename])[@"EnvironmentVariables"];
+        if ([test[@"expected"] boolValue]) assert([environment[@"LSB_REGISTER_EXTENSIONKIT"] isEqual:@"1"]);
+        else assert(!environment[@"LSB_REGISTER_EXTENSIONKIT"]);
+        assert(!environment[@"LSB_SIMULATE_SPRINGBOARD_ENTITLEMENTS"]);
+        assert(!environmentValue(&message->plan, "LSB_REGISTER_EXTENSIONKIT"));
+        for (NSString *scope in @[@"Self", @"Child"]) assert(!bootstrap[scope][@"LSB_REGISTER_EXTENSIONKIT"]);
+        dispose(message);
+        assert([NSFileManager.defaultManager removeItemAtPath:path error:NULL]);
+    }
+}
+
+static void testLaunchAngelJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
+    NSString *directory = [root stringByAppendingPathComponent:@"System/Library/LaunchAngels"];
+    assert([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:NULL]);
+    NSString *filename = @"com.apple.PosterBoard.plist", *path = [directory stringByAppendingPathComponent:filename];
+    NSDictionary *runningBoard = @{@"Managed": @YES, @"Reported": @YES};
+    NSDictionary *stock = @{
+        @"Label": @"com.apple.PosterBoard", @"ProgramArguments": @[@"/Applications/PosterBoard.app/PosterBoard"],
+        @"RunAtLoad": @NO, @"KeepAlive": @NO, @"EnableTransactions": @NO, @"EnablePressuredExit": @NO,
+        @"ProcessType": @"App", @"POSIXSpawnType": @"App", @"UserName": @"mobile",
+        @"MachServices": @{@"com.apple.posterboardservices.services": @{@"_ExperimentalNonLaunching": @YES}},
+        @"_AdditionalProperties": @{@"RunningBoard": runningBoard, @"UnrelatedPolicy": @YES},
+        @"EnvironmentVariables": @{@"MallocNanoZone": @"0", @"HOME": @"/wrong", @"LSB_FAKE_PTY_STATE": @"/wrong"}
+    };
+    assert([stock writeToFile:path atomically:YES]);
+    // Merely being in LaunchAngels never selects an application.
+    assert(([@{@"Label": @"com.kdt.unselected", @"ProgramArguments": @[@"/bin/df"]}
+        writeToFile:[directory stringByAppendingPathComponent:@"com.kdt.unselected.plist"] atomically:YES]));
+    NSString *workerFilename = @"com.kdt.startup-worker.plist";
+    NSString *workerPath = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:workerFilename];
+    assert(([@{@"Label": @"com.kdt.startup-worker", @"ProgramArguments": @[@"/usr/libexec/launchctl-control-worker"]}
+        writeToFile:workerPath atomically:YES]));
+    const char *selected[] = {"com.apple.PosterBoard", "com.apple.notifyd", "com.kdt.startup-worker", NULL};
+    assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
+    NSString *generated = [readPlist(configPath)[@"Bootstrap"][@"Paths"] firstObject];
+    NSDictionary *job = readPlist([generated stringByAppendingPathComponent:filename]);
+    for (NSString *key in @[@"ProgramArguments", @"MachServices", @"RunAtLoad", @"KeepAlive", @"EnableTransactions",
+                            @"EnablePressuredExit", @"ProcessType", @"POSIXSpawnType"]) assert([job[key] isEqual:stock[key]]);
+    assertPlistBoolean(job[@"RunAtLoad"], NO);
+    assert(([job[@"_AdditionalProperties"] isEqual:@{@"RunningBoard": runningBoard}]));
+    assert(!job[@"UserName"] && !job[@"GroupName"]);
+    assert(([job[@"EnvironmentVariables"] isEqual:@{@"MallocNanoZone": @"0", @"LSB_REGISTER_EXTENSIONKIT": @"1"}]));
+    assert([job[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/com.apple.PosterBoard.log"]);
+    assert([job[@"StandardErrorPath"] isEqual:job[@"StandardOutPath"]]);
+    assert([job[@"WorkingDirectory"] isEqual:@"/private/var/mobile/"]);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:generated error:NULL].count == 6);
+    assert(![NSFileManager.defaultManager fileExistsAtPath:[generated stringByAppendingPathComponent:@"com.kdt.unselected.plist"]]);
+    NSDictionary *daemon = readPlist([generated stringByAppendingPathComponent:@"com.apple.notifyd.plist"]);
+    assert([daemon[@"RunAtLoad"] boolValue] && ![daemon[@"KeepAlive"] boolValue] && !daemon[@"_AdditionalProperties"]);
+    assertPlistBoolean(daemon[@"RunAtLoad"], YES);
+    NSDictionary *worker = readPlist([generated stringByAppendingPathComponent:workerFilename]);
+    assert(!worker[@"MachServices"] && [worker[@"ProgramArguments"] isEqual:@[@"/usr/libexec/launchctl-control-worker"]]);
+    assertPlistBoolean(worker[@"RunAtLoad"], YES); // Without a demand service, a numeric 1 silently leaves this worker unstarted.
+    dispose(message);
+
+    // Reject unsupported on-demand policies before publishing any output, while preserving the prior working selection.
+    NSDictionary *prior = snapshotDirectory(dataPath);
+    NSArray *invalid = @[
+        @{@"RunAtLoad": @YES}, @{@"KeepAlive": @YES}, @{@"EnableTransactions": @YES}, @{@"EnablePressuredExit": @YES},
+        @{@"ProcessType": @"Interactive"}, @{@"POSIXSpawnType": @"Interactive"},
+        @{@"RunAtLoad": @"false"}, @{@"KeepAlive": @{}}, @{@"EnablePressuredExit": @0}, @{@"ProcessType": @YES},
+        @{@"_AdditionalProperties": @[]}, @{@"_AdditionalProperties": @{@"RunningBoard": @YES}},
+        @{@"_AdditionalProperties": @{@"RunningBoard": @{@"Managed": @"true"}}}
+    ];
+    for (NSUInteger i = 0; i < invalid.count; ++i) {
+        NSMutableDictionary *malformed = stock.mutableCopy;
+        [malformed addEntriesFromDictionary:invalid[i]];
+        assert([malformed writeToFile:path atomically:YES]);
+        assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected) == (i < 6 ? ENOTSUP : EINVAL));
+        assertUnchanged(message);
+        assert([snapshotDirectory(dataPath) isEqual:prior]);
+    }
+    assert([stock writeToFile:path atomically:YES]);
+    NSString *daemonPath = [[root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"] stringByAppendingPathComponent:filename];
+    assert(!symlink(path.fileSystemRepresentation, daemonPath.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected) == ELOOP);
+    assertUnchanged(message);
+    assert(!unlink(daemonPath.fileSystemRepresentation));
+    assert(!unlink(path.fileSystemRepresentation));
+    assert(!symlink(configPath.fileSystemRepresentation, path.fileSystemRepresentation));
+    assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected) == ELOOP);
+    assertUnchanged(message);
+    assert([snapshotDirectory(dataPath) isEqual:prior]);
+    assert(!unlink(path.fileSystemRepresentation));
+    assert([stock writeToFile:path atomically:YES]);
+}
+
 static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
     NSString *stockDirectory = [root stringByAppendingPathComponent:@"System/Library/LaunchDaemons"];
     NSString *notifyPath = [stockDirectory stringByAppendingPathComponent:@"com.apple.notifyd.plist"];
@@ -428,6 +544,7 @@ static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSStrin
     assert([job[@"PublishesEvents"] isEqual:notify[@"PublishesEvents"]]);
     assert(([job[@"EnvironmentVariables"] isEqual:@{@"ASL_DISABLE": @"1", @"DEBUGSCOPE": @"normal"}]));
     assert([job[@"RunAtLoad"] boolValue] && ![job[@"KeepAlive"] boolValue] && ![job[@"EnableTransactions"] boolValue]);
+    assertPlistBoolean(job[@"RunAtLoad"], YES);
     for (NSString *key in @[@"UserName", @"GroupName", @"POSIXSpawnType", @"EnablePressuredExit", @"LimitLoadToSessionType",
                             @"LaunchEvents", @"HardResourceLimits"]) assert(!job[key]);
     assert([job[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/com.apple.notifyd.log"]);
@@ -492,6 +609,8 @@ static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSStrin
     testServiceCapacity(message, root, dataPath, configPath);
     testSpringBoardResources(message, root, configPath);
     testIconServicesGraphics(message, root, configPath);
+    testPosterBoardDiscovery(message, root, configPath);
+    testLaunchAngelJobs(message, root, dataPath, configPath);
 }
 
 static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath) {
