@@ -51,6 +51,20 @@ static void makeFile(const char *path) {
     assert(descriptor >= 0 && write(descriptor, "fixture", 7) == 7 && !close(descriptor));
 }
 
+static void makeAppInfo(const char *path, CFStringRef name, CFStringRef type, CFPropertyListFormat format) {
+    const void *keys[] = {CFSTR("CFBundleExecutable"), CFSTR("CFBundlePackageType")};
+    const void *values[] = {name, type};
+    CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    assert(info);
+    CFDataRef data = CFPropertyListCreateData(NULL, info, format, 0, NULL);
+    assert(data);
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    assert(descriptor >= 0 && write(descriptor, CFDataGetBytePtr(data), (size_t)CFDataGetLength(data)) == CFDataGetLength(data));
+    assert(!close(descriptor));
+    CFRelease(data);
+    CFRelease(info);
+}
+
 static void removeTree(char *path) {
     char *paths[] = {path, NULL};
     FTS *tree = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
@@ -88,6 +102,9 @@ int main(void) {
     char springboard[PATH_MAX], springboardDirectory[PATH_MAX];
     join(springboardDirectory, root, "System/Library/CoreServices/SpringBoard.app"); makeDirectory(springboardDirectory);
     join(springboard, springboardDirectory, "SpringBoard"); makeFile(springboard);
+    char springboardInfo[PATH_MAX];
+    join(springboardInfo, springboardDirectory, "Info.plist");
+    makeAppInfo(springboardInfo, CFSTR("SpringBoard"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
     char iconservices[PATH_MAX];
     join(iconservices, root, "System/Library/CoreServices/iconservicesagent"); makeFile(iconservices);
     join(bundle, root, "System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc"); makeDirectory(bundle);
@@ -178,7 +195,94 @@ int main(void) {
     assert(!unlink(compiler)); makeFile(compiler);
     expectRoles(root, executable, springboard, iconservices, 0, true);
     assert(registrations == 9);
+
+    char app[PATH_MAX], appMain[PATH_MAX], appInfo[PATH_MAX];
+    join(app, root, "Applications/Contacts.app"); makeDirectory(app);
+    join(appMain, app, "Contacts"); makeFile(appMain);
+    join(appInfo, app, "Info.plist");
+    makeAppInfo(appInfo, CFSTR("Contacts"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
+    expect("1", root, appMain, 0, true);
+    assert(!strcmp(registeredPath, bundle));
+    join(candidate, alias, "Applications/Contacts.app/Contacts");
+    expect("1", alias, candidate, 0, true);
+    makeAppInfo(appInfo, CFSTR("Contacts"), CFSTR("APPL"), kCFPropertyListBinaryFormat_v1_0);
+    expect("1", root, appMain, 0, true);
+
+    // An app's other binaries and nested app/XPC services cannot inherit its compiler registration.
+    join(candidate, app, "Helper"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+    char nested[PATH_MAX];
+    join(nested, app, "PlugIns/Widget.app"); makeDirectory(nested);
+    join(candidate, nested, "Widget"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+    const char *invalidLocations[] = {"Applications-other/Fake.app", "Applications/Fake.app-other", "Applications/Fake",
+                                    "Applications/Folder/Fake.app", "System/Library/CoreServices-other/Fake.app",
+                                    "System/Library/PrivateFrameworks/Fake.app", "usr/libexec/Fake.app"};
+    for (unsigned i = 0; i < sizeof(invalidLocations) / sizeof(*invalidLocations); ++i) {
+        join(nested, root, invalidLocations[i]); makeDirectory(nested);
+        join(candidate, nested, "Fake"); makeFile(candidate);
+        expect("1", root, candidate, 0, false);
+    }
+
+    // Main executables need a valid, bounded APPL Info.plist, including binary plists; a filename convention is insufficient.
+    makeAppInfo(appInfo, CFSTR("Helper"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
+    expect("1", root, appMain, 0, false);
+    makeAppInfo(appInfo, CFSTR("Contacts"), CFSTR("XPC!"), kCFPropertyListXMLFormat_v1_0);
+    expect("1", root, appMain, EINVAL, false);
+    makeAppInfo(appInfo, CFSTR("../Contacts"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
+    expect("1", root, appMain, EINVAL, false);
+    makeFile(appInfo); expect("1", root, appMain, EINVAL, false);
+    assert(!truncate(appInfo, 0)); expect("1", root, appMain, EINVAL, false);
+    assert(!truncate(appInfo, 1024 * 1024 + 1)); expect("1", root, appMain, EINVAL, false);
+    assert(!unlink(appInfo)); expect("1", root, appMain, ENOENT, false);
+    assert(!symlink(info, appInfo)); expect("1", root, appMain, ELOOP, false);
+    assert(!unlink(appInfo) && !mkfifo(appInfo, 0600)); expect("1", root, appMain, EINVAL, false);
+    assert(!unlink(appInfo) && !mkdir(appInfo, 0700)); expect("1", root, appMain, EINVAL, false);
+    assert(!rmdir(appInfo));
+    makeAppInfo(appInfo, CFSTR("Contacts"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
+    assert(!unlink(appMain) && !mkdir(appMain, 0700)); expect("1", root, appMain, EINVAL, false);
+    assert(!rmdir(appMain)); makeFile(appMain);
+
+    // Canonical app targets cannot escape the runtime or be selected only by a neighboring root's prefix.
+    assert(!unlink(appMain) && !symlink(outsideFile, appMain));
+    expect("1", root, appMain, 0, false);
+    assert(!unlink(appMain)); makeFile(appMain);
+    join(nested, outside, "Applications/Contacts.app"); makeDirectory(nested);
+    join(candidate, nested, "Contacts"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+
+    char coreApp[PATH_MAX], coreMain[PATH_MAX], coreInfo[PATH_MAX];
+    join(coreApp, root, "System/Library/CoreServices/Example.app"); makeDirectory(coreApp);
+    join(coreMain, coreApp, "ActualMain"); makeFile(coreMain);
+    join(coreInfo, coreApp, "Info.plist");
+    makeAppInfo(coreInfo, CFSTR("ActualMain"), CFSTR("APPL"), kCFPropertyListBinaryFormat_v1_0);
+    expect("1", root, coreMain, 0, true);
+    join(candidate, coreApp, "Example"); makeFile(candidate);
+    expect("1", root, candidate, 0, false);
+
+    join(nested, root, "System/Applications/Image Playground.app"); makeDirectory(nested);
+    join(candidate, nested, "Image Playground"); makeFile(candidate);
+    char systemAppInfo[PATH_MAX];
+    join(systemAppInfo, nested, "Info.plist");
+    makeAppInfo(systemAppInfo, CFSTR("Image Playground"), CFSTR("APPL"), kCFPropertyListBinaryFormat_v1_0);
+    expect("1", root, candidate, 0, true);
+    const UniChar nulName[] = {'C', 'o', 'n', 't', 'a', 'c', 't', 's', 0, 'x'};
+    CFStringRef embeddedNUL = CFStringCreateWithCharacters(NULL, nulName, sizeof(nulName) / sizeof(*nulName));
+    makeAppInfo(appInfo, embeddedNUL, CFSTR("APPL"), kCFPropertyListBinaryFormat_v1_0);
+    CFRelease(embeddedNUL);
+    expect("1", root, appMain, 0, false);
+    makeAppInfo(appInfo, CFSTR("Contacts"), CFSTR("APPL"), kCFPropertyListXMLFormat_v1_0);
+
+    // The newly eligible app roles retain exactly the same compiler bundle and file validation.
+    assert(!rename(bundle, moved) && !symlink(moved, bundle));
+    expect("1", root, appMain, EPERM, false);
+    expect("1", root, coreMain, EPERM, false);
+    assert(!unlink(bundle) && !rename(moved, bundle));
+    assert(!unlink(compiler)); expect("1", root, appMain, ENOENT, false);
+    makeFile(compiler);
+    expect("1", root, appMain, 0, true);
+    assert(registrations == 15);
     removeTree(canonical);
-    puts("MetalCompilerRegistration: opt-in, canonical executable roles, contained bundle, regular files and exact registration passed");
+    puts("MetalCompilerRegistration: opt-in, canonical roles/app mains, contained bundle, regular files and exact registration passed");
     return 0;
 }

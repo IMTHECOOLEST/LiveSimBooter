@@ -1,5 +1,6 @@
 #include "MetalCompilerRegistration.h"
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -28,6 +29,70 @@ static int readableBundleFile(int directory, const char *name) {
     return error;
 }
 
+static int applicationMainExecutable(const char *root, const char *executable, bool *allowed) {
+    *allowed = false;
+    size_t rootLength = strlen(root);
+    if (strncmp(executable, root, rootLength) || executable[rootLength] != '/') return 0;
+    const char *relative = executable + rootLength + 1, *app = NULL;
+    const char *locations[] = {"Applications/", "System/Applications/", "System/Library/CoreServices/"};
+    for (unsigned i = 0; i < sizeof(locations) / sizeof(*locations); ++i) {
+        size_t length = strlen(locations[i]);
+        if (!strncmp(relative, locations[i], length)) { app = relative + length; break; }
+    }
+    if (!app) return 0;
+    const char *separator = strchr(app, '/');
+    if (!separator || separator - app <= 4 || memcmp(separator - 4, ".app", 4)) return 0;
+    const char *name = separator + 1;
+    if (!*name || strchr(name, '/')) return 0;
+
+    char appPath[PATH_MAX];
+    size_t length = (size_t)(separator - executable);
+    memcpy(appPath, executable, length);
+    appPath[length] = 0;
+    int directory = open(appPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) return errno;
+    int descriptor = openat(directory, "Info.plist", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int error = descriptor < 0 ? errno : 0;
+    close(directory);
+    if (error) return error;
+    struct stat metadata;
+    if (fstat(descriptor, &metadata)) error = errno;
+    else if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0 || metadata.st_size > 1024 * 1024) error = EINVAL;
+    size_t size = error ? 0 : (size_t)metadata.st_size;
+    uint8_t *bytes = error ? NULL : malloc(size);
+    if (!error && !bytes) error = ENOMEM;
+    size_t offset = 0;
+    while (!error && offset < size) {
+        ssize_t count = read(descriptor, bytes + offset, size - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) error = count < 0 ? errno : EINVAL;
+        else offset += (size_t)count;
+    }
+    close(descriptor);
+    if (error) { free(bytes); return error; }
+    CFDataRef data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, bytes, (CFIndex)size, kCFAllocatorNull);
+    CFPropertyListRef plist = data ? CFPropertyListCreateWithData(kCFAllocatorDefault, data, kCFPropertyListImmutable, NULL, NULL) : NULL;
+    if (!data) error = ENOMEM;
+    else if (!plist || CFGetTypeID(plist) != CFDictionaryGetTypeID()) error = EINVAL;
+    else {
+        CFTypeRef main = CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR("CFBundleExecutable"));
+        CFTypeRef type = CFDictionaryGetValue((CFDictionaryRef)plist, CFSTR("CFBundlePackageType"));
+        char declaredName[PATH_MAX];
+        if (!main || CFGetTypeID(main) != CFStringGetTypeID() || !type || !CFEqual(type, CFSTR("APPL")) ||
+            !CFStringGetCString((CFStringRef)main, declaredName, sizeof(declaredName), kCFStringEncodingUTF8) ||
+            !*declaredName || strchr(declaredName, '/') || !strcmp(declaredName, ".") || !strcmp(declaredName, "..")) error = EINVAL;
+        else {
+            CFStringRef actual = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingUTF8);
+            if (!actual) error = EINVAL;
+            else { *allowed = CFEqual(main, actual); CFRelease(actual); }
+        }
+    }
+    if (plist) CFRelease(plist);
+    if (data) CFRelease(data);
+    free(bytes);
+    return error;
+}
+
 int LSBRegisterMetalCompilerForExecutable(const char *enabled, const char *runtimeRoot, const char *executablePath, bool *requested) {
     if (!requested) return EINVAL;
     *requested = false;
@@ -50,7 +115,12 @@ int LSBRegisterMetalCompilerForExecutable(const char *enabled, const char *runti
         if (error) return error;
         if (!strcmp(executable, expected)) { allowed = true; break; }
     }
-    // An inherited option cannot register a domain for launchd, xpcproxy, the compiler, or an unrelated executable.
+    // Cached Metal's virtual image path cannot import its XPC bundle into a physical app's PID domain. Register only
+    // validated app main executables; inherited options still exclude launchd, xpcproxy, nested services and the compiler.
+    if (!allowed) {
+        error = applicationMainExecutable(root, executable, &allowed);
+        if (error) return error;
+    }
     if (!allowed) return 0;
     if (stat(executable, &metadata)) return errno;
     if (!S_ISREG(metadata.st_mode)) return EINVAL;

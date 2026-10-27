@@ -205,7 +205,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         closeStatus();
         fprintf(stderr, "[LiveProcess] Native worker appeared before handoff: %s\n", strerror(error)); return 1;
     }
-    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 12];
+    const char *arguments[LSB_MAX_VECTOR + 1], *environment[LSB_MAX_VECTOR + 13];
     for (unsigned i = 0; i < launch.plan.argc; ++i) arguments[i] = launch.plan.strings + launch.plan.argv[i];
     arguments[launch.plan.argc] = NULL;
     unsigned count = 0;
@@ -220,6 +220,7 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         if (strncmp(entry, "DYLD_INSERT_LIBRARIES=", 22) && strncmp(entry, "LSB_BROKER_PORT=", 16) &&
             strncmp(entry, "RB_USE_BINARY_ARCHIVE=", sizeof("RB_USE_BINARY_ARCHIVE=") - 1) &&
             strncmp(entry, "LSB_SIMULATE_FRAMEWORK_BUNDLES=", sizeof("LSB_SIMULATE_FRAMEWORK_BUNDLES=") - 1) &&
+            strncmp(entry, "LSB_REGISTER_METAL_COMPILER=", sizeof("LSB_REGISTER_METAL_COMPILER=") - 1) &&
             strncmp(entry, "SIMULATOR_CAPABILITIES=", sizeof("SIMULATOR_CAPABILITIES=") - 1) &&
             strncmp(entry, "LSB_GUEST_PID=", sizeof("LSB_GUEST_PID=") - 1) &&
             strncmp(entry, "LSB_GUEST_PPID=", sizeof("LSB_GUEST_PPID=") - 1) &&
@@ -233,6 +234,8 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
     environment[count++] = "RB_USE_BINARY_ARCHIVE=0";
     // Cached install paths must resolve resources inside RuntimeRoot, including apps that supply a replacement environment.
     environment[count++] = "LSB_SIMULATE_FRAMEWORK_BUNDLES=1";
+    // Apps need the physical compiler bundle imported into their own PID domain; the guest hook validates the executable role.
+    environment[count++] = "LSB_REGISTER_METAL_COMPILER=1";
     // MobileGestalt reads this profile directly. A missing optional profile must not prevent command-line guests from starting.
     environment[count++] = capabilitiesEnvironment;
     environment[count++] = insertLibrary;

@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 
-// Register the fixed compiler bundle only for explicitly enabled, canonical backboardd, SpringBoard or iconservicesagent executables.
+// Register the fixed compiler bundle for enabled canonical graphics roles or declared main executables of contained stock app bundles.
 // Returns errno on validation failure; requested means the void XPC call returned, not that the compiler was launched.
 int LSBRegisterMetalCompilerForExecutable(const char *enabled, const char *runtimeRoot, const char *executablePath, bool *requested);
 

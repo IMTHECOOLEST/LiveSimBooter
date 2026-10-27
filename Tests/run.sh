@@ -104,7 +104,7 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutableAccessTests.c -o "$test_directory/ExecutableAccess"
 "$test_directory/ExecutableAccess"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
-    Tests/MetalCompilerRegistrationTests.c -o "$test_directory/MetalCompilerRegistration"
+    Tests/MetalCompilerRegistrationTests.c -framework CoreFoundation -o "$test_directory/MetalCompilerRegistration"
 "$test_directory/MetalCompilerRegistration"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExtensionKitRegistrationTests.c -o "$test_directory/ExtensionKitRegistration"
