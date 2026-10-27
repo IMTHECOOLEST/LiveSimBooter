@@ -35,6 +35,9 @@ static const char *virtualObject(const char *name, char file[WORKSPACE_OBJECT_FI
     if (!name) return NULL;
     const char *selected;
     if (!strcmp(name, "apple.shm.notification_center") || !strcmp(name, "/apple.shm.notification_center")) selected = objectFile;
+    // 23A343 CoreFoundation _initializeShmemPage:/getShmemName: use snprintf(size=31), truncating the user name's version digit.
+    // __CFXPreferencesDaemon_main enables O_CREAT|O_RDWR; clients open O_RDONLY. The real daemon bypasses the local-daemon sandbox preflight.
+    else if (!strcmp(name, "apple.sim.cfprefs.user.daemonv")) selected = "cfpreferences-user-v1.shm";
     else if (workspaceObjectFile(name, file)) selected = file;
     else return NULL;
     const char *enabled = getenv(LSB_NOTIFICATION_SHM_ENABLE_ENV);

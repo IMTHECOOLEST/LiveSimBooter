@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
@@ -45,7 +46,10 @@ static void testForwarding(void) {
                           "/apple.shm.notification_center/nested", "APPLE.shm.notification_center", "/FBW1:", "/FBW2:",
                           "FBW1:com.apple.frontboard", "//FBW1:com.apple.frontboard", "/FBW0:com.apple.frontboard",
                           "/FBW3:com.apple.frontboard", "/FBW1:com.apple.frontboard.systX", "/FBW1:../other",
-                          "/FBW2:name/nested", "/FBW1:name:other", "/FBW1:name with space", "/FBW1:\xc3\xa9"};
+                          "/FBW2:name/nested", "/FBW1:name:other", "/FBW1:name with space", "/FBW1:\xc3\xa9",
+                          "/apple.sim.cfprefs.user.daemonv", "apple.sim.cfprefs.user.daemonv1", "apple.sim.cfprefs.user.daemon",
+                          "apple.sim.cfprefs.user.daemonv.extra", "apple.sim.cfprefs.system.daemo", "apple.sim.cfprefs.system.daemonv1",
+                          "test.sim.cfprefs.user.daemonv1", "apple.cfprefs.user.daemonv1"};
     assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "1", 1));
     for (unsigned i = 0; i < sizeof(names) / sizeof(*names); ++i) {
         expectedName = names[i]; expectedFlags = O_CREAT | O_RDWR | O_EXCL; expectedMode = 0621;
@@ -53,7 +57,8 @@ static void testForwarding(void) {
         assert(objectOpen(expectedName, expectedFlags, expectedMode) == -1 && errno == ENOSYS);
         assert(objectUnlink(expectedName) == -1 && errno == ENOSYS && forwards == before + 2);
     }
-    const char *disabledNames[] = {"apple.shm.notification_center", "/FBW1:com.apple.frontboard.syst", "/FBW2:other-domain"};
+    const char *disabledNames[] = {"apple.shm.notification_center", "/FBW1:com.apple.frontboard.syst", "/FBW2:other-domain",
+                                   "apple.sim.cfprefs.user.daemonv"};
     expectedFlags = O_RDONLY;
     for (unsigned index = 0; index < sizeof(disabledNames) / sizeof(*disabledNames); ++index) {
         expectedName = disabledNames[index];
@@ -72,6 +77,7 @@ static void testForwarding(void) {
 #endif
 
 static const char *name = "apple.shm.notification_center", *slashName = "/apple.shm.notification_center";
+static const char *preferencesName = "apple.sim.cfprefs.user.daemonv";
 
 static void pathJoin(char result[PATH_MAX], const char *root, const char *suffix) {
     int count = snprintf(result, PATH_MAX, "%s/%s", root, suffix);
@@ -179,6 +185,49 @@ static void testWorkspaceIsolation(const char *root, const char *second) {
     }
 }
 
+static void testPreferenceCounters(const char *root, const char *second) {
+    // Match the daemon's 16 KiB writable counter page and a fresh client's separate read-only open/mapping.
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    assert(objectOpen(preferencesName, O_RDONLY) == -1 && errno == ENOENT);
+    int producer = objectOpen(preferencesName, O_CREAT | O_RDWR, 0644);
+    assert(producer >= 0 && !ftruncate(producer, 16384));
+    volatile uint32_t *counters = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, producer, 0);
+    assert(counters != MAP_FAILED);
+    counters[3393] = 41;
+    int ready[2], update[2];
+    assert(!pipe(ready) && !pipe(update));
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        assert(!close(ready[0]) && !close(update[1]) && !close(producer) && !munmap((void *)counters, 16384));
+        int client = objectOpen(preferencesName, O_RDONLY);
+        assert(client >= 0 && (fcntl(client, F_GETFL) & O_ACCMODE) == O_RDONLY);
+        const volatile uint32_t *observed = mmap(NULL, 16384, PROT_READ, MAP_SHARED, client, 0);
+        assert(observed != MAP_FAILED && observed[3393] == 41);
+        assert(mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, client, 0) == MAP_FAILED);
+        char token = 'r';
+        assert(write(ready[1], &token, 1) == 1 && read(update[0], &token, 1) == 1 && observed[3393] == 42);
+        assert(!munmap((void *)observed, 16384) && !close(client) && !close(ready[1]) && !close(update[0]));
+        _exit(0);
+    }
+    assert(!close(ready[1]) && !close(update[0]));
+    char token;
+    assert(read(ready[0], &token, 1) == 1);
+    counters[3393] = 42;
+    assert(write(update[1], &token, 1) == 1 && !close(ready[0]) && !close(update[1]));
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(!close(producer));
+    int reopened = objectOpen(preferencesName, O_CREAT | O_RDWR, 0644);
+    uint32_t value = 0;
+    assert(reopened >= 0 && !ftruncate(reopened, 16384) && pread(reopened, &value, sizeof(value), 3393 * sizeof(value)) == sizeof(value));
+    assert(value == 42 && !close(reopened)); // A daemon restart reopens the existing object without replacing its counter storage.
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, second, 1));
+    assert(objectOpen(preferencesName, O_RDONLY) == -1 && errno == ENOENT);
+    assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
+    assert(!objectUnlink(preferencesName) && counters[3393] == 42 && !munmap((void *)counters, 16384));
+}
+
 #ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
 static void checkSandbox(const char *name, const char *operation, bool expected) {
     errno = EDOM;
@@ -195,6 +244,7 @@ static void testWorkspaceSandbox(const char *root) {
         checkSandbox(workspace, operations[index], true); // Preflight also works before the first object is created.
         checkSandbox("/FBW2:com.apple.frontboard.syst", operations[index], true);
         checkSandbox(name, operations[index], false); // Notification support does not grant arbitrary SHM preflights.
+        checkSandbox(preferencesName, operations[index], false); // The real preference daemon does not need an access-check exception.
         checkSandbox("/FBW3:com.apple.frontboard.syst", operations[index], false);
         checkSandbox("/FBW1:com.apple.frontboard.systX", operations[index], false);
         checkSandbox("/FBW1:../outside", operations[index], false);
@@ -203,6 +253,7 @@ static void testWorkspaceSandbox(const char *root) {
     checkSandbox(workspace, NULL, false);
     checkSandbox(workspace, "file-read-data", false);
     checkSandbox(workspace, "ipc-posix-shm-read-data.extra", false);
+    checkSandbox(preferencesName, "ipc-posix-shm-write-data", false);
     assert(access(object, F_OK) == -1 && errno == ENOENT); // Access queries have no creation side effect.
     assert(!setenv(LSB_NOTIFICATION_SHM_ENABLE_ENV, "0", 1));
     checkSandbox(workspace, operations[0], false);
@@ -255,9 +306,12 @@ int main(void) {
     testMappings(root, name, slashName);
     testMappings(root, "/FBW1:com.apple.frontboard.syst", "/FBW1:com.apple.frontboard.syst");
     testMappings(root, "/FBW2:com.apple.frontboard.syst", "/FBW2:com.apple.frontboard.syst");
+    testMappings(root, preferencesName, preferencesName);
     testRejections(root, name, "notification-center.shm");
     testRejections(root, "/FBW1:com.apple.frontboard.syst", "frontboard-workspace-1-com.apple.frontboard.syst.shm");
+    testRejections(root, preferencesName, "cfpreferences-user-v1.shm");
     testWorkspaceIsolation(root, second);
+    testPreferenceCounters(root, second);
 #ifndef LSB_NOTIFICATION_SHM_INTERPOSE_TESTING
     testWorkspaceSandbox(root);
 #endif
@@ -272,6 +326,6 @@ int main(void) {
     assert(!setenv(LSB_NOTIFICATION_SHM_ROOT_ENV, root, 1));
     assert(!fstat(first, &status) && status.st_size == 1234 && !close(first) && !objectUnlink(name));
     assert(!rmdir(secondTmp) && !rmdir(second) && !rmdir(temporary) && !rmdir(root));
-    puts("NotificationSharedMemory: notification/FBW mappings, unlink lifetime, namespace isolation and safe sandbox preflights passed");
+    puts("NotificationSharedMemory: notification/FBW/cfprefs mappings, cross-process counters, unlink lifetime and safe sandbox preflights passed");
     return 0;
 }

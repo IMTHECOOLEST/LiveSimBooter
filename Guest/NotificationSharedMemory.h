@@ -7,7 +7,7 @@
 #define LSB_NOTIFICATION_SHM_ENABLE_ENV "LSB_SIMULATE_NOTIFICATION_SHM"
 #define LSB_NOTIFICATION_SHM_ROOT_ENV "SIMULATOR_SHARED_RESOURCES_DIRECTORY"
 
-// Explicitly scoped simulator notification object and /FBW1:/FBW2: names with 1–25 safe ASCII identifier characters.
+// Simulator notification object, exact 23A343 user cfprefs object, and /FBW1:/FBW2: names with 1–25 safe ASCII identifier characters.
 // All unrelated names retain native POSIX shared-memory behavior.
 // Enabled opens use an owned regular file in the canonical data directory's existing tmp subdirectory, with FD_CLOEXEC.
 // Mode is required only with O_CREAT, matching the native variadic declaration. Errors use -1/errno.

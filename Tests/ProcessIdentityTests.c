@@ -464,6 +464,97 @@ static void testCoreServicesSelfIdentity(void) {
     assert(!nativeCoreServicesPath[0]);
 }
 
+static void testCoreFoundationPreferencesIdentity(void) {
+    enum { Size = 0x198000, Caller = 0x1971a4 };
+    unsigned char *bytes = calloc(1, Size);
+    assert(bytes);
+    struct mach_header_64 *image = (struct mach_header_64 *)bytes;
+    struct uuid_command *uuid = (struct uuid_command *)(image + 1);
+    struct segment_command_64 *text = (struct segment_command_64 *)(uuid + 1);
+    struct section_64 *section = (struct section_64 *)(text + 1);
+    *image = (struct mach_header_64){.magic = MH_MAGIC_64, .cputype = CPU_TYPE_ARM64, .cpusubtype = CPU_SUBTYPE_ARM64_ALL,
+        .filetype = MH_DYLIB, .ncmds = 2, .sizeofcmds = sizeof(*uuid) + sizeof(*text) + sizeof(*section)};
+    *uuid = (struct uuid_command){.cmd = LC_UUID, .cmdsize = sizeof(*uuid),
+        .uuid = {0x6e, 0x5c, 0xfb, 0x28, 0xdd, 0x41, 0x37, 0x56, 0x97, 0x86, 0x3e, 0xf0, 0xad, 0xcd, 0x9d, 0x38}};
+    *text = (struct segment_command_64){.cmd = LC_SEGMENT_64, .cmdsize = sizeof(*text) + sizeof(*section), .segname = "__TEXT",
+        .vmaddr = 0x1000, .vmsize = Size, .filesize = Size, .initprot = VM_PROT_READ | VM_PROT_EXECUTE, .nsects = 1};
+    *section = (struct section_64){.sectname = "__text", .segname = "__TEXT", .addr = 0x2000, .size = Size - 0x1000};
+    const struct { unsigned offset; uint32_t instruction; } pins[] = {
+        {0x1971a0, 0x9400df45}, {0x1971b8, 0xf90003e9}, {0x1971c4, 0x321f0102},
+        {0x1971c8, 0x9400e1d5}, {0x1971cc, 0xaa0003f3}, {0x1971d0, 0x340000c0}
+    };
+    for (unsigned i = 0; i < sizeof(pins) / sizeof(*pins); ++i) memcpy(bytes + pins[i].offset, &pins[i].instruction, sizeof(uint32_t));
+    uintptr_t base = (uintptr_t)image;
+    intptr_t slide = (intptr_t)(base - text->vmaddr);
+    const struct mach_header *header = (const struct mach_header *)image;
+    assert(!callerNeedsNativeIdentity(base + Caller)); // No matching image has been published yet.
+    assert(!setenv("DYLD_ROOT_PATH", "/private/Group/RuntimeRoot", 1));
+    initializeIdentity();
+    const char *physical = "/private/Group/RuntimeRoot/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+    assert(!strcmp(nativeCoreFoundationPath, physical));
+    const char *accepted[] = {coreFoundationInstallPath, physical};
+    for (unsigned i = 0; i < 2; ++i) {
+        rememberNativeIdentityImage(header, slide, accepted[i]);
+        assert(callerNeedsNativeIdentity(base + Caller));
+        for (int delta = -8; delta <= 8; ++delta) if (delta) assert(!callerNeedsNativeIdentity(base + Caller + delta));
+        assert(!callerNeedsNativeIdentity(base) && !callerNeedsNativeIdentity(base + 0x1971cc));
+        assert(!callerNeedsNativeIdentity(base + Size - 1) && LSBGetPID() == 123 && LSBGuestPID() == 123);
+        forgetNativeIdentityImage(header);
+        assert(!callerNeedsNativeIdentity(base + Caller));
+    }
+    const char *rejected[] = {"/Plugins/CoreFoundation", "/System/Library/PrivateFrameworks/CoreFoundation.framework/CoreFoundation",
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundationHelper",
+        "/private/Group/RuntimeRoot-other/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        "/OtherRoot/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        "/System/Library/Frameworks/CoreFoundation.framework/../CoreFoundation"};
+    for (unsigned i = 0; i < sizeof(rejected) / sizeof(*rejected); ++i) {
+        rememberNativeIdentityImage(header, slide, rejected[i]);
+        assert(!callerNeedsNativeIdentity(base + Caller));
+    }
+    rememberNativeIdentityImage(header, slide, coreFoundationInstallPath);
+    uuid->uuid[0] ^= 1;
+    rememberNativeIdentityImage(header, slide, coreFoundationInstallPath);
+    assert(!callerNeedsNativeIdentity(base + Caller));
+    uuid->uuid[0] ^= 1;
+    for (unsigned i = 0; i < sizeof(pins) / sizeof(*pins); ++i) {
+        bytes[pins[i].offset] ^= 1;
+        assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+        bytes[pins[i].offset] ^= 1;
+    }
+    text->filesize = 0x1971d3;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    text->filesize = Size;
+    section->size = 0x1971d3 - 0x1000;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    section->size = Size - 0x1000;
+    section->addr = text->vmaddr + 0x1971a1;
+    section->size = Size - 0x1971a1;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    section->addr = 0x2000;
+    section->size = Size - 0x1000;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide + 1));
+    text->initprot = VM_PROT_READ;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    text->initprot |= VM_PROT_EXECUTE;
+    image->sizeofcmds -= 1;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    image->sizeofcmds += 1;
+    image->cpusubtype = CPU_SUBTYPE_ARM64E;
+    assert(!pinnedCoreFoundationPreferencesImage(image, slide));
+    image->cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+    assert(pinnedCoreFoundationPreferencesImage(image, slide));
+    text->vmaddr = base + 0x1000;
+    section->addr = text->vmaddr + 0x1000;
+    assert(pinnedCoreFoundationPreferencesImage(image, -0x1000));
+    rememberNativeIdentityImage(header, -0x1000, coreFoundationInstallPath);
+    assert(callerNeedsNativeIdentity(base + Caller));
+    forgetNativeIdentityImage(header);
+    free(bytes);
+    assert(!unsetenv("DYLD_ROOT_PATH"));
+    initializeIdentity();
+    assert(!nativeCoreFoundationPath[0]);
+}
+
 int main(void) {
     unsetenv("LSB_GUEST_PID");
     unsetenv("LSB_GUEST_PPID");
@@ -480,6 +571,7 @@ int main(void) {
     testFrontBoardCallerIdentity();
     testUIFrameworkCallerIdentity();
     testCoreServicesSelfIdentity();
+    testCoreFoundationPreferencesIdentity();
     testTaskNameSelfTranslation();
     setenv("LSB_GUEST_PPID", "0", 1);
     initializeIdentity();

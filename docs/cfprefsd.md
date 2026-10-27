@@ -123,3 +123,39 @@ events. Isolated-daemon delivery of the preference remains unproven, as explaine
 
 Local research disassembly is retained under ignored `tmp/cfprefsd/`. These offsets refer to the original 23A343 standalone
 libraries, before shared-cache layout and ASLR relocation.
+
+## Live preference updates on iPhone 17 (2026-10-27)
+
+The Settings touch toggle exposed two separate failures in the 23A343 guest on iPhone18,2 / iOS 27.0 build 24A435.
+The earlier direct-mode hypothesis is now measured: `_CFPrefsDirectMode` returned 1 because its native sandbox preflight
+used a retired logical PID. The same query with the current native PID returned 0. Physical access to the isolated preference
+file was allowed, yet the local direct-mode source could not synchronize changes.
+
+`ProcessIdentity.c` now returns the native PID only at CoreFoundation's `getpid` return site `+0x1971a4`, immediately before
+that native `sandbox_check`. Registration validates UUID `6E5CFB28-DD41-3756-9786-3EF0ADCD9D38`, text bounds and six unchanged
+instructions. The sandbox decision itself is untouched. Before guest identity publication, calls retain native forwarding.
+With this correction, direct mode became 0 and the probe received a genuine reply from the simulator cfprefsd, including
+the original audit PID. However, the client still rejected the returned preference data.
+
+The reply advertised the exact 30-byte shared-memory name `apple.sim.cfprefs.user.daemonv`. Stock `snprintf(..., 31, ...)`
+truncates the intended version digit. The daemon had fallen back to private heap storage after failing to create the object;
+clients' `shm_open(O_RDONLY)` returned `ENOENT`. CoreFoundation treats failure to map this counter page as an invalid source
+before parsing its property list. XML was supported and was not the cause of the failed reads.
+
+The existing owned-file shared-memory adapter now maps only that exact name to `SimulatorData/tmp/cfpreferences-user-v1.shm`.
+The real daemon creates a 16 KiB writable mapping; clients open separate read-only mappings and observe its change counters.
+Other names, including slash-prefixed, untruncated `v1`, system-daemon and test names, retain native behavior. No sandbox
+preflight exception was added. A fresh guest session is required when installing this fix because the daemon and clients
+cache their earlier failures; subsequent preference updates do not require restarts.
+
+Host12095 / cfprefsd12128 ran the signed shim with the existing keyboard-fixed cache at `0x110000000`, UUID
+`73ED978A-FD25-3166-A57A-34E21BB7E5B8`, retained native cache and hardware workqueue redirection, without LLDB. Probe12191
+read true, changed the value to false, and received successful synchronization plus a counter update through the audited
+guest daemon. Disk readback later showed a typed Boolean in the daemon-written 210-byte plist and a 16 KiB owned counter
+file. The user then confirmed both Settings toggle directions changed the live touch markers without I/O errors.
+
+Focused tests cover exact caller selection, malformed image rejection, unrelated forwarding, cross-process read-only
+counter updates, daemon reopen, unlink lifetime, per-runtime isolation and unsafe backing files. The integrated suite
+passed. Evidence is in ignored `tmp/lsd-metadata-default/results/preferences-{probe,native-self-probe,probe-v2,probe-v3,shm-fixed-probe}.log`
+and `tmp/cfprefsd/shm-adapter-tests/`. These experiments establish actual isolated-daemon preference delivery and live
+backboardd observation, resolving the earlier validation limit above. They do not generalize the adapter to all POSIX SHM names.

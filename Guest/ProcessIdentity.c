@@ -25,6 +25,7 @@ static char nativeFrontBoardServicesPath[PATH_MAX];
 static char nativeBackBoardServicesPath[PATH_MAX];
 static char nativeExtensionFoundationPath[PATH_MAX];
 static char nativeCoreServicesPath[PATH_MAX];
+static char nativeCoreFoundationPath[PATH_MAX];
 static const char baseBoardInstallPath[] = "/System/Library/PrivateFrameworks/BaseBoard.framework/BaseBoard";
 static const char runningBoardServicesInstallPath[] =
     "/System/Library/PrivateFrameworks/RunningBoardServices.framework/RunningBoardServices";
@@ -34,6 +35,7 @@ static const char frontBoardServicesInstallPath[] = "/System/Library/PrivateFram
 static const char backBoardServicesInstallPath[] = "/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices";
 static const char extensionFoundationInstallPath[] = "/System/Library/Frameworks/ExtensionFoundation.framework/ExtensionFoundation";
 static const char coreServicesInstallPath[] = "/System/Library/Frameworks/CoreServices.framework/CoreServices";
+static const char coreFoundationInstallPath[] = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
 
 // 23A343 CoreServices compares getpid with a genuine audit-token PID in these two bundle-record lookup paths.
 // Reverse-engineered from +[LSBundleRecord _bundleRecordForAuditToken:checkNSBundleMainBundle:error:] and
@@ -42,10 +44,12 @@ enum { CoreServicesRecordSelfReturn = 0x6f294, CoreServicesBundleSelfReturn = 0x
 static const unsigned coreServicesSelfReturns[] = {CoreServicesRecordSelfReturn, CoreServicesBundleSelfReturn};
 static const unsigned char coreServicesUUID[16] = {0x73, 0xf4, 0x11, 0xd9, 0x84, 0xa9, 0x33, 0xfe,
                                                  0x84, 0xc9, 0x8c, 0xd5, 0x7c, 0xa6, 0x33, 0xdc};
-static _Atomic(uintptr_t) coreServicesSelfImage;
+static _Atomic(uintptr_t) coreServicesSelfImage, coreFoundationPreferencesImage;
+enum { CoreFoundationPreferencesReturn = 0x1971a4 };
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "Early identity caller checks must not require runtime initialization");
 
-static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, intptr_t slide) {
+static bool pinnedIdentityText(const struct mach_header_64 *header, intptr_t slide, const unsigned char expectedUUID[16],
+                               uint64_t firstInstruction, uint64_t endInstruction) {
     if (header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64 || header->cpusubtype != CPU_SUBTYPE_ARM64_ALL ||
         header->filetype != MH_DYLIB || !header->ncmds || header->ncmds > 2048 || header->sizeofcmds > 1048576) return false;
     const unsigned char *command = (const unsigned char *)(header + 1);
@@ -58,7 +62,7 @@ static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, int
         if (load->cmdsize < sizeof(*load) || load->cmdsize > remaining) return false;
         if (load->cmd == LC_UUID) {
             if (uuid || load->cmdsize != sizeof(struct uuid_command) ||
-                memcmp(((const struct uuid_command *)load)->uuid, coreServicesUUID, sizeof(coreServicesUUID))) return false;
+                memcmp(((const struct uuid_command *)load)->uuid, expectedUUID, 16)) return false;
             uuid = true;
         } else if (load->cmd == LC_SEGMENT_64) {
             if (load->cmdsize < sizeof(struct segment_command_64)) return false;
@@ -80,10 +84,7 @@ static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, int
                         section->addr < segment->vmaddr) return false;
                     uint64_t relative = section->addr - segment->vmaddr;
                     if (relative > segment->filesize || section->size > segment->filesize - relative) return false;
-                    for (unsigned k = 0; k < sizeof(coreServicesSelfReturns) / sizeof(*coreServicesSelfReturns); ++k) {
-                        uint64_t start = coreServicesSelfReturns[k] - 16, end = coreServicesSelfReturns[k] + 8;
-                        if (start < relative || end > relative + section->size) return false;
-                    }
+                    if (firstInstruction < relative || endInstruction > relative + section->size) return false;
                     instructions = true;
                 }
             }
@@ -91,7 +92,11 @@ static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, int
         command += load->cmdsize;
         remaining -= load->cmdsize;
     }
-    if (!uuid || !text || !instructions || remaining) return false;
+    return uuid && text && instructions && !remaining;
+}
+
+static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, intptr_t slide) {
+    if (!pinnedIdentityText(header, slide, coreServicesUUID, CoreServicesRecordSelfReturn - 16, CoreServicesBundleSelfReturn + 8)) return false;
     // These windows, including BL getpid, are byte-identical in the stock image and the rebuilt development cache.
     static const uint32_t expected[][6] = {
         {0xaa1303e0, 0x94018282, 0xaa0003f5, 0x94044839, 0x6b0002bf, 0x54000961},
@@ -99,6 +104,26 @@ static bool pinnedCoreServicesSelfImage(const struct mach_header_64 *header, int
     };
     for (unsigned i = 0; i < sizeof(coreServicesSelfReturns) / sizeof(*coreServicesSelfReturns); ++i)
         if (memcmp((const unsigned char *)header + coreServicesSelfReturns[i] - 16, expected[i], sizeof(expected[i]))) return false;
+    return true;
+}
+
+// Original 23A343 ____CFPrefsDirectMode_block_invoke calls getpid here solely for sandbox_check's native self preflight.
+// A retired logical PID denies the named cfprefsd lookup and incorrectly selects an anonymous per-process preferences daemon.
+// Translate identity, not policy: the original sandbox_check still decides whether the current process can use the service.
+static bool pinnedCoreFoundationPreferencesImage(const struct mach_header_64 *header, intptr_t slide) {
+    static const unsigned char uuid[16] = {0x6e, 0x5c, 0xfb, 0x28, 0xdd, 0x41, 0x37, 0x56,
+                                          0x97, 0x86, 0x3e, 0xf0, 0xad, 0xcd, 0x9d, 0x38};
+    if (!pinnedIdentityText(header, slide, uuid, 0x1971a0, 0x1971d4)) return false;
+    // Relocated ADRP/GOT operands differ in a rebuilt cache. Pin the unchanged getpid/sandbox_check BL targets and argument/control flow.
+    static const struct { unsigned offset; uint32_t instruction; } pins[] = {
+        {0x1971a0, 0x9400df45}, {0x1971b8, 0xf90003e9}, {0x1971c4, 0x321f0102},
+        {0x1971c8, 0x9400e1d5}, {0x1971cc, 0xaa0003f3}, {0x1971d0, 0x340000c0}
+    };
+    for (unsigned i = 0; i < sizeof(pins) / sizeof(*pins); ++i) {
+        uint32_t instruction;
+        memcpy(&instruction, (const unsigned char *)header + pins[i].offset, sizeof(instruction));
+        if (instruction != pins[i].instruction) return false;
+    }
     return true;
 }
 
@@ -132,6 +157,8 @@ static _Atomic(unsigned) nativeIdentitySequence;
 static void forgetNativeIdentityImage(const struct mach_header *image) {
     uintptr_t expected = (uintptr_t)image;
     atomic_compare_exchange_strong_explicit(&coreServicesSelfImage, &expected, 0, memory_order_acq_rel, memory_order_acquire);
+    expected = (uintptr_t)image;
+    atomic_compare_exchange_strong_explicit(&coreFoundationPreferencesImage, &expected, 0, memory_order_acq_rel, memory_order_acquire);
     atomic_fetch_add_explicit(&nativeIdentitySequence, 1, memory_order_acq_rel);
     for (unsigned i = 0; i < 16; ++i) if (atomic_load_explicit(&nativeIdentityRanges[i].image, memory_order_relaxed) == (uintptr_t)image)
         atomic_store_explicit(&nativeIdentityRanges[i].image, 0, memory_order_relaxed);
@@ -145,6 +172,12 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
         forgetNativeIdentityImage(image);
         if (pinnedCoreServicesSelfImage((const struct mach_header_64 *)image, slide))
             atomic_store_explicit(&coreServicesSelfImage, (uintptr_t)image, memory_order_release);
+        return;
+    }
+    if (!strcmp(path, coreFoundationInstallPath) || (nativeCoreFoundationPath[0] && !strcmp(path, nativeCoreFoundationPath))) {
+        forgetNativeIdentityImage(image);
+        if (pinnedCoreFoundationPreferencesImage((const struct mach_header_64 *)image, slide))
+            atomic_store_explicit(&coreFoundationPreferencesImage, (uintptr_t)image, memory_order_release);
         return;
     }
     bool notifyd = nativeNotifydPath[0] && !strcmp(path, nativeNotifydPath);
@@ -200,6 +233,8 @@ static void __attribute__((unused)) rememberNativeIdentityImage(const struct mac
 }
 
 static bool callerNeedsNativeIdentity(uintptr_t caller) {
+    uintptr_t preferences = atomic_load_explicit(&coreFoundationPreferencesImage, memory_order_acquire);
+    if (preferences && caller >= preferences && caller - preferences == CoreFoundationPreferencesReturn) return true;
     uintptr_t coreServices = atomic_load_explicit(&coreServicesSelfImage, memory_order_acquire);
     if (coreServices && caller >= coreServices &&
         (caller - coreServices == CoreServicesRecordSelfReturn || caller - coreServices == CoreServicesBundleSelfReturn)) return true;
@@ -250,6 +285,7 @@ __attribute__((constructor)) static void initializeIdentity(void) {
     configureNativeImagePath(nativeBackBoardServicesPath, backBoardServicesInstallPath);
     configureNativeImagePath(nativeExtensionFoundationPath, extensionFoundationInstallPath);
     configureNativeImagePath(nativeCoreServicesPath, coreServicesInstallPath);
+    configureNativeImagePath(nativeCoreFoundationPath, coreFoundationInstallPath);
 #ifndef LSB_PROCESS_IDENTITY_TESTING
     // Existing images are enumerated synchronously before publishing the guest PID. Early recursive calls retain native identity.
     _dyld_register_func_for_add_image(identityImageAdded);
