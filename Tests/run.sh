@@ -141,6 +141,7 @@ DYLD_INSERT_LIBRARIES="$test_directory/libSharedCachePathCompatibility.dylib" \
 python3 -B Tests/PatchIOSPlatformTests.py
 python3 -B Tests/LaunchdIdentityPatchTests.py
 python3 -B Tests/ContainerMetadataPatchTests.py
+python3 -B Tests/KeyboardHapticsPatchTests.py
 python3 -B Tests/LaunchdIdentityVeneerTests.py
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdIdentityTests.c -o "$test_directory/LaunchdIdentity"
