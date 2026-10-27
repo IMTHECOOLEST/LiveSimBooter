@@ -59,17 +59,19 @@ static void assertError(uint8_t *bytes, int error) {
     assert(u32(bytes + 52) == 1 && u32(bytes + 64) == 17);
     assert(u64(bytes + 72 + 140) == 1001 && (int64_t)u64(bytes + 72 + 148) == error);
 }
-static IOSurfaceRef createSurface(void) CF_RETURNS_RETAINED;
-static IOSurfaceRef createSurface(void) {
-    NSDictionary *properties = @{(__bridge NSString *)kIOSurfaceWidth: @1290, (__bridge NSString *)kIOSurfaceHeight: @2796,
+static IOSurfaceRef createSizedSurface(uint32_t width, uint32_t height) CF_RETURNS_RETAINED;
+static IOSurfaceRef createSizedSurface(uint32_t width, uint32_t height) {
+    NSDictionary *properties = @{(__bridge NSString *)kIOSurfaceWidth: @(width), (__bridge NSString *)kIOSurfaceHeight: @(height),
         (__bridge NSString *)kIOSurfaceBytesPerElement: @4, (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241),
-        (__bridge NSString *)kIOSurfaceBytesPerRow: @(IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, 1290 * 4))};
+        (__bridge NSString *)kIOSurfaceBytesPerRow: @(IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width * 4))};
     IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
     assert(surface && !IOSurfaceLock(surface, 0, NULL));
     memcpy(IOSurfaceGetBaseAddress(surface), "\x11\x22\x33\xff", 4);
     assert(!IOSurfaceUnlock(surface, 0, NULL));
     return surface;
 }
+static IOSurfaceRef createSurface(void) CF_RETURNS_RETAINED;
+static IOSurfaceRef createSurface(void) { return createSizedSurface(1290, 2796); }
 static uint8_t *singleItem(uint8_t *bytes, unsigned type, unsigned delta) {
     put32(bytes + 52 + delta, 1);
     put64(bytes + 56 + delta, UINT64_C(0xfadecafe00007777));
@@ -92,7 +94,7 @@ static void presentRequest(uint8_t *bytes, const uint8_t *session, IOSurfaceRef 
     if (fence) ports[1] = (mach_msg_port_descriptor_t){.name = fence, .disposition = MACH_MSG_TYPE_MOVE_RECEIVE, .type = MACH_MSG_PORT_DESCRIPTOR};
     uint8_t *payload = singleItem(bytes, 10, delta);
     put64(payload, operation); put64(payload + 16, 0x18);
-    uint32_t rectangle[] = {0, 0, 1290, 2796};
+    uint32_t rectangle[] = {0, 0, (uint32_t)IOSurfaceGetWidth(surface), (uint32_t)IOSurfaceGetHeight(surface)};
     memcpy(payload + 24, rectangle, 16); memcpy(payload + 40, rectangle, 16);
     put32(payload + 56, 1); put32(payload + 60, 1); put32(payload + 64, IOSurfaceGetID(surface));
     put32(payload + 68, 0); put32(payload + 72, fence ? 1 : UINT32_MAX);
@@ -291,7 +293,7 @@ static void delayedCancellationTest(BOOL abandonServer) {
 static uint32_t createRawChain(LSBFramebufferServer *server, uint8_t *bytes, const uint8_t *session) {
     makeRequest(bytes, 9, session, MACH_PORT_NULL);
     uint8_t *chain = singleItem(bytes, 7, 0);
-    put32(chain, 1290); put32(chain + 4, 2796); put32(chain + 8, 1);
+    put32(chain, server.geometry.width); put32(chain + 4, server.geometry.height); put32(chain + 8, 1);
     transact(server, bytes);
     assert(u32(bytes + 64) == 7 && u32(bytes + 84));
     return u32(bytes + 84);
@@ -307,6 +309,67 @@ static void presentRectangle(LSBFramebufferServer *server, uint8_t *bytes, const
     transact(server, bytes);
     if (error) assertError(bytes, error);
     else assert(!u32(bytes + 52));
+}
+
+static void geometryTests(void) {
+    const LSBFramebufferGeometry invalid[] = {
+        {0, 1334, 2, 326}, {750, 0, 2, 326}, {750, 1334, 0, 326}, {750, 1334, 2, 0},
+        {16385, 1334, 2, 326}, {750, 16385, 2, 326}, {UINT32_MAX, UINT32_MAX, 2, 326}
+    };
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        int error = 0;
+        assert(![[LSBFramebufferServer alloc] initWithGeometry:invalid[i] error:&error] && error == EINVAL);
+    }
+    assert(![[LSBFramebufferServer alloc] initWithGeometry:invalid[0] error:NULL]);
+    const LSBFramebufferGeometry profiles[] = {{750, 1334, 2, 326}, {1242, 2208, 3, 401}, {2064, 2752, 2, 264}};
+    for (unsigned i = 0; i < sizeof(profiles) / sizeof(profiles[0]); ++i) {
+        int error = -1;
+        LSBFramebufferGeometry input = profiles[i], expected = input;
+        LSBFramebufferServer *server = [[LSBFramebufferServer alloc] initWithGeometry:input error:&error];
+        input = (LSBFramebufferGeometry){1, 1, 1, 1}; // The running server owns a value, not the caller's configuration storage.
+        LSBFramebufferGeometry actual = server.geometry;
+        assert(server && !error && !memcmp(&actual, &expected, sizeof(actual)) && input.width != actual.width);
+        __block unsigned copied = 0;
+        server.frameHandler = immediateHandler(^int(IOSurfaceRef surface, CGRect rectangle) {
+            assert(IOSurfaceGetWidth(surface) == expected.width && IOSurfaceGetHeight(surface) == expected.height);
+            CGRect wanted = copied ? CGRectMake(expected.width - 1, expected.height - 1, 1, 1) : CGRectMake(0, 0, expected.width, expected.height);
+            assert(CGRectEqualToRect(rectangle, wanted));
+            ++copied;
+            return 0;
+        });
+        audit_token_t token = ownAudit();
+        [server authorizeClientWithAuditToken:&token];
+        mach_port_t events = receivePort();
+        uint8_t bytes[4096], session[16];
+        makeRequest(bytes, 1, NULL, events); transact(server, bytes); memcpy(session, bytes + 72, 16);
+        makeRequest(bytes, 2, session, MACH_PORT_NULL); transact(server, bytes);
+        assert(u32(bytes + 52) == 2 && u32(bytes + 64) == 4 && u32(bytes + 328) == 5);
+        const uint8_t *properties = bytes + 72, *mode = bytes + 336;
+        assert(u32(properties + 212) == expected.width && u32(properties + 216) == expected.height);
+        assert(u32(properties + 220) == expected.width && u32(properties + 224) == expected.height);
+        assert(u32(properties + 236) == expected.dotPitch);
+        assert(u32(mode + 4) == expected.width && u32(mode + 8) == expected.height && u32(mode + 12) == expected.scale);
+
+        // An old device's swapchain cannot silently remain usable in the replacement session.
+        makeRequest(bytes, 9, session, MACH_PORT_NULL);
+        uint8_t *chainItem = singleItem(bytes, 7, 0);
+        put32(chainItem, 1290); put32(chainItem + 4, 2796); put32(chainItem + 8, 1);
+        transact(server, bytes); assertError(bytes, ENOTSUP);
+        uint32_t chain = createRawChain(server, bytes, session);
+        const uint32_t full[] = {0, 0, expected.width, expected.height};
+        const uint32_t edge[] = {expected.width - 1, expected.height - 1, 1, 1};
+        const uint32_t outside[] = {expected.width, expected.height - 1, 1, 1};
+        IOSurfaceRef surface = createSizedSurface(expected.width, expected.height), oldSurface = createSurface();
+        presentRectangle(server, bytes, session, surface, 1, chain, edge, edge, ENODATA);
+        presentRectangle(server, bytes, session, oldSurface, 2, chain, full, full, ENOTSUP);
+        presentRectangle(server, bytes, session, surface, 3, chain, full, full, 0);
+        presentRectangle(server, bytes, session, surface, 4, chain, edge, edge, 0);
+        presentRectangle(server, bytes, session, surface, 5, chain, outside, outside, EINVAL);
+        dispatch_sync(dispatch_get_main_queue(), ^{ assert(copied == 2); });
+        [server close];
+        assert(!mach_port_mod_refs(mach_task_self(), events, MACH_PORT_RIGHT_RECEIVE, -1));
+        CFRelease(oldSurface); CFRelease(surface);
+    }
 }
 
 static void sendDeferred(LSBFramebufferServer *server, uint8_t *bytes, mach_port_t reply) {
@@ -715,7 +778,7 @@ int main(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         @autoreleasepool {
             cancellationTests(); delayedCancellationTest(NO); delayedCancellationTest(YES); asynchronousCompletionTests();
-            diagnosticTests(); dirtyRectangleTests(); stockClientTests();
+            diagnosticTests(); dirtyRectangleTests(); geometryTests(); stockClientTests();
         }
         dispatch_async(dispatch_get_main_queue(), ^{ CFRunLoopStop(mainLoop); });
     });

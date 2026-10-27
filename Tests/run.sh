@@ -295,7 +295,7 @@ DYLD_INSERT_LIBRARIES="$test_directory/libXPCWireCompatibility.dylib" XPC_FLAGS=
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/BrokerTests.m Host/SessionControlQueue.c Host/TerminalSession.m Host/LaunchdConfiguration.m ProcessSupport/LaunchdHandshake.c ProcessSupport/LaunchdProbe.c \
     Host/IndigoHIDServer.m Host/FramebufferServer.m Host/IOSurfaceServer.m ProcessSupport/LaunchdEndpoint.c \
-    Host/GuestEntitlementsConversion.m ProcessSupport/GuestEntitlements.c \
+    Host/GuestEntitlementsConversion.m Host/DeviceType.m Host/DeviceConfiguration.m ProcessSupport/GuestEntitlements.c \
     ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c ProcessSupport/ChildStatus.c ProcessSupport/NativeMetalControl.c \
     -framework Foundation -framework IOSurface -o "$test_directory/Broker"
 "$test_directory/Broker"
@@ -327,9 +327,19 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     -o "$test_directory/MetalDisplayRenderer"
 "$test_directory/MetalDisplayRenderer"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
-    Tests/LaunchdConfigurationTests.m Host/LaunchdConfiguration.m ProcessSupport/SpawnPlan.c \
+    Tests/LaunchdConfigurationTests.m Host/LaunchdConfiguration.m Host/DeviceType.m ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/LaunchdConfiguration"
 "$test_directory/LaunchdConfiguration"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/DeviceTypeTests.m Host/DeviceType.m -framework Foundation -o "$test_directory/DeviceType"
+"$test_directory/DeviceType"
+python3 Tests/SetupIOS26DeviceTypesTests.py
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/DeviceConfigurationTests.m Host/DeviceConfiguration.m Host/DeviceType.m -framework Foundation -o "$test_directory/DeviceConfiguration"
+"$test_directory/DeviceConfiguration"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IHost -IProcessSupport \
+    Tests/GuestDeviceSettingsTests.m Host/GuestDeviceSettings.m Host/DeviceType.m -framework Foundation -o "$test_directory/GuestDeviceSettings"
+"$test_directory/GuestDeviceSettings"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 -IProcessSupport -IHost \
     Tests/TerminalSessionTests.m Host/TerminalSession.m ProcessSupport/FakePTY.c ProcessSupport/SpawnPlan.c \
     -framework Foundation -o "$test_directory/TerminalSession"

@@ -7,9 +7,15 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]);
 @class LSBIndigoHIDServer;
 @class LSBFramebufferServer;
 @class NSString;
+@class LSBGuestDeviceType;
+// Main-thread native UI only. Apply stages a catalog profile and uses the existing owned-process drain before replacement.
+LSBGuestDeviceType *LSBHostCurrentDeviceType(void);
+BOOL LSBHostCanApplyDeviceType(void);
+void LSBHostApplyDeviceType(LSBGuestDeviceType *type, void (^completion)(int error, BOOL restarted));
 extern NSString *const LSBHostIndigoDidChangeNotification;
 extern NSString *const LSBHostFramebufferDidChangeNotification;
 extern NSString *const LSBHostTerminalDidChangeNotification;
+extern NSString *const LSBHostSessionStateDidChangeNotification;
 int LSBHostUsesSimulatorDisplay(void);
 // Main-thread access. The display view forwards only its own touches to this simulator-local endpoint.
 LSBIndigoHIDServer *LSBHostIndigoHIDServer(void);

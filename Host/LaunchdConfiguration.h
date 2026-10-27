@@ -2,6 +2,12 @@
 
 #include "SpawnTransport.h"
 
+#ifdef __OBJC__
+@class LSBGuestDeviceType;
+// Main-thread host selection; nil restores the legacy default/explicit identity overrides used by standalone probes.
+void LSBLaunchdConfigurationSetDeviceType(LSBGuestDeviceType *type);
+#endif
+
 // Native host only. Requires a zeroed plan and message->fds initialized to -1; leaves them unchanged on failure.
 // Creates only owned SimulatorData paths beside RuntimeRoot, regenerating its bootstrap plist and appending to its regular log file.
 // The caller supplies signal masks after success and owns the returned FDs. No terminal is attached.

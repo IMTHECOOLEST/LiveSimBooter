@@ -4,6 +4,7 @@
 #include "ChildMonitor.h"
 #include "RunningBoardMonitor.h"
 #include "SessionControlQueue.h"
+#import "DeviceConfiguration.h"
 #include "ChildStatus.h"
 #include "SpawnTransport.h"
 #include "PrivateXPC.h"
@@ -128,6 +129,9 @@ static uint64_t rebootGeneration;
 static NSMutableSet<NSNumber *> *rebootPendingDeaths;
 static NSMutableArray<LSBRunningBoardMonitor *> *rebootDeathMonitors;
 static NSMutableArray<dispatch_source_t> *rebootExitSources;
+static LSBGuestDeviceType *sessionDeviceType, *pendingDeviceType;
+static NSData *pendingDeviceCapabilities;
+static void (^deviceChangeCompletion)(int, BOOL);
 // Allow every launchd child to overlap its exec replacement, plus launchd and the backboardd, SpringBoard and public Metal helpers.
 enum { BrokerJobCapacity = 2 * LSB_CHILD_STATUS_CAPACITY + 4, DisplayRegistrationTimeoutSeconds = 30,
        RetiredIdentityCapacity = 256, AuditResolutionLogLimit = 32 };
@@ -141,9 +145,12 @@ static BOOL retiredIdentitiesFull;
 NSString *const LSBHostIndigoDidChangeNotification = @"LSBHostIndigoDidChange";
 NSString *const LSBHostFramebufferDidChangeNotification = @"LSBHostFramebufferDidChange";
 NSString *const LSBHostTerminalDidChangeNotification = @"LSBHostTerminalDidChange";
+NSString *const LSBHostSessionStateDidChangeNotification = @"LSBHostSessionStateDidChange";
+static BOOL sessionStateNotificationScheduled;
 static void startNextJob(void);
 static void beginUserspaceReboot(LSBJob *exitedLaunchd);
 static void completeUserspaceReboot(uint64_t generation);
+static int prepareRuntimeRoot(void);
 static int signalJob(LSBJob *child, int signalNumber);
 static int signalTerminal(pid_t foreground, int signalNumber);
 static BOOL launchdOwnsChildIdentity(LSBJob *job);
@@ -151,6 +158,43 @@ static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, const char *name, int
 static void registerReplacementSpringBoardMetal(LSBJob *active, LSBJob *helper);
 
 LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
+LSBGuestDeviceType *LSBHostCurrentDeviceType(void) { return jobs ? sessionDeviceType ?: LSBConfiguredGuestDeviceType() : LSBConfiguredGuestDeviceType(); }
+BOOL LSBHostCanApplyDeviceType(void) {
+    if (sessionDraining || deviceChangeCompletion || launchLaneFailed || startingJob) return NO;
+    if (!jobs) return YES;
+    for (LSBJob *job in jobs) if (job.simulatorLaunchd && !job.parentIdentifier && job.phase == JobRunning) return enableIndigo;
+    return NO;
+}
+static void finishDeviceChange(int error) {
+    void (^completion)(int, BOOL) = deviceChangeCompletion;
+    deviceChangeCompletion = nil;
+    pendingDeviceType = nil;
+    pendingDeviceCapabilities = nil;
+    if (completion) completion(error, YES);
+}
+void LSBHostApplyDeviceType(LSBGuestDeviceType *type, void (^completion)(int, BOOL)) {
+    if (!NSThread.isMainThread) { if (completion) completion(EPERM, NO); return; }
+    if (!type || type != LSBGuestDeviceTypeForIdentifier(type.identifier)) { if (completion) completion(EINVAL, NO); return; }
+    if (!LSBHostCanApplyDeviceType()) { if (completion) completion(EBUSY, NO); return; }
+    if (type == LSBHostCurrentDeviceType()) { if (completion) completion(0, NO); return; }
+    int error = runtimeRoot ? 0 : prepareRuntimeRoot();
+    NSData *capabilities = nil;
+    if (!error) error = LSBCopyGuestDeviceCapabilities(runtimeRoot, type, &capabilities);
+    if (error) { if (completion) completion(error, NO); return; }
+    if (!jobs) {
+        // The Start gate has not opened. Persist the validated choice; installation happens before the first guest.
+        LSBSaveConfiguredGuestDeviceType(type);
+        if (completion) completion(0, NO);
+        return;
+    }
+    pendingDeviceType = type;
+    pendingDeviceCapabilities = capabilities;
+    deviceChangeCompletion = [completion copy];
+    fprintf(stderr, "[broker] Applying device %s through simulator session restart\n", type.identifier.UTF8String);
+    // Host-requested restart uses the same drain as guest reboot. Unlike launchctl's graceful shutdown, every tracked
+    // guest (including launchd) is terminated here; no profile or framebuffer is replaced until death is observed.
+    beginUserspaceReboot(nil);
+}
 int LSBHostUsesSimulatorDisplay(void) { return enableIndigo; }
 LSBIndigoHIDServer *LSBHostIndigoHIDServer(void) {
     for (LSBJob *job in jobs) if (job.simulatorLaunchd && job.indigo) return job.indigo;
@@ -806,6 +850,14 @@ static void extensionEvent(uint64_t identifier, pid_t pid, int error, void *cont
 }
 
 static void startNextJob(void) {
+    // Coalesce recursive queue transitions and notify UIKit after the main-thread transaction has settled.
+    if (!sessionStateNotificationScheduled) {
+        sessionStateNotificationScheduled = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sessionStateNotificationScheduled = NO;
+            [NSNotificationCenter.defaultCenter postNotificationName:LSBHostSessionStateDidChangeNotification object:nil];
+        });
+    }
     if (startingJob || finishingDepth || sessionDraining) return;
     if (launchLaneFailed) {
         for (LSBJob *job in [jobs copy]) if (job.phase == JobQueued) { finishJob(job, EBUSY); return; }
@@ -1244,7 +1296,10 @@ static int prepareLaunchdHandshake(LSBJob *job) {
         int error = 0;
         job.indigo = [[LSBIndigoHIDServer alloc] initWithError:&error];
         if (!job.indigo) return error ? error : ENOMEM;
-        job.framebuffer = [[LSBFramebufferServer alloc] initWithError:&error];
+        LSBGuestDeviceType *deviceType = sessionDeviceType ?: LSBDefaultGuestDeviceType();
+        LSBFramebufferGeometry geometry = {(uint32_t)deviceType.width, (uint32_t)deviceType.height,
+                                           (uint32_t)deviceType.scale, (uint32_t)deviceType.pitch};
+        job.framebuffer = [[LSBFramebufferServer alloc] initWithGeometry:geometry error:&error];
         if (!job.framebuffer) return error ? error : ENOMEM;
         job.iosurface = [[LSBIOSurfaceServer alloc] initWithError:&error];
         if (!job.iosurface) return error ? error : ENOMEM;
@@ -1836,6 +1891,7 @@ static void completeUserspaceReboot(uint64_t generation) {
     rebootExitSources = nil;
     if (rebootDrainFailed || launchLaneFailed || jobs.count) {
         fprintf(stderr, "[broker] Simulator reboot stopped: old session could not be fully retired; reopen host\n");
+        finishDeviceChange(EIO);
         return;
     }
     NSString *data = [runtimeRoot.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"SimulatorData"];
@@ -1843,8 +1899,16 @@ static void completeUserspaceReboot(uint64_t generation) {
     if (queueError) {
         rebootDrainFailed = YES;
         fprintf(stderr, "[broker] Could not preserve the old launchctl queue: %s; reopen host\n", strerror(queueError));
+        finishDeviceChange(queueError);
         return;
     }
+    if (pendingDeviceType) {
+        int deviceError = LSBInstallGuestDeviceCapabilities(runtimeRoot, pendingDeviceCapabilities);
+        if (deviceError) { rebootDrainFailed = YES; finishDeviceChange(deviceError); return; }
+        sessionDeviceType = pendingDeviceType;
+        LSBSaveConfiguredGuestDeviceType(sessionDeviceType);
+    }
+    LSBLaunchdConfigurationSetDeviceType(sessionDeviceType);
     const char *arguments[LSB_MAX_VECTOR + 1] = {0}, *environment[LSB_MAX_VECTOR + 1] = {0};
     for (NSUInteger i = 0; i < rebootArguments.count; ++i) arguments[i] = rebootArguments[i].bytes;
     for (NSUInteger i = 0; i < rebootEnvironment.count; ++i) environment[i] = rebootEnvironment[i].bytes;
@@ -1858,6 +1922,7 @@ static void completeUserspaceReboot(uint64_t generation) {
         if (initial) disposeMessage(initial);
         rebootDrainFailed = YES;
         fprintf(stderr, "[broker] Fresh simulator plan failed: %s; reopen host\n", strerror(error));
+        finishDeviceChange(error);
         return;
     }
     // The old session's tracked processes have exited. New requests still require the new generation's full audit identity.
@@ -1868,6 +1933,7 @@ static void completeUserspaceReboot(uint64_t generation) {
     fprintf(stderr, "[broker] Starting fresh simulator session after userspace reboot\n");
     error = enqueueInitialJob(initial, role);
     if (error) fprintf(stderr, "[broker] Fresh simulator service setup failed: %s\n", strerror(error));
+    finishDeviceChange(error);
 }
 
 static void beginUserspaceReboot(LSBJob *exitedLaunchd) {
@@ -1934,6 +2000,7 @@ static void beginUserspaceReboot(LSBJob *exitedLaunchd) {
         rebootDeathMonitors = nil;
         for (dispatch_source_t source in rebootExitSources) dispatch_source_cancel(source);
         rebootExitSources = nil;
+        finishDeviceChange(ETIMEDOUT);
     });
     completeUserspaceReboot(generation);
 }
@@ -1945,6 +2012,15 @@ int LSBStartHost(int argc, const char *argv[], const char *envp[]) {
         if (argc < 1 || !argv || !argv[0]) return EINVAL;
         int error = snapshotRebootInputs(argc, argv, envp);
         if (!error) error = prepareRuntimeRoot();
+        if (!error) {
+            sessionDeviceType = LSBConfiguredGuestDeviceType();
+            NSData *capabilities = nil;
+            error = LSBCopyGuestDeviceCapabilities(runtimeRoot, sessionDeviceType, &capabilities);
+            // Preserve command-line and legacy setups without a profile. Selecting another device always requires its staged original.
+            if (error == ENOENT && sessionDeviceType == LSBDefaultGuestDeviceType()) error = 0;
+            if (!error && capabilities) error = LSBInstallGuestDeviceCapabilities(runtimeRoot, capabilities);
+            LSBLaunchdConfigurationSetDeviceType(sessionDeviceType);
+        }
         if (error) { fprintf(stderr, "[broker] Startup failed: %s\n", strerror(error)); return error; }
         LSBReceivedMessage *initial = calloc(1, sizeof(*initial));
         if (!initial) return ENOMEM;

@@ -19,6 +19,7 @@ and device access, then use the tracked setup/build/sign/copy steps. Generated b
 After setup, open the app and tap **Start** on the **IOSurface** tab. Keep the native host in the foreground for baseline use.
 The persistent **IOSurface**, **Fish**, and **Settings** tabs share one simulator session; switching tabs does not restart guests.
 Fish belongs to simulator launchd, and Settings provides the guest performance HUD and touch-marker controls.
+The [device picker](docs/device-types.md) changes the simulated model and resolution, then restarts the guest session.
 Silent background audio is optional and disabled by default.
 
 Explicit guest arguments, such as `--launchd-services` or `/bin/df`, retain automatic startup for development tests.

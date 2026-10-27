@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import "DeviceType.h"
 #include <CommonCrypto/CommonDigest.h>
 #include "LaunchdConfiguration.h"
 #include "ChildStatus.h"
@@ -16,6 +17,9 @@
 // Backboardd, cfprefsd and the terminal/settings helpers are direct launchd children alongside the selected services.
 enum { BaselineLaunchdChildren = 4, MaximumSelectedServices = 16 };
 _Static_assert(BaselineLaunchdChildren + MaximumSelectedServices < LSB_CHILD_STATUS_CAPACITY, "leave child-ledger slots for dynamic jobs");
+
+static LSBGuestDeviceType *configurationDeviceType;
+void LSBLaunchdConfigurationSetDeviceType(LSBGuestDeviceType *type) { configurationDeviceType = type; }
 
 static int openDirectory(int parent, const char *name) {
     if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
@@ -347,6 +351,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             strlen(configPath.fileSystemRepresentation) >= LSB_PATH_BYTES ||
             (includeJob && (strlen(jobPath.fileSystemRepresentation) >= LSB_PATH_BYTES ||
                             strlen(jobLogPath.fileSystemRepresentation) >= LSB_PATH_BYTES))) return ENAMETOOLONG;
+        LSBGuestDeviceType *deviceType = configurationDeviceType ?: LSBDefaultGuestDeviceType();
         NSMutableDictionary<NSString *, NSString *> *runtimeEnvironment = [@{
             @"XPC_SIMULATOR_LAUNCHD_NAME": @"com.kdt.LiveSimBooter.launchd",
             @"DYLD_ROOT_PATH": root, @"DYLD_SHARED_CACHE_DIR": [root stringByAppendingPathComponent:@"System/Library/Caches/com.apple.dyld"],
@@ -358,8 +363,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"SIMULATOR_BOOT_TIME": [NSString stringWithFormat:@"%lu", (unsigned long)NSDate.date.timeIntervalSince1970],
             // All guests share this simulated boot identity; native kern.bootsessionuuid may be denied inside the app sandbox.
             @"LSB_SIMULATOR_BOOT_UUID": NSUUID.UUID.UUIDString,
-            // Initial iPhone 15 Pro Max profile: CoreSimulator's profile.plist maps iPhone16,2 to productClass D84.
-            @"SIMULATOR_PRODUCT_CLASS": @"D84", @"SIMULATOR_MODEL_IDENTIFIER": @"iPhone16,2",
+            @"SIMULATOR_PRODUCT_CLASS": deviceType.productClass, @"SIMULATOR_MODEL_IDENTIFIER": deviceType.modelIdentifier,
             @"SIMULATOR_HID_SYSTEM_MANAGER": [root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"],
             @"LSB_SIMULATE_SESSIONS": @"1",
             @"LSB_SIMULATE_FILE_LOCK_SUSPENSION": @"1",
@@ -378,13 +382,14 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             // The cached client dlopens getenv directly; an absent value resolves its dispatch table back to its own trampolines.
             runtimeEnvironment[@"SIMULATOR_FRAMEBUFFER_FRAMEWORK"] =
                 [root stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimFramebuffer.framework/SimFramebuffer"];
-            // Match the host framebuffer's iPhone 15 Pro Max display in both launchd and its children.
+            // Match the immutable framebuffer for this session, including iPhone 8 Plus's rendered (not panel) dimensions.
             [runtimeEnvironment addEntriesFromDictionary:@{
-                @"SIMULATOR_MAINSCREEN_WIDTH": @"1290", @"SIMULATOR_MAINSCREEN_HEIGHT": @"2796",
-                @"SIMULATOR_MAINSCREEN_SCALE": @"3", @"SIMULATOR_MAINSCREEN_PITCH": @"460"
+                @"SIMULATOR_MAINSCREEN_WIDTH": @(deviceType.width).stringValue, @"SIMULATOR_MAINSCREEN_HEIGHT": @(deviceType.height).stringValue,
+                @"SIMULATOR_MAINSCREEN_SCALE": @(deviceType.scale).stringValue, @"SIMULATOR_MAINSCREEN_PITCH": @(deviceType.pitch).stringValue
             }];
         }
-        for (NSString *key in @[@"SIMULATOR_PRODUCT_CLASS", @"SIMULATOR_MODEL_IDENTIFIER"]) {
+        // Explicit diagnostic callers can still override identity when no catalog selection was supplied by the broker.
+        for (NSString *key in configurationDeviceType ? @[] : @[@"SIMULATOR_PRODUCT_CLASS", @"SIMULATOR_MODEL_IDENTIFIER"]) {
             const char *name = key.UTF8String;
             size_t length = strlen(name);
             for (const char *const *entry = inheritedEnv; entry && *entry; ++entry) {

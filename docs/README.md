@@ -17,6 +17,7 @@ Spotlight last-character crash is deferred.
 Historical sections below describe earlier cache layouts and failures; use the setup guide for current preparation commands.
 
 - [Architecture](architecture.md): current process boundaries, launch roles, runtime compatibility, and pinned implementation references.
+- [Device types](device-types.md): original device profiles, phone/iPad choices, display dimensions, and applying a session restart.
 - [Source licensing](licensing.md): MIT original code, Apple-derived APSL files, retained notices, and source availability.
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.

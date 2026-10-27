@@ -40,6 +40,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
 @property (nonatomic, strong) id indigoObserver;
 @property (nonatomic, strong) id framebufferObserver;
 @property (nonatomic, strong) LSBSimulatorDisplayView *simulatorDisplay;
+@property (nonatomic, strong) NSLayoutConstraint *displayAspect;
 @property (nonatomic, strong) LSBFramebufferServer *framebuffer;
 @property uint64_t displayGeneration;
 @end
@@ -58,6 +59,11 @@ static void showStatus(UIViewController *controller, NSString *text) {
     _framebuffer = server;
     uint64_t generation = ++_displayGeneration;
     if (!server) return;
+    LSBFramebufferGeometry geometry = server.geometry;
+    self.displayAspect.active = NO;
+    self.displayAspect = [self.simulatorDisplay.widthAnchor constraintEqualToAnchor:self.simulatorDisplay.heightAnchor
+                                                                        multiplier:(CGFloat)geometry.width / geometry.height];
+    self.displayAspect.active = YES;
     __weak LSBSurfaceViewController *weakSelf = self;
     __weak LSBFramebufferServer *weakServer = server;
     server.frameHandler = ^(IOSurfaceRef surface, CGRect dirtyRect, void (^completion)(int)) {
@@ -144,6 +150,8 @@ static void showStatus(UIViewController *controller, NSString *text) {
     [self.view addSubview:display];
     hostDisplay = display;
     self.simulatorDisplay = display;
+    self.displayAspect = [display.widthAnchor constraintEqualToAnchor:display.heightAnchor multiplier:1290.0 / 2796.0];
+    self.displayAspect.active = YES;
     [self bindFramebuffer];
     __weak LSBSimulatorDisplayView *weakDisplay = display;
     self.indigoObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostIndigoDidChangeNotification object:nil
@@ -160,7 +168,6 @@ static void showStatus(UIViewController *controller, NSString *text) {
     [NSLayoutConstraint activateConstraints:@[
         [display.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
         [display.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
-        [display.widthAnchor constraintEqualToAnchor:display.heightAnchor multiplier:1290.0 / 2796.0],
         [display.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor multiplier:0.94],
         [display.heightAnchor constraintLessThanOrEqualToAnchor:safe.heightAnchor multiplier:0.94],
         preferredWidth

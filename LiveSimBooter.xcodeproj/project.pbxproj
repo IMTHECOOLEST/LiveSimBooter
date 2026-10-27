@@ -76,9 +76,12 @@
 				BackgroundAudio.m = "-fobjc-arc";
 				BackgroundAudioPlayback.m = "-fobjc-arc";
 				Broker.m = "-fobjc-arc";
+				DeviceConfiguration.m = "-fobjc-arc";
+				DeviceType.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				FramebufferServer.m = "-fobjc-arc";
 				GuestDisplaySettings.m = "-fobjc-arc";
+				GuestDeviceSettings.m = "-fobjc-arc";
 				GuestEntitlementsConversion.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
 				IOSurfaceServer.m = "-fobjc-arc";

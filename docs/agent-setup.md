@@ -67,7 +67,8 @@ after changing shared constants. No personal certificate hash, device name, unlo
 The default simulated display is iPhone 15 Pro Max, `iPhone16,2` / `D84`, 1290 × 2796 at scale 3. Use its capabilities plist,
 independently of the physical phone's model. The staged path is
 `RuntimeRoot/Library/Developer/CoreSimulator/DeviceType/capabilities.plist`; the host and C child inject `SIMULATOR_CAPABILITIES`
-for that physical file. Changing the simulated model requires reviewing the matching display dimensions and resources too.
+for that physical file. The [device picker](device-types.md) keeps capabilities, identity and framebuffer geometry together.
+Stage its seven original profiles below to enable Home-button/Home-indicator iPhones and iPads; iPhone 8/8 Plus remain experimental on this OS.
 
 ## Build and inspect the cache
 
@@ -264,6 +265,10 @@ cp "$LSB_HID_FRAMEWORK/Info.plist" "$LSB_WORK/runtime/RuntimeRoot/Library/Framew
 mkdir -p "$LSB_WORK/runtime/RuntimeRoot/System/Library/Caches/com.apple.dyld"
 cp "$LSB_WORK/signed-cache/dyld_sim_shared_cache_arm64" \
   "$LSB_WORK/runtime/RuntimeRoot/System/Library/Caches/com.apple.dyld/dyld_sim_shared_cache_arm64"
+python3 Tools/setup-ios26-device-types.py --device-types-root /Library/Developer/CoreSimulator/Profiles/DeviceTypes \
+  --output-dir "$LSB_WORK/device-types"
+ditto "$LSB_WORK/device-types/RuntimeRoot/Library/Developer/CoreSimulator/DeviceTypes" \
+  "$LSB_WORK/runtime/RuntimeRoot/Library/Developer/CoreSimulator/DeviceTypes"
 ```
 
 Read the inventory and any blockers before staging. The broad stock payload includes diagnostic/XCTest executables with unresolved

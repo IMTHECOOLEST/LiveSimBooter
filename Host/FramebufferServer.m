@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { FBItemSize = sizeof(FBWireItem), FBMaxItems = 32, FBMaxDescriptors = 64, FBMaxMessage = 16384, FBWidth = 1290, FBHeight = 2796 };
+enum { FBItemSize = sizeof(FBWireItem), FBMaxItems = 32, FBMaxDescriptors = 64, FBMaxMessage = 16384, FBMaximumDimension = 16384 };
 static const uint64_t FBMagic = UINT64_C(0x00ace0ace0face01), FBItemMagic = UINT64_C(0xfadecafe00007777);
 static uint64_t monotonicNanoseconds(void) {
     mach_timebase_info_data_t timebase;
@@ -150,6 +150,7 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
     uint64_t _lastOperation;
     unsigned _diagnostics, _frames, _partialFrames;
     LSBFramebufferPresent _frameHandler;
+    LSBFramebufferGeometry _geometry;
 }
 - (void)drain;
 - (void)dropClient;
@@ -161,10 +162,21 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
 
 @implementation LSBFramebufferServer
 @synthesize frameHandler = _frameHandler;
+@synthesize geometry = _geometry;
 
 - (instancetype)initWithError:(int *)error {
+    return [self initWithGeometry:(LSBFramebufferGeometry){1290, 2796, 3, 460} error:error];
+}
+- (instancetype)initWithGeometry:(LSBFramebufferGeometry)geometry error:(int *)error {
     if (error) *error = 0;
+    // Match the renderer's maximum texture dimension and keep the full BGRA allocation within size_t on supported hosts.
+    if (!geometry.width || !geometry.height || !geometry.scale || !geometry.dotPitch ||
+        geometry.width > FBMaximumDimension || geometry.height > FBMaximumDimension) {
+        if (error) *error = EINVAL;
+        return nil;
+    }
     if (!(self = [super init])) { if (error) *error = ENOMEM; return nil; }
+    _geometry = geometry;
     _queue = dispatch_queue_create("com.kdt.LiveSimBooter.framebuffer", DISPATCH_QUEUE_SERIAL);
     kern_return_t result = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &_receive);
     if (!result) result = mach_port_insert_right(mach_task_self(), _receive, _receive, MACH_MSG_TYPE_MAKE_SEND);
@@ -348,12 +360,14 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
             FBWireDisplayProperties properties = {
                 .displayUID = "PurpleMain", .displayName = "LCD", .deviceName = "primary", .displayFlags = 1, // Powered on.
                 .supportedPresentationModes = 3, // Immediate (1) and bounded delayed (2) presentation.
-                .deviceWidth = FBWidth, .deviceHeight = FBHeight, .canvasWidth = FBWidth, .canvasHeight = FBHeight,
-                .displayID = 1, .displayType = 0, .dotPitch = 460, .maximumLayerCount = 1, .maximumSwapchainCount = 1
+                .deviceWidth = _geometry.width, .deviceHeight = _geometry.height,
+                .canvasWidth = _geometry.width, .canvasHeight = _geometry.height,
+                .displayID = 1, .displayType = 0, .dotPitch = _geometry.dotPitch, .maximumLayerCount = 1, .maximumSwapchainCount = 1
             };
             addItem(&reply, 4, &properties, sizeof(properties));
             FBWireDisplayMode mode = {
-                .modeID = 1, .width = FBWidth, .height = FBHeight, .scale = 3, .hdr = 1, .pixelFormat = 0x42475241, .colorSpace = 1,
+                .modeID = 1, .width = _geometry.width, .height = _geometry.height, .scale = _geometry.scale,
+                .hdr = 1, .pixelFormat = 0x42475241, .colorSpace = 1,
                 .refreshHundredths = 6000, .preferred = 1, .native = 1, .current = 1
             };
             addItem(&reply, 5, &mode, sizeof(mode));
@@ -363,7 +377,7 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
         if (request->descriptorCount || !copyPayload(request, 7, &chain, sizeof(chain))) error = EINVAL;
         else if (_pending) error = EAGAIN;
         else if (_swapchain) error = ENOSPC;
-        else if (chain.width != FBWidth || chain.height != FBHeight || chain.displayID != 1 || chain.presentationMode > 2) error = ENOTSUP;
+        else if (chain.width != _geometry.width || chain.height != _geometry.height || chain.displayID != 1 || chain.presentationMode > 2) error = ENOTSUP;
         else {
             if (!++_nextSwapchain) ++_nextSwapchain;
             _swapchain = _nextSwapchain;
@@ -375,7 +389,7 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
             chain.hdr = 1;
             chain.presentationMode = _presentationMode;
             addItem(&reply, 7, &chain, sizeof(chain));
-            fprintf(stderr, "[framebuffer] swapchain=%u size=%ux%u mode=%u\n", _swapchain, FBWidth, FBHeight, chain.presentationMode);
+            fprintf(stderr, "[framebuffer] swapchain=%u size=%ux%u mode=%u\n", _swapchain, _geometry.width, _geometry.height, chain.presentationMode);
         }
     } else if (header->msgh_id == 11) {
         error = [self present:request];
@@ -438,10 +452,11 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
     const FBWireRectangle rectangles[] = {payload.source, payload.destination};
     for (unsigned i = 0; i < 2; ++i) {
         const FBWireRectangle *r = &rectangles[i];
-        if (!r->width || !r->height || r->x >= FBWidth || r->y >= FBHeight || r->width > FBWidth - r->x || r->height > FBHeight - r->y) return EINVAL;
+        if (!r->width || !r->height || r->x >= _geometry.width || r->y >= _geometry.height ||
+            r->width > _geometry.width - r->x || r->height > _geometry.height - r->y) return EINVAL;
     }
     if (memcmp(&payload.source, &payload.destination, sizeof(payload.source))) return ENOTSUP;
-    BOOL fullFrame = !payload.source.x && !payload.source.y && payload.source.width == FBWidth && payload.source.height == FBHeight;
+    BOOL fullFrame = !payload.source.x && !payload.source.y && payload.source.width == _geometry.width && payload.source.height == _geometry.height;
     if (!fullFrame && !_hasBaseline) return ENODATA;
     BOOL hasFence = fenceIndex != UINT32_MAX;
     if (request->descriptorCount != (hasFence ? 2u : 1u) || surfaceIndex >= request->descriptorCount ||
@@ -453,9 +468,11 @@ static int sendReply(FBReply *reply, mach_port_t destination, BOOL once) {
     IOSurfaceRef surface = IOSurfaceLookupFromMachPort(request->descriptors[surfaceIndex].name);
     if (!surface) return EINVAL;
     size_t row = IOSurfaceGetBytesPerRow(surface), allocation = IOSurfaceGetAllocSize(surface);
-    if (IOSurfaceGetID(surface) != payload.surfaceID || IOSurfaceGetWidth(surface) != FBWidth || IOSurfaceGetHeight(surface) != FBHeight ||
+    if (IOSurfaceGetID(surface) != payload.surfaceID || IOSurfaceGetWidth(surface) != _geometry.width || IOSurfaceGetHeight(surface) != _geometry.height ||
         IOSurfaceGetPlaneCount(surface) || IOSurfaceGetPixelFormat(surface) != 0x42475241 || IOSurfaceGetBytesPerElement(surface) != 4 ||
-        row < 4 * FBWidth || row > SIZE_MAX / FBHeight || allocation < row * FBHeight) { CFRelease(surface); return ENOTSUP; }
+        row < (size_t)4 * _geometry.width || row > SIZE_MAX / _geometry.height || allocation < row * _geometry.height) {
+        CFRelease(surface); return ENOTSUP;
+    }
     FBPresentation *presentation = [FBPresentation new];
     presentation->surface = surface;
     presentation->surfaceID = IOSurfaceGetID(surface);

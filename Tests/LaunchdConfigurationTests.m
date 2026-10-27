@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #include "../Host/LaunchdConfiguration.h"
+#import "../Host/DeviceType.h"
 #include "../ProcessSupport/ChildStatus.h"
 #include <assert.h>
 #include <errno.h>
@@ -72,6 +73,33 @@ static void testDeviceProfile(LSBReceivedMessage *message, NSString *root, NSStr
         assertUnchanged(message);
         assert([[NSData dataWithContentsOfFile:configPath] isEqualToData:previous]);
     }
+}
+
+static void testSelectedDeviceProfiles(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    const char *stale[] = {"SIMULATOR_PRODUCT_CLASS=stale", "SIMULATOR_PRODUCT_CLASS=", "SIMULATOR_MODEL_IDENTIFIER=stale",
+        "SIMULATOR_MODEL_IDENTIFIER=", "SIMULATOR_MAINSCREEN_WIDTH=1", "SIMULATOR_MAINSCREEN_HEIGHT=2", "SIMULATOR_MAINSCREEN_SCALE=9",
+        "SIMULATOR_MAINSCREEN_PITCH=7", "SIMULATOR_CAPABILITIES=/stale", "SIMULATOR_PRODUCT_CLASS_EXTRA=preserved", NULL};
+    NSArray<LSBGuestDeviceType *> *devices = LSBGuestDeviceTypes();
+    assert(devices.count == 7);
+    for (LSBGuestDeviceType *type in devices) {
+        LSBLaunchdConfigurationSetDeviceType(type);
+        assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, stale));
+        NSDictionary *expected = @{
+            @"SIMULATOR_PRODUCT_CLASS": type.productClass, @"SIMULATOR_MODEL_IDENTIFIER": type.modelIdentifier,
+            @"SIMULATOR_MAINSCREEN_WIDTH": @(type.width).stringValue, @"SIMULATOR_MAINSCREEN_HEIGHT": @(type.height).stringValue,
+            @"SIMULATOR_MAINSCREEN_SCALE": @(type.scale).stringValue, @"SIMULATOR_MAINSCREEN_PITCH": @(type.pitch).stringValue,
+            @"SIMULATOR_CAPABILITIES": [root stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"]
+        };
+        NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+        for (NSString *key in expected) {
+            assert(!strcmp(environmentValue(&message->plan, key.UTF8String), [expected[key] UTF8String]));
+            for (NSString *scope in @[@"Self", @"Child"]) assert([bootstrap[scope][key] isEqual:expected[key]]);
+        }
+        assert(!strcmp(environmentValue(&message->plan, "SIMULATOR_PRODUCT_CLASS_EXTRA"), "preserved"));
+        dispose(message);
+    }
+    LSBLaunchdConfigurationSetDeviceType(nil);
+    testDeviceProfile(message, root, configPath); // Explicitly clearing selection restores legacy diagnostic overrides.
 }
 
 static void testRuntimeBooleanEnvironment(LSBReceivedMessage *message, NSString *root, NSString *configPath, const char *name,
@@ -783,6 +811,7 @@ static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSSt
     }
     dispose(message);
     testServiceJobs(message, root, dataPath, configPath);
+    testSelectedDeviceProfiles(message, root, configPath);
     assert([NSFileManager.defaultManager removeItemAtPath:[root stringByAppendingPathComponent:@"System"] error:NULL]);
 }
 

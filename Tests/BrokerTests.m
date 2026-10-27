@@ -11,6 +11,11 @@
 #include <sys/event.h>
 #include <sys/wait.h>
 #include "../Host/GuestEntitlementsConversion.h"
+#import "../Host/DeviceConfiguration.h"
+static LSBGuestDeviceType *testConfiguredDeviceType(void);
+static void testSaveDeviceType(LSBGuestDeviceType *);
+#define LSBConfiguredGuestDeviceType testConfiguredDeviceType
+#define LSBSaveConfiguredGuestDeviceType testSaveDeviceType
 static int testCopyXMLFromDEREntitlements(const void *, size_t, void **, size_t *);
 static int testReadMachOCodeDirectoryHash(int, unsigned char [20]);
 static kern_return_t testTaskInfo(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *);
@@ -30,6 +35,20 @@ static kern_return_t testBootstrapLookup(mach_port_t, const char *, mach_port_t 
 #undef LSBLaunchdUnregisterEndpointWithTimeout
 #undef LSBCopyXMLFromDEREntitlements
 #undef LSBReadMachOCodeDirectoryHash
+#undef LSBConfiguredGuestDeviceType
+#undef LSBSaveConfiguredGuestDeviceType
+
+// Isolate preference publication from the developer's real NSUserDefaults domain; filesystem validation/install stays real.
+static NSString *savedDeviceIdentifier;
+static unsigned devicePreferenceWrites;
+static LSBGuestDeviceType *testConfiguredDeviceType(void) {
+    return LSBGuestDeviceTypeForIdentifier(savedDeviceIdentifier) ?: LSBDefaultGuestDeviceType();
+}
+static void testSaveDeviceType(LSBGuestDeviceType *type) {
+    assert(type == LSBGuestDeviceTypeForIdentifier(type.identifier));
+    savedDeviceIdentifier = [type.identifier copy];
+    ++devicePreferenceWrites;
+}
 
 typedef struct {
     unsigned objectID;
@@ -367,6 +386,12 @@ static void resetBroker(void) {
     ++rebootGeneration;
     sessionDraining = rebootDrainFailed = NO;
     rebootArguments = rebootEnvironment = nil;
+    sessionDeviceType = pendingDeviceType = nil;
+    pendingDeviceCapabilities = nil;
+    deviceChangeCompletion = nil;
+    savedDeviceIdentifier = nil;
+    devicePreferenceWrites = 0;
+    LSBLaunchdConfigurationSetDeviceType(nil);
     rebootPendingDeaths = nil;
     for (LSBRunningBoardMonitor *monitor in rebootDeathMonitors) LSBRunningBoardMonitorCancel(monitor);
     rebootDeathMonitors = nil;
@@ -3801,6 +3826,161 @@ static void testRebootPreservesQueuedKqueueCallbacks(void) {
     }
 }
 
+static NSData *deviceProfile(LSBGuestDeviceType *type) {
+    NSDictionary *profile = @{@"capabilities": @{
+        @"modelIdentifier": type.modelIdentifier, @"productClass": type.productClass,
+        @"displays": @[@{@"deviceName": @"primary", @"width": @(type.width), @"height": @(type.height),
+            @"scale": @(type.scale), @"hdpi": @(type.pitch), @"vdpi": @(type.pitch)}]
+    }};
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:profile format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+    assert(data && !LSBValidateGuestDeviceCapabilities(data, type));
+    return data;
+}
+
+static NSString *stageDeviceProfile(LSBGuestDeviceType *type, NSData *data) {
+    NSURL *url = [type capabilitiesURLInRuntimeRoot:[NSURL fileURLWithPath:runtimeRoot isDirectory:YES]];
+    assert([NSFileManager.defaultManager createDirectoryAtURL:url.URLByDeletingLastPathComponent
+        withIntermediateDirectories:YES attributes:nil error:NULL]);
+    assert([data writeToURL:url options:NSDataWritingAtomic error:NULL]);
+    return url.path;
+}
+
+static NSString *activeDeviceProfilePath(void) {
+    return [runtimeRoot stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"];
+}
+
+static void testDeviceApplyPreflight(void) {
+    LSBGuestDeviceType *target = LSBGuestDeviceTypeForIdentifier(@"iphone-se-2");
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
+        resetBroker();
+        NSString *directory = makeRebootRuntime();
+        rememberRebootInputs();
+        LSBJob *launchd = terminalLaunchd();
+        enableIndigo = YES;
+        sessionDeviceType = LSBDefaultGuestDeviceType();
+        NSData *oldProfile = deviceProfile(sessionDeviceType);
+        assert(!LSBInstallGuestDeviceCapabilities(runtimeRoot, oldProfile));
+        if (scenario != 2) stageDeviceProfile(target, scenario == 3 ? [@"invalid plist" dataUsingEncoding:NSUTF8StringEncoding] : deviceProfile(target));
+        if (scenario == 1) startingJob = launchd;
+        if (scenario == 5) jobs = nil; // Native Start gate has not launched any guest yet.
+        __block unsigned calls = 0;
+        __block int result = -1;
+        __block BOOL restarted = YES;
+        uint64_t generation = rebootGeneration;
+        LSBHostApplyDeviceType(scenario == 0 ? nil : scenario == 4 ? sessionDeviceType : target, ^(int error, BOOL restart) {
+            ++calls; result = error; restarted = restart;
+        });
+        int expected[] = {EINVAL, EBUSY, ENOENT, EINVAL, 0, 0};
+        assert(calls == 1 && result == expected[scenario] && !restarted);
+        assert(!sessionDraining && rebootGeneration == generation && !pendingDeviceType && !deviceChangeCompletion);
+        assert(!submittedLaunches && !deliveredSignals && [[NSData dataWithContentsOfFile:activeDeviceProfilePath()] isEqual:oldProfile]);
+        assert(devicePreferenceWrites == (scenario == 5 ? 1 : 0));
+        if (scenario == 5) assert(testConfiguredDeviceType() == target);
+        else assert(findJob(launchd.identifier) == launchd);
+        resetBroker();
+        assert([NSFileManager.defaultManager removeItemAtPath:directory error:NULL]);
+    }
+}
+
+static void testDeviceApplyWaitsForRootAndPersistsSelection(void) {
+    resetBroker();
+    NSString *directory = makeRebootRuntime();
+    rememberRebootInputs();
+    sessionDeviceType = LSBDefaultGuestDeviceType();
+    NSData *oldProfile = deviceProfile(sessionDeviceType);
+    assert(!LSBInstallGuestDeviceCapabilities(runtimeRoot, oldProfile));
+    LSBGuestDeviceType *target = LSBGuestDeviceTypeForIdentifier(@"ipad-a16");
+    NSData *newProfile = deviceProfile(target);
+    NSString *stagedPath = stageDeviceProfile(target, newProfile);
+    LSBJob *launchd = terminalLaunchd();
+    managedJob(launchd, 6701);
+    enableIndigo = YES;
+    runningBoardError = 0;
+    assert(LSBHostCanApplyDeviceType());
+    __block unsigned calls = 0;
+    __block int result = -1;
+    __block BOOL restarted = NO;
+    LSBHostApplyDeviceType(target, ^(int error, BOOL restart) { ++calls; result = error; restarted = restart; });
+    assert(sessionDraining && !jobs.count && rebootPendingDeaths.count == 2 && rebootDeathMonitors.count == 2);
+    assert(!calls && !devicePreferenceWrites && !submittedLaunches && deliveredSignals == 2);
+    assert(!LSBHostCanApplyDeviceType() && LSBHostCurrentDeviceType() == LSBDefaultGuestDeviceType());
+    assert([[NSData dataWithContentsOfFile:activeDeviceProfilePath()] isEqual:oldProfile]);
+    __block unsigned concurrentCalls = 0;
+    LSBHostApplyDeviceType(LSBGuestDeviceTypeForIdentifier(@"iphone-11"), ^(int error, BOOL restart) {
+        ++concurrentCalls; assert(error == EBUSY && !restart);
+    });
+    assert(concurrentCalls == 1 && !calls && pendingDeviceType == target);
+    LSBRunningBoardExitHandler rootExit = ((LSBRunningBoardMonitor *)rebootDeathMonitors[0]).completion;
+    LSBRunningBoardExitHandler childExit = ((LSBRunningBoardMonitor *)rebootDeathMonitors[1]).completion;
+    childExit(SIGKILL, 0);
+    assert(rebootPendingDeaths.count == 1 && !calls && !submittedLaunches);
+    assert([rebootPendingDeaths containsObject:@(launchd.identifier)]);
+    assert([[NSData dataWithContentsOfFile:activeDeviceProfilePath()] isEqual:oldProfile]);
+    assert(!unlink(stagedPath.fileSystemRepresentation)); // Installation uses the validated snapshot, never a later source reread.
+    rootExit(SIGKILL, 0);
+    assert(calls == 1 && !result && restarted && !sessionDraining && !rebootDrainFailed);
+    assert(!pendingDeviceType && !pendingDeviceCapabilities && !deviceChangeCompletion);
+    assert(submittedLaunches == 1 && jobs.count == 1 && startingJob.simulatorLaunchd);
+    assert([[NSData dataWithContentsOfFile:activeDeviceProfilePath()] isEqual:newProfile]);
+    assert(devicePreferenceWrites == 1 && testConfiguredDeviceType() == target && LSBHostCurrentDeviceType() == target);
+    sessionDeviceType = nil;
+    assert(LSBHostCurrentDeviceType() == target); // Selection survives dropping the in-memory session selection.
+    sessionDeviceType = target;
+    for (NSString *scope in @[@"Self", @"Child"]) {
+        assert([rebootConfiguration()[scope][@"SIMULATOR_PRODUCT_CLASS"] isEqual:target.productClass]);
+        assert([rebootConfiguration()[scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqual:target.modelIdentifier]);
+    }
+    rootExit(SIGKILL, 0); childExit(SIGKILL, 0);
+    assert(calls == 1 && submittedLaunches == 1);
+    // The next graphical launchd receives a new framebuffer with the selected immutable geometry.
+    enableIndigo = YES;
+    LSBJob *geometryJob = managedJob(nil, getpid());
+    geometryJob.simulatorLaunchd = YES;
+    assert(!prepareLaunchdHandshake(geometryJob));
+    LSBFramebufferGeometry geometry = geometryJob.framebuffer.geometry;
+    assert(geometry.width == target.width && geometry.height == target.height && geometry.scale == target.scale && geometry.dotPitch == target.pitch);
+    resetBroker();
+    assert([NSFileManager.defaultManager removeItemAtPath:directory error:NULL]);
+}
+
+static void testDeviceApplyFailureDoesNotOverlapSessions(void) {
+    for (unsigned installFailure = 0; installFailure < 2; ++installFailure) {
+        resetBroker();
+        NSString *directory = makeRebootRuntime();
+        rememberRebootInputs();
+        sessionDeviceType = LSBDefaultGuestDeviceType();
+        NSData *oldProfile = deviceProfile(sessionDeviceType);
+        assert(!LSBInstallGuestDeviceCapabilities(runtimeRoot, oldProfile));
+        LSBGuestDeviceType *target = LSBGuestDeviceTypeForIdentifier(@"iphone-8-plus");
+        stageDeviceProfile(target, deviceProfile(target));
+        LSBJob *launchd = terminalLaunchd();
+        managedJob(launchd, 6702);
+        enableIndigo = YES;
+        runningBoardError = 0;
+        __block unsigned calls = 0;
+        __block int result = 0;
+        LSBHostApplyDeviceType(target, ^(int error, BOOL restarted) { (void)restarted; ++calls; result = error; });
+        assert(!calls && sessionDraining && rebootPendingDeaths.count == 2);
+        LSBRunningBoardExitHandler rootExit = ((LSBRunningBoardMonitor *)rebootDeathMonitors[0]).completion;
+        LSBRunningBoardExitHandler childExit = ((LSBRunningBoardMonitor *)rebootDeathMonitors[1]).completion;
+        if (installFailure) {
+            assert(!unlink(activeDeviceProfilePath().fileSystemRepresentation));
+            assert(!mkdir(activeDeviceProfilePath().fileSystemRepresentation, 0700));
+        }
+        rootExit(SIGKILL, installFailure ? 0 : EIO);
+        assert(!calls && !submittedLaunches && rebootPendingDeaths.count == 1);
+        childExit(SIGKILL, 0);
+        assert(calls == 1 && result && sessionDraining && rebootDrainFailed && !LSBHostCanApplyDeviceType());
+        assert(!submittedLaunches && !jobs.count && !devicePreferenceWrites && !pendingDeviceType && !deviceChangeCompletion);
+        assert(LSBHostCurrentDeviceType() == LSBDefaultGuestDeviceType());
+        if (!installFailure) assert([[NSData dataWithContentsOfFile:activeDeviceProfilePath()] isEqual:oldProfile]);
+        completeUserspaceReboot(rebootGeneration);
+        assert(calls == 1 && !submittedLaunches); // An error cannot replay completion or begin a second generation.
+        resetBroker();
+        assert([NSFileManager.defaultManager removeItemAtPath:directory error:NULL]);
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         alarm(10);
@@ -3868,6 +4048,9 @@ int main(void) {
         testRebootWaitsForOldGenerationAndRegeneratesConfiguration();
         testRebootDrainFailureGuards();
         testRebootPreservesQueuedKqueueCallbacks();
+        testDeviceApplyPreflight();
+        testDeviceApplyWaitsForRootAndPersistsSelection();
+        testDeviceApplyFailureDoesNotOverlapSessions();
         resetBroker();
         puts("Broker: authentication, FD ownership, exit/kill, orphan cleanup, graphics registration/exec gating, Mach handoff, and source cancellation passed");
     }
