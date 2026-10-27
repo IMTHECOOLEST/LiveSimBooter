@@ -137,7 +137,7 @@ static void startNextJob(void);
 static int signalJob(LSBJob *child, int signalNumber);
 static int signalTerminal(pid_t foreground, int signalNumber);
 static BOOL launchdOwnsChildIdentity(LSBJob *job);
-static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, int *result);
+static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, const char *name, int *result);
 static void registerReplacementSpringBoardMetal(LSBJob *active, LSBJob *helper);
 
 LSBTerminalSession *LSBHostTerminal(void) { return hostTerminal; }
@@ -812,7 +812,7 @@ static void startNextJob(void) {
             // enqueueJob can advance the launch lane synchronously. Install the dependency first and rescan the changed job list.
             ++finishingDepth;
             int error = 0;
-            LSBJob *helper = enqueueNativeMetalHelper(NO, &error);
+            LSBJob *helper = enqueueNativeMetalHelper(NO, "Metal.SpringBoard", &error);
             parent.springBoardMetalServiceIdentifier = helper.identifier;
             parent.springBoardMetalError = error;
             parent.springBoardMetalPending = helper != nil;
@@ -1706,7 +1706,7 @@ static int initialPlan(LSBReceivedMessage *message, int argc, const char *argv[]
     return error ? error : LSBValidateSpawnPlan(plan);
 }
 
-static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, int *result) {
+static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, const char *name, int *result) {
     const char *arguments[] = { "LiveSimBooter", "--native-metal-probe", NULL };
     LSBReceivedMessage *request = calloc(1, sizeof(*request));
     if (!request) { *result = ENOMEM; return nil; }
@@ -1714,7 +1714,7 @@ static LSBJob *enqueueNativeMetalHelper(BOOL publicAccess, int *result) {
     int readOnlyFD = -1;
     int error = initialPlan(request, 2, arguments, NULL);
     if (!error) error = LSBPlanAddString(&request->plan, "/__LiveSimBooterNativeMetalService", &request->plan.path);
-    request->plan.argv[0] = request->plan.path;
+    if (!error) error = LSBPlanAddString(&request->plan, name, &request->plan.argv[0]);
     if (!error) error = LSBNativeMetalControlCreate(runtimeRoot.stringByDeletingLastPathComponent.fileSystemRepresentation, &control, &readOnlyFD);
     if (!error && publicAccess) error = LSBNativeMetalControlPublishPublic(control);
     if (!error) {
@@ -1745,9 +1745,9 @@ static int enqueueInitialJob(LSBReceivedMessage *initial, uint32_t executionRole
     ++finishingDepth;
     BOOL nativeConfigdSelected = initialNativeConfigdPending;
     int error = 0, springBoardError = 0;
-    LSBJob *helper = enqueueNativeMetalHelper(NO, &error);
-    LSBJob *springBoard = helper && enableSpringBoardMetal ? enqueueNativeMetalHelper(NO, &springBoardError) : nil;
-    LSBJob *publicHelper = helper ? enqueueNativeMetalHelper(YES, &error) : nil;
+    LSBJob *helper = enqueueNativeMetalHelper(NO, "Metal.backboardd", &error);
+    LSBJob *springBoard = helper && enableSpringBoardMetal ? enqueueNativeMetalHelper(NO, "Metal.SpringBoard", &springBoardError) : nil;
+    LSBJob *publicHelper = helper ? enqueueNativeMetalHelper(YES, "Metal.public", &error) : nil;
     LSBJob *launchd = publicHelper ? enqueueJob(initial, nil, executionRole) : nil;
     if (!publicHelper) disposeMessage(initial);
     if (launchd) {

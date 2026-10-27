@@ -1768,6 +1768,7 @@ static LSBJob *queueNativeMetalSessionWithSpringBoard(LSBJob **launchd, const LS
     assert((*launchd).simulatorLaunchd && !(*launchd).parentIdentifier && (*launchd).nativeMetalServiceIdentifier == helper.identifier);
     assert((*launchd).phase == JobQueued && !helper.request->plan.envc && helper.request->plan.argc == 1);
     assert(!strcmp(helper.request->plan.strings + helper.request->plan.path, "/__LiveSimBooterNativeMetalService"));
+    assert(!strcmp(helper.request->plan.strings + helper.request->plan.argv[0], "Metal.backboardd"));
     unsigned index = helper.request->plan.fdCount - 1;
     assert(helper.request->plan.fds[index].number == 3 && !helper.request->plan.fds[index].flags);
     assert((fcntl(helper.request->fds[index], F_GETFL) & O_ACCMODE) == O_RDONLY);
@@ -1779,11 +1780,13 @@ static LSBJob *queueNativeMetalSessionWithSpringBoard(LSBJob **launchd, const LS
         assert(!fstat(second.request->fds[second.request->plan.fdCount - 1], &secondFile));
         assert(firstFile.st_dev != secondFile.st_dev || firstFile.st_ino != secondFile.st_ino);
         assert(helper.nativeMetalControl != second.nativeMetalControl && second.nativeMetalControl);
+        assert(!strcmp(second.request->plan.strings + second.request->plan.argv[0], "Metal.SpringBoard"));
         assert((*launchd).springBoardMetalSelected && (*launchd).springBoardMetalServiceIdentifier == second.identifier);
     }
     LSBJob *publicHelper = findJob((*launchd).publicMetalServiceIdentifier);
     assert(publicHelper && publicHelper == jobs[jobs.count - 2] && publicHelper != helper && !publicHelper.parentIdentifier);
     assert(publicHelper.nativeMetalControl && publicHelper.nativeMetalControl != helper.nativeMetalControl);
+    assert(!strcmp(publicHelper.request->plan.strings + publicHelper.request->plan.argv[0], "Metal.public"));
     LSBNativeMetalAuthorization authorization;
     assert(!LSBNativeMetalControlRead(publicHelper.nativeMetalControl, &authorization) && authorization.authorized && authorization.publicAccess);
     audit_token_t empty = {{0}};
@@ -2558,6 +2561,7 @@ static void testSpringBoardMetalRestart(void) {
         for (LSBJob *job in jobs) if (job.request == request) replacement = job;
         assert(replacement && replacement.phase == JobQueued && startingJob == replacementHelper && !replyFor(object));
         assert(replacementHelper.identifier != retiredHelper.identifier && replacementHelper.nativeMetalControl != retiredHelper.nativeMetalControl);
+        assert(!strcmp(replacementHelper.request->plan.strings + replacementHelper.request->plan.argv[0], "Metal.SpringBoard"));
         assert(!launchd.springBoardMetalRestartAllowed && launchd.springBoardMetalPending && !launchd.springBoardMetalError);
         assert(!LSBNativeMetalControlImport(replacementHelper.request->fds[replacementHelper.request->plan.fdCount - 1], &replacementReader));
         assert(!LSBNativeMetalControlRead(replacementReader, &observed) && !observed.authorized && !observed.publicAccess);

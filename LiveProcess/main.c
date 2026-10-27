@@ -4,6 +4,7 @@
 #include "ChildStatus.h"
 #include "NativeProbeLoader.h"
 #include "ExecutablePath.h"
+#include "ProcessDisplayName.h"
 #include "../NativeMetal/Backend.h"
 #include <errno.h>
 #include <dlfcn.h>
@@ -112,14 +113,16 @@ static int runNativeMetalService(int error, int planApplied) {
         fprintf(stderr, "[LiveProcess] Native Metal service preparation failed: %s %s\n", strerror(error ? error : readyError), detail);
         return 1;
     }
-    fprintf(stderr, "[LiveProcess] pid=%d native Metal service ready; host cache retained\n", getpid());
+    fprintf(stderr, "[LiveProcess] pid=%d %s ready; host cache retained\n", getpid(), launch.plan.strings + launch.plan.argv[0]);
     fflush(stderr);
     run();
     return 1; // The service owns the process until the broker terminates it.
 }
 
 int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char *apple[]) {
-    (void)argc; (void)argv; (void)envp;
+    (void)envp;
+    char *nativeArgv0 = argc > 0 && argv && argv[0] ? (char *)argv[0] : NULL;
+    size_t nativeArgv0Capacity = nativeArgv0 ? strlen(nativeArgv0) + 1 : 0;
     // Cancel launchd's extension-alive timer through its C API before any broker retry.
     launch_extension_check_in_live_4UIKit();
     int error = LSBRequireSingleThread();
@@ -133,6 +136,10 @@ int NSExtensionMain(int argc, const char *argv[], const char *envp[], const char
         if (error == EAGAIN) usleep(100000);
     }
     if (error) { fprintf(stderr, "[LiveProcess] Check-in failed: %s\n", strerror(error)); return 1; }
+    const char *displayName = launch.plan.strings + (launch.executionRole == LSB_EXECUTION_NATIVE_METAL_SERVICE ?
+        launch.plan.argv[0] : launch.plan.path);
+    int nameError = LSBSetProcessDisplayName(displayName, nativeArgv0, nativeArgv0Capacity);
+    if (nameError) fprintf(stderr, "[LiveProcess] Could not set native process name: %s\n", strerror(nameError));
     error = prepareStatus();
     if (!error) error = LSBApplySpawnPlanPreservingFD(&launch.plan, received, launch.wakeFD);
     int planApplied = !error;

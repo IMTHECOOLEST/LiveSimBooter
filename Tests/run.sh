@@ -47,6 +47,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ExecutablePathTests.c LiveProcess/ExecutablePath.c -o "$test_directory/ExecutablePath"
 "$test_directory/ExecutablePath"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/ProcessDisplayNameTests.c -o "$test_directory/ProcessDisplayName"
+"$test_directory/ProcessDisplayName"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/UserHomeCompatibilityTests.c -o "$test_directory/UserHomeCompatibility"
 "$test_directory/UserHomeCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
