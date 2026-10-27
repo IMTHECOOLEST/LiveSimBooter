@@ -1997,10 +1997,20 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
     assert([manager createDirectoryAtPath:daemons withIntermediateDirectories:YES attributes:nil error:NULL]);
     NSArray *selected = @[@"com.apple.notifyd", @"com.apple.lsd", @"com.apple.runningboardd", @"com.apple.containermanagerd",
         @"com.apple.fontservicesd", @"com.apple.containermanagerd.system", @"com.apple.distnoted.xpc.daemon", @"com.apple.configd_sim",
-        @"com.apple.sleepd", @"com.apple.SpringBoard", @"com.apple.iconservices.iconservicesagent"];
+        @"com.apple.sleepd", @"com.apple.systemstatusd", @"com.apple.SpringBoard", @"com.apple.iconservices.iconservicesagent"];
+    NSDictionary *enabled = @{@"#IfFeatureFlagEnabled": @"SystemStatus/EmbeddedDaemon", @"#Then": @YES};
+    NSDictionary *disabled = @{@"#IfFeatureFlagDisabled": @"SystemStatus/EmbeddedDaemon", @"#Then": @YES};
+    NSArray *statusServices = @[@"com.apple.systemstatus", @"com.apple.systemstatus.publisher", @"com.apple.systemstatus.activityattribution"];
     for (NSString *label in selected) {
         NSString *program = [label isEqual:@"com.apple.SpringBoard"] ? @"/System/Library/CoreServices/SpringBoard.app/SpringBoard" : @"/bin/df";
         NSDictionary *job = @{@"Label": label, @"ProgramArguments": @[program]};
+        if ([label isEqual:@"com.apple.systemstatusd"] || [label isEqual:@"com.apple.SpringBoard"]) {
+            BOOL separate = [label isEqual:@"com.apple.systemstatusd"];
+            NSString *statusProgram = separate ? @"/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" : program;
+            job = @{@"Label": label, @"ProgramArguments": @[statusProgram],
+                @"MachServices": [NSDictionary dictionaryWithObjects:@[separate ? enabled : disabled, separate ? enabled : disabled,
+                    separate ? enabled : disabled] forKeys:statusServices]};
+        }
         assert([job writeToFile:[daemons stringByAppendingPathComponent:[label stringByAppendingString:@".plist"]] atomically:YES]);
     }
     NSDictionary *backboard = @{@"MachServices": @{@"com.apple.backboardd.virtualframebuffer": @YES}};
@@ -2033,6 +2043,16 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
             [jobDirectory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.terminal-fish.plist"]];
         assert(([terminal[@"ProgramArguments"] isEqual:@[@"/usr/libexec/terminal-fish"]]));
         assert([terminal[@"RunAtLoad"] boolValue] && ![terminal[@"KeepAlive"] boolValue]);
+        NSDictionary *status = [NSDictionary dictionaryWithContentsOfFile:
+            [jobDirectory stringByAppendingPathComponent:@"com.apple.systemstatusd.plist"]];
+        NSDictionary *springBoard = [NSDictionary dictionaryWithContentsOfFile:
+            [jobDirectory stringByAppendingPathComponent:@"com.apple.SpringBoard.plist"]];
+        assert(([status[@"ProgramArguments"] isEqual:@[@"/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd"]]));
+        for (NSString *name in statusServices) {
+            assert([status[@"MachServices"][name] isEqual:enabled]);
+            assert([springBoard[@"MachServices"][name] isEqual:disabled]);
+        }
+        assert([status[@"RunAtLoad"] boolValue] && ![status[@"KeepAlive"] boolValue] && ![status[@"EnableTransactions"] boolValue]);
         disposeMessage(initial);
     }
     resetBroker();

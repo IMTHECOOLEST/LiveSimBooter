@@ -13,7 +13,7 @@ xcrun --sdk iphonesimulator clang -arch arm64 -target arm64-apple-ios14.0-simula
     Guest/ProcessIdentity.c Guest/ProcessEvents.c Guest/ProcessSession.c Guest/FakePTY.c Guest/FileLockCompatibility.c \
     Guest/ThreadBootstrap.c Guest/MetalCompilerRegistration.c \
     Guest/WorkqueueBootstrap.c Guest/LaunchdCompatibility.c Guest/LaunchdIdentity.c Guest/LaunchdJobIdentity.c \
-    Guest/XPCWireCompatibility.c Guest/SystemPowerCompatibility.c \
+    Guest/XPCWireCompatibility.c Guest/SystemPowerCompatibility.c Guest/LoggingCompatibility.c \
     Guest/FrameworkBundleCompatibility.c Guest/NotificationSharedMemory.c Guest/CodeSigningCompatibility.c Guest/SpringBoardEntitlements.c \
     Guest/PeerProcessCompatibility.c Guest/ExtensionKitRegistration.c Guest/UserHomeCompatibility.c Guest/SharedCachePathCompatibility.c \
     ProcessSupport/ChildStatus.c ProcessSupport/FakePTY.c \

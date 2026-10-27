@@ -187,6 +187,17 @@ DYLD_INSERT_LIBRARIES="$test_directory/libNotificationSharedMemory.dylib" "$test
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/CodeSigningCompatibilityTests.c -framework CoreFoundation -o "$test_directory/CodeSigningCompatibility"
 "$test_directory/CodeSigningCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_GUEST_RUNTIME \
+    Tests/LoggingCompatibilityTests.c -o "$test_directory/LoggingCompatibility"
+"$test_directory/LoggingCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/LoggingCompatibilityTests.c -o "$test_directory/LoggingCompatibilityNative"
+"$test_directory/LoggingCompatibilityNative"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_GUEST_RUNTIME -dynamiclib \
+    Guest/LoggingCompatibility.c -o "$test_directory/libLoggingCompatibility.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_LOGGING_INTERPOSE_TESTING \
+    Tests/LoggingCompatibilityTests.c -o "$test_directory/LoggingCompatibilityInterpose"
+DYLD_INSERT_LIBRARIES="$test_directory/libLoggingCompatibility.dylib" "$test_directory/LoggingCompatibilityInterpose"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/GuestEntitlementsTests.c ProcessSupport/GuestEntitlements.c -o "$test_directory/GuestEntitlements"
 "$test_directory/GuestEntitlements"
