@@ -10,6 +10,10 @@ FOUNDATION_EXPORT NSNotificationName const LSBGuestDeviceSettingsDidChangeNotifi
 @property (nonatomic, readonly, copy) NSArray<LSBGuestDeviceType *> *deviceTypes;
 @property (nonatomic, readonly, copy) NSString *currentIdentifier, *statusText;
 @property (nonatomic, readonly) BOOL pending, canApply, outcomeUnknown;
+// Saved host-presentation preference; effective only for home-button devices and iPads. It never restarts a guest.
+@property (nonatomic, readonly) BOOL fullWidth;
+- (instancetype)initWithDefaults:(NSUserDefaults *)defaults;
 - (void)refresh;
 - (void)applyDeviceIdentifier:(NSString *)identifier;
+- (void)setFullWidth:(BOOL)enabled;
 @end

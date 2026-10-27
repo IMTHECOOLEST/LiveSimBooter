@@ -22,14 +22,16 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSArray<LSBGuestDeviceType *> *catalog = LSBGuestDeviceTypes();
         assert(catalog.count == 7 && catalog == LSBGuestDeviceTypes());
-        const struct { const char *identifier, *model, *product; NSUInteger width, height, scale, pitch; BOOL experimental; } expected[] = {
-            {"iphone-8", "iPhone10,4", "D20", 750, 1334, 2, 326, YES},
-            {"iphone-8-plus", "iPhone10,5", "D21", 1242, 2208, 3, 461, YES},
-            {"iphone-se-2", "iPhone12,8", "D79", 750, 1334, 2, 326, NO},
-            {"iphone-11", "iPhone12,1", "N104", 828, 1792, 2, 326, NO},
-            {"iphone-15-pro-max", "iPhone16,2", "D84", 1290, 2796, 3, 460, NO},
-            {"ipad-9", "iPad12,2", "J182", 1620, 2160, 2, 264, NO},
-            {"ipad-a16", "iPad15,7", "J481", 1640, 2360, 2, 264, NO},
+        const struct {
+            const char *identifier, *model, *product; NSUInteger width, height, scale, pitch; BOOL experimental, home, pad;
+        } expected[] = {
+            {"iphone-8", "iPhone10,4", "D20", 750, 1334, 2, 326, YES, YES, NO},
+            {"iphone-8-plus", "iPhone10,5", "D21", 1242, 2208, 3, 461, YES, YES, NO},
+            {"iphone-se-2", "iPhone12,8", "D79", 750, 1334, 2, 326, NO, YES, NO},
+            {"iphone-11", "iPhone12,1", "N104", 828, 1792, 2, 326, NO, NO, NO},
+            {"iphone-15-pro-max", "iPhone16,2", "D84", 1290, 2796, 3, 460, NO, NO, NO},
+            {"ipad-9", "iPad12,2", "J182", 1620, 2160, 2, 264, NO, YES, YES},
+            {"ipad-a16", "iPad15,7", "J481", 1640, 2360, 2, 264, NO, NO, YES},
         };
         NSURL *root = [NSURL fileURLWithPath:@"/fixture/RuntimeRoot" isDirectory:YES];
         for (unsigned i = 0; i < sizeof(expected) / sizeof(*expected); ++i) {
@@ -38,6 +40,7 @@ int main(int argc, const char *argv[]) {
             assert([device.productClass isEqual:@(expected[i].product)] && device.displayName.length && device.detailText.length);
             assert(device.width == expected[i].width && device.height == expected[i].height && device.scale == expected[i].scale &&
                    device.pitch == expected[i].pitch && device.experimental == expected[i].experimental);
+            assert(device.hasHomeButton == expected[i].home && device.isPad == expected[i].pad);
             assert(LSBGuestDeviceTypeForIdentifier(device.identifier) == device);
             NSString *path = [NSString stringWithFormat:@"/fixture/RuntimeRoot/Library/Developer/CoreSimulator/DeviceTypes/%@/capabilities.plist", device.identifier];
             assert([[device capabilitiesURLInRuntimeRoot:root].path isEqual:path]);

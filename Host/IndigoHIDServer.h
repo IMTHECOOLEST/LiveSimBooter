@@ -32,5 +32,12 @@ typedef NS_ENUM(unsigned, LSBIndigoTouchPhase) {
 - (int)sendKeyboardUsage:(uint32_t)usage pressed:(BOOL)pressed;
 // Release every accepted key on focus/window/tab loss. EAGAIN schedules generation-bound, nonblocking retries.
 - (int)releaseAllKeys;
+// Built-in simulator Home button; separate from keyboard page-7 Home and never routed to the host's HID event system.
+// Accepted downs are held until an up. Duplicate down returns EALREADY; unmatched explicit up returns ENOENT.
+// A queued release returns EAGAIN and blocks new Home events with EBUSY until delivery or client replacement.
+- (int)sendHomeButtonPressed:(BOOL)pressed;
+// Idempotent cleanup for up-outside, cancellation, tab/window loss and session changes. Empty/disconnected state is harmless.
+// EAGAIN schedules generation-bound retries; callers may discard their local held state after requesting this release.
+- (int)releaseHomeButton;
 - (void)close;
 @end

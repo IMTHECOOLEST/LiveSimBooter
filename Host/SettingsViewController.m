@@ -209,6 +209,10 @@
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { (void)tableView; return 3; }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     (void)tableView;
+    if (section == 2) {
+        LSBGuestDeviceType *type = LSBGuestDeviceTypeForIdentifier(_device.currentIdentifier);
+        return type.hasHomeButton || type.isPad ? 2 : 1;
+    }
     return section == 1 ? 2 : 1;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -218,7 +222,11 @@
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     (void)tableView;
     if (section == 1) return _display.statusText;
-    if (section == 2) return _device.statusText;
+    if (section == 2) {
+        LSBGuestDeviceType *type = LSBGuestDeviceTypeForIdentifier(_device.currentIdentifier);
+        if (!type.hasHomeButton && !type.isPad) return _device.statusText;
+        return [_device.statusText stringByAppendingString:@"\n\nFull width preserves the screen’s aspect ratio and fits within the available height."];
+    }
     NSString *description = @"Play silence to keep the host's audio session active in the background. Off by default. "
         "This may increase battery use. Other audio can continue playing.";
     NSString *status = _audio.statusText;
@@ -231,6 +239,20 @@
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     cell.textLabel.numberOfLines = 0;
+    if (indexPath.section == 2 && indexPath.row == 1) {
+        cell.textLabel.text = @"Use Full Width";
+        UISwitch *toggle = [UISwitch new];
+        toggle.on = _device.fullWidth;
+        toggle.accessibilityLabel = cell.textLabel.text;
+        toggle.accessibilityIdentifier = @"simulator-full-width";
+        __weak LSBSettingsViewController *weakSelf = self;
+        [toggle addAction:[UIAction actionWithHandler:^(UIAction *action) {
+            LSBSettingsViewController *controller = weakSelf;
+            if (controller) [controller->_device setFullWidth:((UISwitch *)action.sender).on];
+        }] forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = toggle;
+        return cell;
+    }
     if (indexPath.section == 2) {
         cell.textLabel.text = @"Device";
         cell.detailTextLabel.text = @"Choose…";
@@ -280,7 +302,7 @@
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 1 && indexPath.row == 0 && !_device.pending)
         [self.navigationController pushViewController:[LSBHUDSettingsViewController new] animated:YES];
-    else if (indexPath.section == 2)
+    else if (indexPath.section == 2 && indexPath.row == 0)
         [self.navigationController pushViewController:[LSBDeviceTypePickerViewController new] animated:YES];
 }
 @end

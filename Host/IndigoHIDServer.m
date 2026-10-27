@@ -57,7 +57,7 @@ typedef struct {
     int8_t parentIndex;
     uint8_t timestampFlags;
     uint16_t reserved;
-} IndigoKeyboard;
+} IndigoButton;
 #pragma pack(pop)
 _Static_assert(sizeof(IndigoPayload) == 148 && offsetof(IndigoPayload, x) == 28 && offsetof(IndigoPayload, transducerType) == 84 &&
                offsetof(IndigoPayload, target) == 76 && offsetof(IndigoPayload, parentIndex) == 144 &&
@@ -67,10 +67,10 @@ _Static_assert(offsetof(IndigoTouches, payloads) == 32, "Indigo message payload 
 _Static_assert(sizeof(IndigoCreateDigitizer) == 32 + sizeof(IndigoPayload) && offsetof(IndigoCreateDigitizer, command) == 48 &&
                offsetof(IndigoCreateDigitizer, target) == 64 && offsetof(IndigoCreateDigitizer, builtIn) == 68 &&
                offsetof(IndigoCreateDigitizer, displayUID) == 69, "Indigo create-digitizer command layout");
-_Static_assert(sizeof(IndigoKeyboard) == 32 + 148 && offsetof(IndigoKeyboard, subtype) == 48 &&
-               offsetof(IndigoKeyboard, target) == 56 && offsetof(IndigoKeyboard, usage) == 60 &&
-               offsetof(IndigoKeyboard, usagePage) == 68 && offsetof(IndigoKeyboard, parentIndex) == 32 + 144,
-               "Indigo generic keyboard payload layout");
+_Static_assert(sizeof(IndigoButton) == 32 + 148 && offsetof(IndigoButton, subtype) == 48 &&
+               offsetof(IndigoButton, target) == 56 && offsetof(IndigoButton, usage) == 60 &&
+               offsetof(IndigoButton, usagePage) == 68 && offsetof(IndigoButton, parentIndex) == 32 + 144,
+               "Indigo button/keyboard payload layout");
 
 typedef struct { uint64_t identifier; uint32_t identity; double x, y; LSBIndigoTouchEdge edge; bool active; } Touch;
 
@@ -94,6 +94,8 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
     bool _pressedKeys[KeyboardCapacity], _pendingKeyReleases[KeyboardCapacity];
     BOOL _keyReleasePending;
     uint64_t _keyReleaseGeneration;
+    BOOL _homePressed, _homeReleasePending;
+    uint64_t _homeReleaseGeneration;
 }
 - (void)drainRegistrations;
 - (void)dropClient;
@@ -106,6 +108,10 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
 - (int)flushKeyReleases;
 - (void)scheduleKeyReleaseRetry:(uint64_t)generation;
 - (void)retryKeyReleases:(uint64_t)generation;
+- (int)sendHomeButtonPacket:(BOOL)pressed;
+- (int)releaseHomeButtonLocked;
+- (void)scheduleHomeReleaseRetry:(uint64_t)generation;
+- (void)retryHomeRelease:(uint64_t)generation;
 @end
 
 @implementation LSBIndigoHIDServer
@@ -170,6 +176,9 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
     memset(_pendingKeyReleases, 0, sizeof(_pendingKeyReleases));
     _keyReleasePending = NO;
     ++_keyReleaseGeneration;
+    _homePressed = NO;
+    _homeReleasePending = NO;
+    ++_homeReleaseGeneration;
 }
 
 - (void)authorizeClientWithAuditToken:(const audit_token_t *)audit {
@@ -355,7 +364,7 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
 - (int)sendKeyboardPacket:(uint32_t)usage pressed:(BOOL)pressed {
     // SimulatorKit 1171.7 IndigoHIDMessageForHIDArbitrary(target, page, usage, operation), decoded by SimulatorHID +0x67b4.
     // Its generic subtype bypasses _IndigoHIDUpdateKeyboardType: typing must not toggle the host's keyboard attachment state.
-    IndigoKeyboard message = {.stride = 148, .count = 1, .type = 2, .timestamp = mach_absolute_time(),
+    IndigoButton message = {.stride = 148, .count = 1, .type = 2, .timestamp = mach_absolute_time(),
         .subtype = 10001, .operation = pressed ? 1 : 2, .target = 100, .usage = usage, .usagePage = 7, .parentIndex = -1};
     return [self sendMessage:&message.header size:sizeof(message)];
 }
@@ -420,6 +429,64 @@ static uint32_t digitizerEdgeMask(LSBIndigoTouchEdge edge) {
     int error = [self flushKeyReleases];
     if (error == EAGAIN) [self scheduleKeyReleaseRetry:generation];
     else if (error) [self dropClient];
+}
+
+- (int)sendHomeButtonPacket:(BOOL)pressed {
+    // SimulatorKit's IndigoHIDMessageForButton(0, operation, 51): built-in main-screen buttons, not an external keyboard.
+    // SimulatorHID 1171.7 +0x6814/+0x6a44 converts button 0 to consumer page 0x0c, usage 0x40 (Menu/Home).
+    // Receiver arm64 UUID: 5798E246-7275-356F-86D4-9A0AE3DEA378; its service table registers that built-in target at +0x7e70.
+    // Use our established 148-byte receiver stride and Mach timestamp, rather than the factory's newer 160-byte/ns form.
+    IndigoButton message = {.stride = 148, .count = 1, .type = 2, .timestamp = mach_absolute_time(),
+        .subtype = 0, .operation = pressed ? 1 : 2, .target = 51, .parentIndex = -1};
+    return [self sendMessage:&message.header size:sizeof(message)];
+}
+
+- (int)sendHomeButtonPressed:(BOOL)pressed {
+    __block int result = 0;
+    [self serialized:^{
+        if (self->_closed) { result = EBADF; return; }
+        if (!MACH_PORT_VALID(self->_eventPort)) { result = ENOTCONN; return; }
+        if (self->_homeReleasePending) { result = EBUSY; return; }
+        if (self->_homePressed == !!pressed) { result = pressed ? EALREADY : ENOENT; return; }
+        if (!pressed) { result = [self releaseHomeButtonLocked]; return; }
+        result = [self sendHomeButtonPacket:YES];
+        if (!result) self->_homePressed = YES;
+    }];
+    return result;
+}
+
+- (int)releaseHomeButtonLocked {
+    if (!_homePressed) return 0;
+    if (_homeReleasePending) return EAGAIN;
+    int error = [self sendHomeButtonPacket:NO];
+    if (!error) _homePressed = NO;
+    else if (error == EAGAIN) {
+        _homeReleasePending = YES;
+        [self scheduleHomeReleaseRetry:++_homeReleaseGeneration];
+    } else [self dropClient];
+    return error;
+}
+
+- (int)releaseHomeButton {
+    __block int result;
+    [self serialized:^{ result = [self releaseHomeButtonLocked]; }];
+    return result;
+}
+
+- (void)scheduleHomeReleaseRetry:(uint64_t)generation {
+    __weak LSBIndigoHIDServer *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), _queue, ^{ [weakSelf retryHomeRelease:generation]; });
+}
+
+- (void)retryHomeRelease:(uint64_t)generation {
+    if (_closed || !_homeReleasePending || generation != _homeReleaseGeneration) return;
+    int error = [self sendHomeButtonPacket:NO];
+    if (error == EAGAIN) [self scheduleHomeReleaseRetry:generation];
+    else if (error) [self dropClient];
+    else {
+        _homePressed = NO;
+        _homeReleasePending = NO;
+    }
 }
 
 - (void)close {

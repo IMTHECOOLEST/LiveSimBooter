@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, readonly) NSString *productClass;
 @property (nonatomic, readonly) NSUInteger width, height, scale, pitch;
 @property (nonatomic, readonly) BOOL experimental;
+@property (nonatomic, readonly) BOOL hasHomeButton, isPad;
 - (NSURL *)capabilitiesURLInRuntimeRoot:(NSURL *)root;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;

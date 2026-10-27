@@ -305,6 +305,9 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/IndigoKeyboardTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoKeyboard"
 "$test_directory/IndigoKeyboard"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/IndigoHomeButtonTests.m Host/IndigoHIDServer.m -framework Foundation -o "$test_directory/IndigoHomeButton"
+"$test_directory/IndigoHomeButton"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/SimulatorKeyboardInputTests.c -o "$test_directory/SimulatorKeyboardInput"
 "$test_directory/SimulatorKeyboardInput"
@@ -321,6 +324,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 Tests/SimulatorDisplayTests.m \
     -framework Foundation -framework CoreGraphics -framework IOSurface -framework ImageIO -o "$test_directory/SimulatorDisplay"
 "$test_directory/SimulatorDisplay"
+xcrun --sdk macosx clang -Wall -Wextra -Werror -arch arm64 Tests/SimulatorDisplayLayoutTests.m \
+    -framework CoreGraphics -o "$test_directory/SimulatorDisplayLayout"
+"$test_directory/SimulatorDisplayLayout"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/MetalDisplayRendererTests.m Host/MetalDisplayRenderer.m \
     -framework Foundation -framework QuartzCore -framework CoreGraphics -framework IOSurface -framework Metal \

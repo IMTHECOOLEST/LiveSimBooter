@@ -11,6 +11,20 @@ static unsigned requestCount;
 static int immediateError;
 static void (^pendingCompletion)(int, BOOL);
 
+@interface MemoryDeviceDefaults : NSUserDefaults
+@property(nonatomic) NSMutableDictionary<NSString *, NSNumber *> *values;
+@property(nonatomic) unsigned writes;
+@end
+@implementation MemoryDeviceDefaults
+- (instancetype)init { if ((self = [super init])) _values = [NSMutableDictionary new]; return self; }
+- (BOOL)boolForKey:(NSString *)key { return [self.values[key] boolValue]; }
+- (void)setBool:(BOOL)value forKey:(NSString *)key { self.values[key] = value ? @YES : @NO; ++self.writes; }
+@end
+
+static LSBGuestDeviceSettings *newModel(void) {
+    return [[LSBGuestDeviceSettings alloc] initWithDefaults:[MemoryDeviceDefaults new]];
+}
+
 LSBGuestDeviceType *LSBHostCurrentDeviceType(void) { return currentDevice; }
 BOOL LSBHostCanApplyDeviceType(void) { return available; }
 void LSBHostApplyDeviceType(LSBGuestDeviceType *type, void (^completion)(int, BOOL)) {
@@ -43,7 +57,7 @@ static void complete(int error, BOOL restarted) {
 static void testPendingAndBrokerReadiness(void) {
     currentDevice = LSBDefaultGuestDeviceType();
     available = YES;
-    LSBGuestDeviceSettings *model = [LSBGuestDeviceSettings new];
+    LSBGuestDeviceSettings *model = newModel();
     assert([model.currentIdentifier isEqual:currentDevice.identifier] && model.canApply && !model.pending && !model.outcomeUnknown);
     assert(model.deviceTypes.count == 7 && [model.deviceTypes isEqual:LSBGuestDeviceTypes()]);
     __block unsigned changes = 0;
@@ -87,7 +101,7 @@ static void testPendingAndBrokerReadiness(void) {
 static void testColdSelectionAndRefresh(void) {
     currentDevice = LSBDefaultGuestDeviceType();
     available = YES;
-    LSBGuestDeviceSettings *model = [LSBGuestDeviceSettings new];
+    LSBGuestDeviceSettings *model = newModel();
     [model applyDeviceIdentifier:@"iphone-11"];
     assert(model.pending && [model.currentIdentifier isEqual:@"iphone-15-pro-max"]);
     complete(0, NO); // A validated choice before Start changes preferences, without starting a session.
@@ -108,7 +122,7 @@ static void testColdSelectionAndRefresh(void) {
 static void testErrorsLeaveSelectionUnchanged(void) {
     currentDevice = LSBDefaultGuestDeviceType();
     available = YES;
-    LSBGuestDeviceSettings *model = [LSBGuestDeviceSettings new];
+    LSBGuestDeviceSettings *model = newModel();
     const struct { int error; const char *text; BOOL restarted; } cases[] = {
         {ENOENT, "profile is missing", NO}, {EBUSY, "still starting or restarting", NO},
         {EINVAL, "Device change failed", NO}, {EIO, "Reopen the host", YES}, {ETIMEDOUT, "Reopen the host", YES}
@@ -136,10 +150,49 @@ static void testErrorsLeaveSelectionUnchanged(void) {
     immediateError = 0;
 }
 
+static void testFullWidthIsPersistentHostPresentationOnly(void) {
+    currentDevice = LSBGuestDeviceTypeForIdentifier(@"iphone-se-2");
+    available = YES;
+    MemoryDeviceDefaults *defaults = [MemoryDeviceDefaults new];
+    LSBGuestDeviceSettings *model = [[LSBGuestDeviceSettings alloc] initWithDefaults:defaults];
+    assert(!model.fullWidth && !defaults.writes);
+    __block unsigned changes = 0;
+    id observer = [NSNotificationCenter.defaultCenter addObserverForName:LSBGuestDeviceSettingsDidChangeNotification object:model
+        queue:nil usingBlock:^(NSNotification *notification) { assert(notification.object == model && NSThread.isMainThread); ++changes; }];
+    unsigned count = requestCount;
+    [model setFullWidth:NO];
+    assert(!defaults.writes && !changes && requestCount == count);
+    [model setFullWidth:YES];
+    assert(model.fullWidth && defaults.writes == 1 && changes == 1 && requestCount == count);
+    assert(defaults.values.count == 1 && [defaults.values[@"LSBSimulatorFullWidth"] isEqual:@YES]);
+    [model setFullWidth:YES];
+    assert(defaults.writes == 1 && changes == 1 && requestCount == count);
+    LSBGuestDeviceSettings *reopened = [[LSBGuestDeviceSettings alloc] initWithDefaults:defaults];
+    assert(reopened.fullWidth && defaults.writes == 1);
+
+    // Changing device eligibility never destroys the user's saved presentation choice.
+    for (NSString *identifier in @[@"iphone-11", @"ipad-a16", @"iphone-se-2"]) {
+        currentDevice = LSBGuestDeviceTypeForIdentifier(identifier);
+        [model refresh];
+        assert(model.fullWidth && [model.currentIdentifier isEqual:identifier] && defaults.writes == 1 && requestCount == count);
+    }
+    [model applyDeviceIdentifier:@"ipad-9"];
+    assert(model.pending && requestCount == count + 1);
+    NSString *pendingStatus = model.statusText;
+    [model setFullWidth:NO];
+    assert(!model.fullWidth && model.pending && !model.canApply && [model.statusText isEqual:pendingStatus]);
+    assert(defaults.writes == 2 && requestCount == count + 1);
+    complete(0, YES);
+    assert(!model.pending && !model.fullWidth && requestCount == count + 1);
+    reopened = [[LSBGuestDeviceSettings alloc] initWithDefaults:defaults];
+    assert(!reopened.fullWidth && defaults.writes == 2);
+    [NSNotificationCenter.defaultCenter removeObserver:observer];
+}
+
 static void testObserverDoesNotRetainController(void) {
     __weak LSBGuestDeviceSettings *weakModel;
     @autoreleasepool {
-        LSBGuestDeviceSettings *model = [LSBGuestDeviceSettings new];
+        LSBGuestDeviceSettings *model = newModel();
         weakModel = model;
         [model refresh];
     }
@@ -152,6 +205,7 @@ int main(void) {
         testPendingAndBrokerReadiness();
         testColdSelectionAndRefresh();
         testErrorsLeaveSelectionUnchanged();
+        testFullWidthIsPersistentHostPresentationOnly();
         testObserverDoesNotRetainController();
         assert(!pendingCompletion);
         assert(LSBGuestDeviceSettings.sharedController == LSBGuestDeviceSettings.sharedController);

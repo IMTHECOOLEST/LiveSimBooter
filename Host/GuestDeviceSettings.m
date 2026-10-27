@@ -4,9 +4,11 @@
 #include <string.h>
 
 NSNotificationName const LSBGuestDeviceSettingsDidChangeNotification = @"LSBGuestDeviceSettingsDidChange";
+static NSString *const FullWidthPreference = @"LSBSimulatorFullWidth";
 
 @implementation LSBGuestDeviceSettings {
     id _sessionObserver;
+    NSUserDefaults *_defaults;
 }
 + (instancetype)sharedController {
     static LSBGuestDeviceSettings *controller;
@@ -15,7 +17,12 @@ NSNotificationName const LSBGuestDeviceSettingsDidChangeNotification = @"LSBGues
     return controller;
 }
 - (instancetype)init {
+    return [self initWithDefaults:NSUserDefaults.standardUserDefaults];
+}
+- (instancetype)initWithDefaults:(NSUserDefaults *)defaults {
     if ((self = [super init])) {
+        _defaults = defaults;
+        _fullWidth = [_defaults boolForKey:FullWidthPreference];
         _deviceTypes = LSBGuestDeviceTypes();
         _statusText = @"Apply changes the simulator display and restarts its session. App data is preserved.";
         __weak LSBGuestDeviceSettings *weakSelf = self;
@@ -24,6 +31,13 @@ NSNotificationName const LSBGuestDeviceSettingsDidChangeNotification = @"LSBGues
         [self refresh];
     }
     return self;
+}
+- (void)setFullWidth:(BOOL)enabled {
+    NSAssert(NSThread.isMainThread, @"Device settings are main-thread only");
+    if (_fullWidth == enabled) return;
+    _fullWidth = enabled;
+    [_defaults setBool:enabled forKey:FullWidthPreference];
+    [self publish];
 }
 - (void)dealloc { if (_sessionObserver) [NSNotificationCenter.defaultCenter removeObserver:_sessionObserver]; }
 - (void)publish {

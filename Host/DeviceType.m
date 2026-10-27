@@ -1,5 +1,6 @@
 #import "DeviceType.h"
 #include <errno.h>
+#include <string.h>
 
 typedef struct {
     const char *identifier, *name, *detail, *model, *product, *idiom;
@@ -44,6 +45,8 @@ static const LSBDeviceTypeDescriptor descriptors[] = {
     _scale = descriptor->scale;
     _pitch = descriptor->pitch;
     _experimental = descriptor->experimental;
+    _hasHomeButton = descriptor->homeButton == 0 || descriptor->homeButton == 1;
+    _isPad = !strcmp(descriptor->idiom, "pad");
     return self;
 }
 - (NSURL *)capabilitiesURLInRuntimeRoot:(NSURL *)root {

@@ -7,6 +7,22 @@ simulator session. `SimulatorData` is preserved. The native IOSurface, Fish, and
 
 The default remains **iPhone 15 Pro Max**. The simulated device is independent of the physical host iPhone.
 
+For a Home-button profile or either iPad, **Settings → Use Full Width** removes the normal presentation inset. This saved
+option takes effect immediately without rebooting or changing the guest's resolution. The display keeps its aspect ratio
+and fits the native safe area; if height is limiting, it uses the largest width that still fits. Home-indicator iPhones keep
+the existing inset layout. Switching profiles preserves the saved option but applies it only to eligible devices.
+
+A virtual **Home** button appears below the guest screen for iPhone 8, 8 Plus, SE2 and iPad (9th generation). It reserves a
+48-point touch target outside the framebuffer, so it does not cover simulator content. The layout keeps full width when
+the screen and button fit vertically, otherwise reducing the screen just enough to fit both. There is no extra button for
+Home-indicator profiles.
+
+The button sends stock Indigo Home down/up events to the authenticated simulator backboardd, never to the physical phone.
+Releases on drag-out, cancellation, tab/window inactivity and session replacement target the server that accepted the down.
+Queued releases are retried within that connection generation and cannot leak into a replacement session. VoiceOver activation
+sends one press/release pair. The wire format follows SimulatorKit's `IndigoHIDMessageForButton(0, operation, 51)` and
+SimulatorHID 1171.7's consumer-page Menu/Home mapping; the implementation records the inspected framework UUID and offsets.
+
 | Device | Identifier | Framebuffer pixels | Scale | Interface |
 | --- | --- | --- | ---: | --- |
 | iPhone 8 | `iphone-8` | 750 × 1334 | 2 | Home button; experimental |
@@ -67,7 +83,7 @@ is interpreted as a file path or shell command.
 The broker snapshots one profile for each session and uses it for guest environment and framebuffer construction. The
 [framebuffer server](../Host/FramebufferServer.h) copies width, height, scale, and pitch into immutable geometry. Swapchains,
 surface dimensions, and dirty rectangles must match that session. On replacement, the IOSurface tab clears the previous
-presentation and updates its aspect constraint; rendering and touch coordinates already follow the actual surface viewport.
+presentation and recomputes its fitted display frame; rendering and touch coordinates already follow the actual surface viewport.
 
 Apply is unavailable while startup or another restart is in progress. Preflight, drain, and synchronous setup failures are
 reported. Successful Apply means the replacement session was queued and is starting; it does not confirm later guest boot
@@ -108,3 +124,20 @@ separately boot-tested in this run. iPhone 8 compatibility remains experimental 
 
 The integrated `sh Tests/run.sh` suite, iPhoneOS build/signature checks and `git diff --check` passed. Evidence is under
 ignored `tmp/device-picker/`, with console output in `tmp/userspace-reboot/device-picker-baseline-console.log`.
+
+### Full-width presentation and virtual Home verification (2026-10-27)
+
+The follow-up signed host UUID was `A13D0D48-6F67-3BE5-8453-A1D2CA5EBAA2`, installed on the same iPhone18,2 with the
+same pinned runtime and cache. No guest binary or cache replacement was needed. Native host PID **14327** booted the saved
+iPad (A16) profile, then remained alive through the user's Apply to iPhone 8 Plus. The replacement session registered a
+1242 × 2208 framebuffer and reported model `iPhone10,5`, product `D21`, scale 3 and pitch 461.
+
+The user confirmed that full-width presentation and the virtual Home action both work. The iPhone 8 Plus screenshot shows
+the Home button below the framebuffer and above the native tabs; the screen is slightly width-limited to fit that combined
+height. A reported double-press failure was attributed by the user to pressing too slowly; the stock guest timing remains
+unchanged. No special double-click packet or host-side app-switcher action was added.
+
+The integrated local suite passed, including seven-profile layout coverage, fractional safe-area bounds, actual-Mach Home
+packet/authentication tests, queued-release retries and session replacement. The iPhoneOS build, signature verification and
+`git diff --check` passed. No LLDB was attached, and the final owned-process inventory contained no stopped process. Evidence
+is under ignored `tmp/full-width-home/` and `tmp/userspace-reboot/full-width-home-baseline-console.log`.

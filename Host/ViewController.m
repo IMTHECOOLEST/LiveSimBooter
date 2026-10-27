@@ -7,6 +7,9 @@
 #import "FramebufferServer.h"
 #import "SettingsViewController.h"
 #import "BackgroundAudio.h"
+#import "GuestDeviceSettings.h"
+#import "IndigoHIDServer.h"
+#include "SimulatorDisplayLayout.h"
 #include <errno.h>
 #include <string.h>
 
@@ -30,6 +33,13 @@ static void showStatus(UIViewController *controller, NSString *text) {
     ]];
 }
 
+@interface LSBVirtualHomeButton : UIButton
+@property (nonatomic, copy) BOOL (^accessibilityPress)(void);
+@end
+@implementation LSBVirtualHomeButton
+- (BOOL)accessibilityActivate { return self.enabled && self.accessibilityPress ? self.accessibilityPress() : NO; }
+@end
+
 @interface LSBSurfaceViewController : UIViewController
 @property BOOL visible;
 @property BOOL startupAttempted;
@@ -39,31 +49,68 @@ static void showStatus(UIViewController *controller, NSString *text) {
 @property (nonatomic, strong) UIButton *startButton;
 @property (nonatomic, strong) id indigoObserver;
 @property (nonatomic, strong) id framebufferObserver;
+@property (nonatomic, strong) id deviceSettingsObserver, inactiveObserver, activeObserver;
 @property (nonatomic, strong) LSBSimulatorDisplayView *simulatorDisplay;
-@property (nonatomic, strong) NSLayoutConstraint *displayAspect;
+@property (nonatomic, strong) LSBVirtualHomeButton *homeButton;
+@property (nonatomic, strong) LSBIndigoHIDServer *pressedHomeServer;
 @property (nonatomic, strong) LSBFramebufferServer *framebuffer;
 @property uint64_t displayGeneration;
 @end
 
 @implementation LSBSurfaceViewController
 - (void)dealloc {
+    [_pressedHomeServer releaseHomeButton];
     if (_indigoObserver) [NSNotificationCenter.defaultCenter removeObserver:_indigoObserver];
     if (_framebufferObserver) [NSNotificationCenter.defaultCenter removeObserver:_framebufferObserver];
+    for (id observer in @[_deviceSettingsObserver ?: NSNull.null, _inactiveObserver ?: NSNull.null, _activeObserver ?: NSNull.null])
+        if (observer != NSNull.null) [NSNotificationCenter.defaultCenter removeObserver:observer];
     _framebuffer.frameHandler = nil;
+}
+- (BOOL)pressHomeButton {
+    if (!self.visible || !self.homeButton.enabled || self.homeButton.hidden || self.pressedHomeServer ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return NO;
+    LSBIndigoHIDServer *server = self.simulatorDisplay.indigoServer;
+    if (!server) return NO;
+    int error = [server sendHomeButtonPressed:YES];
+    if (error) { fprintf(stderr, "[input] Simulator Home down: %s\n", strerror(error)); return NO; }
+    self.pressedHomeServer = server;
+    return YES;
+}
+- (void)releaseHomeButton {
+    LSBIndigoHIDServer *server = self.pressedHomeServer;
+    self.pressedHomeServer = nil;
+    int error = [server releaseHomeButton];
+    if (error && error != EAGAIN && error != ENOTCONN) fprintf(stderr, "[input] Simulator Home release: %s\n", strerror(error));
+}
+- (void)homeButtonDown:(UIButton *)button { (void)button; [self pressHomeButton]; }
+- (void)homeButtonUp:(UIButton *)button { (void)button; [self releaseHomeButton]; }
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (!self.simulatorDisplay) return;
+    LSBGuestDeviceType *device = LSBHostCurrentDeviceType();
+    LSBFramebufferGeometry geometry = self.framebuffer ? self.framebuffer.geometry : (LSBFramebufferGeometry){0};
+    CGSize pixels = self.framebuffer ? CGSizeMake(geometry.width, geometry.height) : CGSizeMake(device.width, device.height);
+    BOOL needsHome = device.hasHomeButton;
+    LSBDisplayLayout layout;
+    BOOL fits = LSBComputeSimulatorDisplayLayout(self.view.safeAreaLayoutGuide.layoutFrame, pixels, needsHome || device.isPad,
+                                                 LSBGuestDeviceSettings.sharedController.fullWidth, needsHome, &layout);
+    if (!fits || !needsHome || !CGRectEqualToRect(self.homeButton.frame, layout.homeButtonFrame)) [self releaseHomeButton];
+    self.simulatorDisplay.frame = fits ? layout.displayFrame : CGRectZero;
+    self.homeButton.hidden = !fits || !needsHome;
+    self.homeButton.enabled = fits && needsHome && self.visible && self.simulatorDisplay.indigoServer != nil &&
+                              UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    self.homeButton.frame = fits ? layout.homeButtonFrame : CGRectZero;
 }
 - (void)bindFramebuffer {
     LSBFramebufferServer *server = LSBHostFramebufferServer();
     if (_framebuffer == server) return;
+    [self releaseHomeButton];
     [self.simulatorDisplay resetPresentation];
     _framebuffer.frameHandler = nil;
     _framebuffer = server;
     uint64_t generation = ++_displayGeneration;
+    [self.view setNeedsLayout];
     if (!server) return;
-    LSBFramebufferGeometry geometry = server.geometry;
-    self.displayAspect.active = NO;
-    self.displayAspect = [self.simulatorDisplay.widthAnchor constraintEqualToAnchor:self.simulatorDisplay.heightAnchor
-                                                                        multiplier:(CGFloat)geometry.width / geometry.height];
-    self.displayAspect.active = YES;
     __weak LSBSurfaceViewController *weakSelf = self;
     __weak LSBFramebufferServer *weakServer = server;
     server.frameHandler = ^(IOSurfaceRef surface, CGRect dirtyRect, void (^completion)(int)) {
@@ -80,6 +127,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
     self.visible = YES;
     self.simulatorDisplay.presentationEnabled = YES;
     self.simulatorDisplay.userInteractionEnabled = YES;
+    [self.view setNeedsLayout];
 }
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
@@ -87,6 +135,8 @@ static void showStatus(UIViewController *controller, NSString *text) {
 }
 - (void)viewWillDisappear:(BOOL)animated {
     self.visible = NO;
+    [self releaseHomeButton];
+    self.homeButton.enabled = NO;
     self.simulatorDisplay.userInteractionEnabled = NO; // Cancels active contacts before another tab can receive touches.
     self.simulatorDisplay.presentationEnabled = NO;
     [super viewWillDisappear:animated];
@@ -143,35 +193,62 @@ static void showStatus(UIViewController *controller, NSString *text) {
     self.startButton = nil;
     if (!LSBHostUsesSimulatorDisplay()) { showStatus(self, @"This runtime has no simulator display."); return; }
     LSBSimulatorDisplayView *display = [[LSBSimulatorDisplayView alloc] initWithFrame:CGRectZero];
-    display.translatesAutoresizingMaskIntoConstraints = NO;
     display.indigoServer = LSBHostIndigoHIDServer();
     display.presentationEnabled = self.visible;
     display.userInteractionEnabled = self.visible;
     [self.view addSubview:display];
     hostDisplay = display;
     self.simulatorDisplay = display;
-    self.displayAspect = [display.widthAnchor constraintEqualToAnchor:display.heightAnchor multiplier:1290.0 / 2796.0];
-    self.displayAspect.active = YES;
+    UIButtonConfiguration *homeConfiguration = UIButtonConfiguration.grayButtonConfiguration;
+    homeConfiguration.image = [UIImage systemImageNamed:@"square"];
+    homeConfiguration.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightRegular];
+    homeConfiguration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    homeConfiguration.baseForegroundColor = UIColor.labelColor;
+    UIBackgroundConfiguration *background = homeConfiguration.background;
+    CGFloat inset = (LSBDisplayHomeButtonHitSize - LSBDisplayHomeButtonVisibleSize) / 2.0;
+    background.backgroundInsets = NSDirectionalEdgeInsetsMake(inset, inset, inset, inset);
+    background.strokeColor = UIColor.secondaryLabelColor;
+    background.strokeWidth = 1.5;
+    homeConfiguration.background = background;
+    LSBVirtualHomeButton *home = [[LSBVirtualHomeButton alloc] initWithFrame:CGRectZero];
+    home.configuration = homeConfiguration;
+    home.accessibilityLabel = @"Simulator Home";
+    home.accessibilityHint = @"Press the simulated device's Home button.";
+    home.accessibilityIdentifier = @"simulator-home-button";
+    [home addTarget:self action:@selector(homeButtonDown:) forControlEvents:UIControlEventTouchDown];
+    [home addTarget:self action:@selector(homeButtonUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
+        UIControlEventTouchCancel | UIControlEventTouchDragExit];
+    [self.view addSubview:home];
+    self.homeButton = home;
     [self bindFramebuffer];
     __weak LSBSimulatorDisplayView *weakDisplay = display;
+    __weak LSBSurfaceViewController *weakSelf = self;
+    home.accessibilityPress = ^BOOL {
+        LSBSurfaceViewController *controller = weakSelf;
+        BOOL sent = [controller pressHomeButton];
+        [controller releaseHomeButton];
+        return sent;
+    };
     self.indigoObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostIndigoDidChangeNotification object:nil
         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
             (void)notification;
+            [weakSelf releaseHomeButton];
             weakDisplay.indigoServer = LSBHostIndigoHIDServer();
+            [weakSelf.view setNeedsLayout];
         }];
-    __weak LSBSurfaceViewController *weakSelf = self;
     self.framebufferObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBHostFramebufferDidChangeNotification object:nil
         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf bindFramebuffer]; }];
-    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
-    NSLayoutConstraint *preferredWidth = [display.widthAnchor constraintEqualToAnchor:safe.widthAnchor multiplier:0.94];
-    preferredWidth.priority = UILayoutPriorityDefaultHigh;
-    [NSLayoutConstraint activateConstraints:@[
-        [display.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor],
-        [display.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
-        [display.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor multiplier:0.94],
-        [display.heightAnchor constraintLessThanOrEqualToAnchor:safe.heightAnchor multiplier:0.94],
-        preferredWidth
-    ]];
+    self.deviceSettingsObserver = [NSNotificationCenter.defaultCenter addObserverForName:LSBGuestDeviceSettingsDidChangeNotification
+        object:LSBGuestDeviceSettings.sharedController queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+            (void)notification; [weakSelf.view setNeedsLayout];
+        }];
+    self.inactiveObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+            (void)notification; [weakSelf releaseHomeButton]; weakSelf.homeButton.enabled = NO;
+        }];
+    self.activeObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+        queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) { (void)notification; [weakSelf.view setNeedsLayout]; }];
+    [self.view setNeedsLayout];
     if (self.visible) [display becomeFirstResponder];
 }
 @end
