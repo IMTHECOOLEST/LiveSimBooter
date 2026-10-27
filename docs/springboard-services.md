@@ -1404,3 +1404,75 @@ boot generations. The fixed coordinator probe returned a valid transient URL; th
 This verifies the startup crash boundary, not the wallpaper picker or presentation. Evidence:
 `results/poster-coordinator-probe.log`, `poster-coordinator-fixed.log`, `poster-bootuuid-status.log` under
 `tmp/lsd-metadata-default/`. These tests ran without LLDB.
+
+### PosterBoard scene exists while displayed output stays black
+
+The subsequent V3 diagnostic ran without a debugger on native host **12095**, with PosterBoard logical **12235** /
+native **12236**. The guest remained iOS 26.0/23A343, using the 1,353-image cache at `0x110000000`, UUID
+`73ED978A-FD25-3166-A57A-34E21BB7E5B8`. A temporary load-command dependency in a separately signed PosterBoard executable
+loaded the diagnostic; the original executable was retained. Restoration was still pending at this checkpoint.
+
+Four main-thread snapshots at **2, 10, 30 and 60 seconds** consistently found the application and its
+`com.apple.PosterBoard.switcher` scene foreground-active. `PBFPosterSwitcherSceneDelegate` owned a key, visible UIWindow
+with alpha 1 and bounds 430×932. Its loaded `PBFPosterRackCollectionViewController` had a full-size attached collection,
+a `LockScreenPosterCollectionViewCell`, a gallery-affordance cell, a section header, two buttons and a page control.
+The inspected ordinary controls had visible ancestor chains. Nevertheless, the user still saw black output, and the
+[host screenshot](../tmp/lsd-metadata-default/results/poster-scene-v3-screen.png) captured a black simulator display.
+The [V3 log](../tmp/lsd-metadata-default/results/poster-scene-v3-live.log) includes earlier launches before the V3 constructor;
+only the four labeled V3 snapshots belong to this result.
+
+These observations rule out an absent scene/root controller or wholly empty rack as the immediate explanation. They do not
+prove that its Core Animation context was submitted or visible in SpringBoard's scene host. `layerHasContents=0` on a
+composite UIKit view also does not establish missing pixels. Public Metal and IOSurface connections were accepted from
+this process, which proves connection authorization, not successful rendering or composition.
+
+Pinned static inspection narrows the next measurement. `PBFDisplayTransformer` returns the supplied display configuration
+in a set without applying a geometric transform. The switcher window has an explicit initial publication of its context ID
+through FrontBoard client setting `0x640d`, plus attach/detach updates; it does not rely solely on later notifications.
+The custom context getter is also used for touch transfer, so matching context IDs alone would not prove rendering.
+SpringBoard presents this private-role scene through CoverSheet's `CSPosterSwitcherViewController`, a traits-aware host,
+and `SBDashBoardHostedAppViewController`; their content-ready, attachment and visibility state still needs measurement.
+
+The IOSurface notifier warning is not sufficient evidence of a missing implementation: in the original 23A343 simulator
+IOSurface image, `IOSurfaceClientSetSurfaceNotify` unconditionally returns `kIOReturnUnsupported` (`0xe00002c7`).
+See the [context/hosting audit](../tmp/lsd-metadata-default/poster-context-static.md) and
+[rendering review](../tmp/lsd-metadata-default/poster-rendering-review.md) for image UUIDs and exact call sites.
+A bounded V4 context and offscreen-capture probe was pending. Offscreen capture can omit remote-backed content, so its
+ordinary local controls, success result and live output must be compared separately. No rendering fix or successful
+wallpaper picker presentation is established yet.
+
+V4 then ran without a debugger in native PosterBoard **12348**. The window context ID and published switcher context ID
+both read **910221592**. The inspected window/root/rack model and presentation layers had full-size bounds, opacity 1,
+identity transforms and no masking that explained the black display. At ten seconds,
+`drawViewHierarchyInRect:afterScreenUpdates:` returned true and produced a 430×932 offscreen image with **49,930 nonblack
+pixels**. The [guest-window PNG](../tmp/lsd-metadata-default/results/poster-scene-v4-window.png) visibly contains the
+Collections header, clock/date, poster outline, Customize and plus buttons, and page indicators. The corresponding
+[live host screenshot](../tmp/lsd-metadata-default/results/poster-scene-v4-device.png) still shows a black simulator display;
+the measurements are in [the V4 log](../tmp/lsd-metadata-default/results/poster-scene-v4-live.log).
+
+This establishes that ordinary PosterBoard UI can draw and that the custom context ID was published correctly. It does
+not establish correct remote wallpaper rendering or successful live scene composition. The next boundary is SpringBoard's
+private-role scene host and compositor visibility; the black-screen issue remains unresolved.
+
+After native PosterBoard **12348** exited, the original executable was restored from its preserved device backup. The
+temporary probe library and launch helper were moved out of RuntimeRoot, and the diagnostic launchd job was booted out.
+The user-requested guest SpringBoard restart completed with new native SpringBoard **12389**, but the
+[later live screenshot](../tmp/lsd-metadata-default/results/after-respring-later-device.png) remained black while touch
+diagnostics still rendered. A respring therefore did not resolve the symptom. The next full simulator boot began under
+native host **12420** at 17:03:54 after stopping only the owned host and children; its
+[console](../tmp/lsd-metadata-default/results/poster-full-reboot-console.log) records that separate test. The full restart
+restored the Home Screen, but the user confirmed that reopening PosterBoard still produced black output.
+
+At the user's request, a supplied arm64 simulator FLEX dylib was then loaded only into guest SpringBoard. The original
+SpringBoard executable was preserved on the device. Its temporary diagnostic copy adds a 32-byte `LC_LOAD_DYLIB /FLEX`
+command inside verified unused header padding; no section offsets or existing dependency ordinals change. The small
+bootstrap loads `/usr/local/lib/libFLEX.sim.dylib` and calls the declared `FLEXManager` API on the main queue after a
+SpringBoard window is ready. Both libraries and the executable were signed with the existing app identity/identifier;
+transfers used inactive staging and skipped post-copy checksums as requested. This is an inspection setup, not a production fix.
+
+A fresh session under native host **12494**, SpringBoard **12526**, reported the explorer visible, and a
+[device screenshot](../tmp/lsd-metadata-default/results/flex-springboard-device.png) independently confirms the FLEX toolbar
+over the guest Home Screen. No debugger was attached. The simulator was left running for the user's examination.
+The [preparation and rollback notes](../tmp/lsd-metadata-default/flex-springboard/README.md) and device activation receipt
+record the temporary files. Restore the preserved original SpringBoard executable with affected guests stopped when
+inspection ends; the normal setup guide does not install FLEX. PosterBoard's live presentation remains unresolved.

@@ -110,8 +110,8 @@ The device run used an iPhone18,2 host on iOS 27 build 24A435 and guest iOS 26.0
 was based at `0x110000000`, UUID `73ED978A-FD25-3166-A57A-34E21BB7E5B8`. The final session had native host 12095 and cfprefsd
 12128; these PIDs are historical, not setup inputs.
 
-The user confirmed the initial FPS-only HUD and later saw the Basic HUD. After the preference compatibility fix, the native
-Visualize touches control stopped reporting an error, and the user confirmed that the markers followed live on/off changes.
+The user confirmed the initial FPS-only HUD; a later screenshot established the Basic HUD. After the preference compatibility
+fix, the native Visualize touches control stopped reporting an error, and the user explicitly confirmed both live toggle directions.
 This verifies those UI operations; it does not claim that every HUD mode was visually checked or that preferences survive
 an interrupted disk flush. Local evidence is in [the Settings console](../tmp/lsd-metadata-default/results/settings-preferences-fixed-console.log),
 [the preference probe](../tmp/lsd-metadata-default/results/preferences-shm-fixed-probe.log), and
