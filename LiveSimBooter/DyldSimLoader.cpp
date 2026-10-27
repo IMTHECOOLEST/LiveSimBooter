@@ -32,6 +32,7 @@
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/dyldMain.cpp
 
 #include "DyldSimLoader.h"
+#include "../LiveProcess/StackReservation.h"
 #include "HostPreparation.h"
 #include "SharedCacheHandoff.h"
 #include "SimSyscallHelpers.h"
@@ -303,7 +304,33 @@ bool cacheOverlapFailure(const char *kind, uintptr_t address, size_t size, const
     return fail(error, detail);
 }
 
-bool imageOutsideCache(const mach_header *header, const CacheReservation &cache, std::string &error, const char *kind = "resident image") {
+bool validNativeStackExclusion(const segment_command_64 &segment, const uint8_t *command, uintptr_t slide, bool wide = true) {
+    if (slide >= LSB_STACK_RESERVATION_MAX_SLIDE || segment.cmdsize != sizeof(segment) + sizeof(section_64) ||
+        (wide ? segment.vmaddr != LSB_STACK_RESERVATION_ADDRESS : (segment.vmaddr & 0x3fff)) ||
+        segment.vmsize != (wide ? LSB_STACK_RESERVATION_SIZE : 0x4000) ||
+        segment.fileoff || segment.filesize || segment.maxprot || segment.initprot || segment.nsects != 1 || segment.flags)
+        return false;
+    auto section = read<section_64>(command + sizeof(segment));
+    return !strncmp(segment.segname, LSB_STACK_RESERVATION_SEGMENT, sizeof(segment.segname)) &&
+        !strncmp(section.segname, LSB_STACK_RESERVATION_SEGMENT, sizeof(section.segname)) &&
+        !strncmp(section.sectname, LSB_STACK_RESERVATION_SECTION, sizeof(section.sectname)) &&
+        section.addr == segment.vmaddr && section.size == segment.vmsize && !section.offset && section.align == 14 &&
+        !section.reloff && !section.nreloc && section.flags == S_ZEROFILL && !section.reserved1 && !section.reserved2 && !section.reserved3;
+}
+
+bool nativeStackPreservesArguments(uintptr_t top, size_t size, const CacheReservation &cache, std::string &error,
+                                   const CacheReservation &exclusion = {}) {
+    if (!top || !mainStackContains(top, size, top - 1)) return fail(error, "Invalid native main-stack bounds");
+    if (rangesOverlap(top - size, size, cache.address, cache.size))
+        return fail(error, "Kernel fallback stack still overlaps simulator cache; refusing to overwrite native process arguments");
+    if (rangesOverlap(top - size, size, exclusion.address, exclusion.size))
+        return fail(error, "Kernel fallback stack overlaps native exclusion; refusing to release native process arguments");
+    return true;
+}
+
+bool imageOutsideCache(const mach_header *header, const CacheReservation &cache, std::string &error, const char *kind = "resident image",
+                       CacheReservation *nativeStackExclusion = nullptr) {
+    if (nativeStackExclusion) *nativeStackExclusion = {};
     if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 16 * 1024 * 1024)
         return fail(error, "Cannot validate the resident image against the simulator cache");
     const uint8_t *commands = reinterpret_cast<const uint8_t *>(header) + sizeof(mach_header_64);
@@ -329,6 +356,18 @@ bool imageOutsideCache(const mach_header *header, const CacheReservation &cache,
         auto command = read<load_command>(commands + offset);
         if (command.cmd == LC_SEGMENT_64) {
             auto segment = read<segment_command_64>(commands + offset);
+            if (nativeStackExclusion && !strncmp(segment.segname, LSB_STACK_RESERVATION_SEGMENT, sizeof(segment.segname))) {
+                bool wide = segment.vmsize == LSB_STACK_RESERVATION_SIZE;
+                if (nativeStackExclusion->size || !validNativeStackExclusion(segment, commands + offset, slide, wide))
+                    return fail(error, "Invalid native stack-exclusion segment");
+                if (wide) {
+                    // Experimental only: the loader's exact file-empty reservation may be released. Guest images receive no exemption.
+                    *nativeStackExclusion = {segment.vmaddr + slide, static_cast<size_t>(segment.vmsize)};
+                    offset += command.cmdsize;
+                    continue;
+                }
+                // Default builds retain the linked 16 KiB placeholder, with ordinary collision checks and no deallocation.
+            }
             if (segment.vmsize && strncmp(segment.segname, "__PAGEZERO", sizeof(segment.segname))) {
                 if (segment.vmaddr > UINTPTR_MAX - slide) { error = std::string(kind) + " segment address overflows"; return false; }
                 if (rangesOverlap(segment.vmaddr + slide, segment.vmsize, cache.address, cache.size)) {
@@ -340,6 +379,22 @@ bool imageOutsideCache(const mach_header *header, const CacheReservation &cache,
         offset += command.cmdsize;
     }
     return true;
+}
+
+bool releaseNativeStackExclusion(const CacheReservation &reservation, std::string &error) {
+    if (!reservation.address && !reservation.size) return true;
+    if (reservation.address < LSB_STACK_RESERVATION_ADDRESS ||
+        reservation.address - LSB_STACK_RESERVATION_ADDRESS >= LSB_STACK_RESERVATION_MAX_SLIDE ||
+        (reservation.address & 0x3fff) || reservation.size != LSB_STACK_RESERVATION_SIZE)
+        return fail(error, "Invalid native stack-exclusion release range");
+    // This is the native loader's validated zero-file, maxprot=0 segment, never its kernel-selected argument stack.
+    // Remove its Mach-O VM entry explicitly: MAP_FIXED is not assumed to replace every native loader mapping on iOS.
+    kern_return_t result = vm_deallocate(mach_task_self(), reservation.address, reservation.size);
+    if (result == KERN_SUCCESS) return true;
+    char detail[192];
+    snprintf(detail, sizeof(detail), "vm_deallocate(native stack exclusion 0x%llx-0x%llx): kern_return=%d",
+             static_cast<unsigned long long>(reservation.address), static_cast<unsigned long long>(reservation.address + reservation.size), result);
+    return fail(error, detail);
 }
 
 bool storageInResidentImage(const void *storage, const void *residentHeader, std::string &error) {
@@ -746,6 +801,7 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     }
     CacheReservation cache;
     GuardedMainStack relocatedStack;
+    CacheReservation nativeStackExclusion;
     Dl_info resident = {};
     if (!readRuntimeCacheReservation(rootPath, cache, stackError)) {
         fprintf(stderr, "Cannot prepare simulator cache reservation: %s\n", stackError.c_str());
@@ -754,7 +810,9 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     if (cache.size) {
         bool safe = dladdr(reinterpret_cast<const void *>(&LSBEnterDyldSim), &resident) && resident.dli_fbase;
         if (!safe) fail(stackError, "Cannot locate the native loader image");
-        if (safe) safe = imageOutsideCache(static_cast<const mach_header *>(resident.dli_fbase), cache, stackError, "native loader image");
+        if (safe) safe = imageOutsideCache(static_cast<const mach_header *>(resident.dli_fbase), cache, stackError,
+                                          "native loader image", &nativeStackExclusion);
+        if (safe && nativeStackExclusion.size) safe = nativeStackPreservesArguments(stackTop, stackSize, cache, stackError, nativeStackExclusion);
         if (safe && rangesOverlap(reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache.address, cache.size))
             safe = cacheOverlapFailure("mapped dyld_sim", reinterpret_cast<uintptr_t>(image->header), image->mappedSize, cache, stackError);
         if (safe) safe = imageOutsideCache(executable, cache, stackError, "simulator executable");
@@ -775,6 +833,9 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         fprintf(stderr, "Relocated simulator main stack: top 0x%llx, size 0x%llx; cache reservation 0x%llx-0x%llx\n",
                 static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize),
                 static_cast<unsigned long long>(cache.address), static_cast<unsigned long long>(cache.address + cache.size));
+    else if (nativeStackExclusion.size)
+        fprintf(stderr, "Preserved native argument stack: top 0x%llx, size 0x%llx; outside simulator cache\n",
+                static_cast<unsigned long long>(stackTop), static_cast<unsigned long long>(stackSize));
     if (!LSBInitializeSimProcessInfo(image->header, dyldPath)) {
         fprintf(stderr, "Cannot initialize simulator process info: %s\n", strerror(*LSBGetSimSyscallHelpers()->errnoAddress()));
         return 1;
@@ -834,6 +895,10 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
     int workerError = LSBValidateHostThreadCount();
     if (workerError) {
         fprintf(stderr, "Refusing host-cache detachment with native workers: %s\n", strerror(workerError));
+        return 1;
+    }
+    if (!releaseNativeStackExclusion(nativeStackExclusion, stackError)) {
+        fprintf(stderr, "Cannot release native stack exclusion: %s\n", stackError.c_str());
         return 1;
     }
     int detachError = LSBDetachHostCacheAndEnter(&launch);

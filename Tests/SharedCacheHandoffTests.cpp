@@ -43,9 +43,11 @@ static void expectEvents(std::initializer_list<Event> sequence) {
 }
 
 namespace lsb {
+int *errnoAddress() { static int error = EACCES; return &error; }
+
 ssize_t write(int fd, const void *bytes, size_t size) {
     events.push_back(Event::Diagnostic);
-    check(fd == 2 && size < 128 && reservationCalls == 1 && !entryCalls, "reservation failure emits one bounded pre-entry stderr diagnostic");
+    check(fd == 2 && size < 192 && reservationCalls == 1 && !entryCalls, "reservation failure emits one bounded pre-entry stderr diagnostic");
     reservationDiagnostic.assign(static_cast<const char *>(bytes), size);
     return -1; // Even a closed stderr must not prevent raw termination after detachment.
 }
@@ -316,6 +318,9 @@ int main() {
                   "failed reservation has only a bounded diagnostic and raw exit after its mapping attempt");
             check(reservationDiagnostic.find(wrongAddress ? "wrong address" : "mmap failed") != std::string::npos,
                   "fatal diagnostic distinguishes mmap failure from a wrong returned address");
+            if (!wrongAddress)
+                check(reservationDiagnostic.find("errno=0x0000000d address=0x0000000120000000 size=0x0000000000100000") != std::string::npos,
+                      "mmap failure reports exact numeric errno and range without host formatting or TLS");
         }
     }
     for (int status : {0, 42, 127}) {

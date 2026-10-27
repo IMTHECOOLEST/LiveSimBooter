@@ -49,6 +49,7 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/ProcessDisplayNameTests.c -o "$test_directory/ProcessDisplayName"
 "$test_directory/ProcessDisplayName"
+python3 Tests/NativeStackReservationTests.py
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/UserHomeCompatibilityTests.c -o "$test_directory/UserHomeCompatibility"
 "$test_directory/UserHomeCompatibility"

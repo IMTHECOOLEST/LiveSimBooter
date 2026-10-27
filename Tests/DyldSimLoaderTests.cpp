@@ -23,6 +23,7 @@ static void *reservedStack = MAP_FAILED;
 static bool rejectStackProtection = false, stackUsedFixedMapping = false;
 static bool sourceViewLive = false, allocatedWithParseView = false, reservationUsedOverwrite = false;
 static std::function<kern_return_t(vm_address_t *, vm_size_t, int)> allocationHook;
+static std::function<kern_return_t(vm_address_t, vm_size_t)> deallocationHook;
 static std::function<kern_return_t(vm_address_t *, vm_size_t *, mach_msg_type_number_t *, mach_port_t *)> regionHook;
 static constexpr uintptr_t freshPtrMungeToken = 0xa739c450e16b28df;
 
@@ -82,7 +83,7 @@ static int testMprotect(void *address, size_t size, int protection) {
 
 static kern_return_t testDeallocate(vm_map_t task, vm_address_t address, vm_size_t size) {
     ++deallocations;
-    return ::vm_deallocate(task, address, size);
+    return deallocationHook ? deallocationHook(address, size) : ::vm_deallocate(task, address, size);
 }
 
 #define fcntl testFcntl
@@ -132,6 +133,92 @@ static void mainStackBoundsTest() {
     check(!mainStackContains(0, 0x8000, 0), "native stack top must be nonzero");
     check(!mainStackContains(0x18000, SIZE_MAX, 0x17000), "native stack subtraction cannot wrap");
     check(!mainStackContains(0x18000, 0x18000, 0x17000), "native stack cannot extend to the null page");
+}
+
+static void nativeStackExclusionTests() {
+    struct Fixture { mach_header_64 header; segment_command_64 text, guard; section_64 section; } fixture = {};
+    fixture.header.magic = MH_MAGIC_64;
+    fixture.header.ncmds = 2;
+    fixture.header.sizeofcmds = sizeof(fixture) - sizeof(fixture.header);
+    fixture.text.cmd = fixture.guard.cmd = LC_SEGMENT_64;
+    fixture.text.cmdsize = sizeof(fixture.text);
+    strcpy(fixture.text.segname, "__TEXT");
+    fixture.text.vmaddr = reinterpret_cast<uintptr_t>(&fixture);
+    fixture.text.vmsize = fixture.text.filesize = sizeof(fixture);
+    fixture.text.initprot = fixture.text.maxprot = VM_PROT_READ | VM_PROT_EXECUTE;
+    fixture.guard.cmdsize = sizeof(fixture.guard) + sizeof(fixture.section);
+    strcpy(fixture.guard.segname, LSB_STACK_RESERVATION_SEGMENT);
+    fixture.guard.vmaddr = LSB_STACK_RESERVATION_ADDRESS;
+    fixture.guard.vmsize = LSB_STACK_RESERVATION_SIZE;
+    fixture.guard.nsects = 1;
+    strcpy(fixture.section.segname, LSB_STACK_RESERVATION_SEGMENT);
+    strcpy(fixture.section.sectname, LSB_STACK_RESERVATION_SECTION);
+    fixture.section.addr = fixture.guard.vmaddr;
+    fixture.section.size = fixture.guard.vmsize;
+    fixture.section.align = 14;
+    fixture.section.flags = S_ZEROFILL;
+    auto header = reinterpret_cast<const mach_header *>(&fixture.header);
+    const CacheReservation cache = {0x110000000, 0x100000};
+    std::string error;
+    CacheReservation reserved;
+    check(!imageOutsideCache(header, cache, error), "guest image cannot use the native stack-exclusion name to bypass collision checks");
+    check(imageOutsideCache(header, cache, error, "native loader image", &reserved) && reserved.address == fixture.guard.vmaddr && reserved.size == fixture.guard.vmsize,
+          "only exact native file-empty reservation is exempt from cache collision checks");
+    auto placeholder = fixture;
+    placeholder.text.vmaddr = reinterpret_cast<uintptr_t>(&placeholder);
+    placeholder.guard.vmsize = placeholder.section.size = 0x4000;
+    check(imageOutsideCache(reinterpret_cast<const mach_header *>(&placeholder), cache, error, "native loader image", &reserved) && !reserved.size,
+          "default tiny placeholder uses ordinary resident checks and never requests guard release");
+    check(!imageOutsideCache(reinterpret_cast<const mach_header *>(&placeholder), {placeholder.guard.vmaddr, 0x4000}, error,
+                             "native loader image", &reserved), "tiny placeholder receives no cache-collision exemption");
+    check(!imageOutsideCache(header, {fixture.text.vmaddr, sizeof(fixture)}, error, "native loader image", &reserved),
+          "native text still cannot overlap cache when it also has a valid exclusion");
+    for (unsigned invalid = 0; invalid < 10; ++invalid) {
+        auto altered = fixture;
+        switch (invalid) {
+            case 0: altered.guard.filesize = 1; break;
+            case 1: altered.guard.fileoff = 1; break;
+            case 2: altered.guard.initprot = VM_PROT_READ; break;
+            case 3: altered.guard.maxprot = VM_PROT_READ; break;
+            case 4: altered.guard.vmsize = 0x4000; break;
+            case 5: altered.guard.vmaddr += 0x4000; break;
+            case 6: altered.guard.nsects = 2; break;
+            case 7: altered.section.flags = S_REGULAR; break;
+            case 8: altered.section.nreloc = 1; break;
+            case 9: altered.section.reserved3 = 1; break;
+        }
+        check(!validNativeStackExclusion(altered.guard, reinterpret_cast<const uint8_t *>(&altered.guard), 0),
+              "malformed, readable, file-backed or unprepared reservations are rejected");
+    }
+    check(validNativeStackExclusion(fixture.guard, reinterpret_cast<const uint8_t *>(&fixture.guard), LSB_STACK_RESERVATION_MAX_SLIDE - 0x4000),
+          "last permitted native ASLR page is supported");
+    check(!validNativeStackExclusion(fixture.guard, reinterpret_cast<const uint8_t *>(&fixture.guard), LSB_STACK_RESERVATION_MAX_SLIDE),
+          "unexpected native ASLR geometry fails closed");
+    check(nativeStackPreservesArguments(0x108000000, 0x800000, cache, error), "kernel fallback stack below cache preserves argv window");
+    check(!nativeStackPreservesArguments(0x10c000000, 0x800000, cache, error,
+                                        {LSB_STACK_RESERVATION_ADDRESS, LSB_STACK_RESERVATION_SIZE}),
+          "stack in the guard's below-cache prefix cannot be released even though it does not overlap cache");
+    check(!nativeStackPreservesArguments(0x110004000, 0x800000, cache, error), "fallback inside cache fails before old argv can be overwritten");
+    check(!nativeStackPreservesArguments(0x1000, 0x2000, cache, error), "fallback stack underflow is rejected");
+    unsigned releases = 0;
+    kern_return_t releaseResult = KERN_SUCCESS;
+    const CacheReservation owned = {LSB_STACK_RESERVATION_ADDRESS + 0x4000, LSB_STACK_RESERVATION_SIZE};
+    deallocationHook = [&](vm_address_t address, vm_size_t size) {
+        ++releases;
+        check(address == owned.address && size == owned.size, "release touches only the exact slid, file-empty native guard");
+        return releaseResult;
+    };
+    check(releaseNativeStackExclusion({}, error) && !releases, "legacy native image without reservation performs no VM mutation");
+    check(releaseNativeStackExclusion(owned, error) && releases == 1, "owned guard is released once before cache reservation");
+    releaseResult = KERN_PROTECTION_FAILURE;
+    check(!releaseNativeStackExclusion(owned, error) && releases == 2 && error.find("kern_return=2") != std::string::npos,
+          "guard release failure is reported numerically before host detachment");
+    for (CacheReservation bad : {CacheReservation{owned.address + 1, owned.size}, {owned.address, 0x4000},
+                                 {LSB_STACK_RESERVATION_ADDRESS - 0x4000, owned.size},
+                                 {LSB_STACK_RESERVATION_ADDRESS + LSB_STACK_RESERVATION_MAX_SLIDE, owned.size}})
+        check(!releaseNativeStackExclusion(bad, error) && releases == 2, "malformed release cannot deallocate unrelated memory");
+    deallocationHook = {};
+
 }
 
 static CacheReservationHeader cacheHeader() {
@@ -1141,6 +1228,7 @@ int main() {
     executableMapping(dylibVariant(executable()), 0);
     executableMapping(universal(true, true, dylibVariant(executable())), page);
     mainStackBoundsTest();
+    nativeStackExclusionTests();
     cacheReservationTests();
     lowImageReservationTests();
     runtimeImageMappingTests();

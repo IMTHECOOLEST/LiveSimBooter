@@ -32,6 +32,7 @@
 #include "SharedCacheHandoff.h"
 #include "DebuggerBridge.h"
 #include "LocalPOSIX.h"
+#include "LocalRuntime.h"
 
 #include <errno.h>
 #include <sys/mman.h>
@@ -67,6 +68,11 @@ __attribute__((always_inline, no_stack_protector)) static inline int sharedRegio
 }
 #endif
 
+__attribute__((no_stack_protector)) static void writeHex(char *output, uintptr_t value, unsigned digits) {
+    static constexpr char hexadecimal[] = "0123456789abcdef";
+    for (unsigned index = digits; index; --index) { output[index - 1] = hexadecimal[value & 15]; value >>= 4; }
+}
+
 extern "C" [[noreturn]] __attribute__((noinline, no_stack_protector, visibility("hidden")))
 void LSBRunDyldSimOnPreparedStack(const LSBDyldSimLaunch *launch) {
     if (launch->cacheSize) {
@@ -75,11 +81,18 @@ void LSBRunDyldSimOnPreparedStack(const LSBDyldSimLaunch *launch) {
         // This must follow the stack switch: the native stack may occupy part of the declared cache reservation.
         void *mapping = lsb::mmap(address, launch->cacheSize, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         if (mapping == MAP_FAILED || mapping != address) {
-            static constexpr char failed[] = "[dyld_sim] Cache reservation mmap failed; exiting before dyld entry.\n";
+            static char failed[] = "[dyld_sim] Cache reservation mmap failed: errno=0x00000000 address=0x0000000000000000 size=0x0000000000000000; exiting.\n";
             static constexpr char misplaced[] = "[dyld_sim] Cache reservation returned the wrong address; exiting before dyld entry.\n";
             // One bounded attempt; stderr failure must not prevent the raw exit or enter host cleanup.
-            if (mapping == MAP_FAILED) (void)lsb::write(2, failed, sizeof(failed) - 1);
-            else (void)lsb::write(2, misplaced, sizeof(misplaced) - 1);
+            if (mapping == MAP_FAILED) {
+                // App-local TLS and fixed-buffer formatting remain safe after the native cache has disappeared.
+                writeHex(failed + sizeof("[dyld_sim] Cache reservation mmap failed: errno=0x") - 1,
+                         static_cast<unsigned>(*lsb::errnoAddress()), 8);
+                writeHex(failed + sizeof("[dyld_sim] Cache reservation mmap failed: errno=0x00000000 address=0x") - 1, launch->cacheAddress, 16);
+                writeHex(failed + sizeof("[dyld_sim] Cache reservation mmap failed: errno=0x00000000 address=0x0000000000000000 size=0x") - 1,
+                         launch->cacheSize, 16);
+                (void)lsb::write(2, failed, sizeof(failed) - 1);
+            } else (void)lsb::write(2, misplaced, sizeof(misplaced) - 1);
             exitProcess(126);
         }
     }
