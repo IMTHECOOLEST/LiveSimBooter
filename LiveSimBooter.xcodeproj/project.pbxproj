@@ -73,6 +73,8 @@
 		A9B7C410000000000000000E /* Exceptions for "Host" folder in "LiveSimBooter" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			additionalCompilerFlagsByRelativePath = {
+				BackgroundAudio.m = "-fobjc-arc";
+				BackgroundAudioPlayback.m = "-fobjc-arc";
 				Broker.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				FramebufferServer.m = "-fobjc-arc";
@@ -83,6 +85,7 @@
 				LaunchdConfiguration.m = "-fobjc-arc";
 				MetalDisplayRenderer.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
+				SettingsViewController.m = "-fobjc-arc";
 				SimulatorDisplayView.m = "-fobjc-arc";
 				TerminalSession.m = "-fobjc-arc";
 				TerminalView.m = "-fobjc-arc";
@@ -482,6 +485,8 @@
 					Metal,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					AVFoundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -534,6 +539,8 @@
 					Metal,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					AVFoundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter;
 				PRODUCT_NAME = "$(TARGET_NAME)";

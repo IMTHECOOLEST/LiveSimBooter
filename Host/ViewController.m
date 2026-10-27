@@ -5,6 +5,8 @@
 #import "TerminalView.h"
 #import "SimulatorDisplayView.h"
 #import "FramebufferServer.h"
+#import "SettingsViewController.h"
+#import "BackgroundAudio.h"
 #include <errno.h>
 #include <string.h>
 
@@ -218,7 +220,7 @@ static void showStatus(UIViewController *controller, NSString *text) {
 @implementation LSBHostViewController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    // The scene keeps both controllers and their runtime connections. Tab selection never starts or stops a process.
+    // The scene keeps the display and terminal connections. Tab selection never starts or stops a process.
     int startupError = LSBStartInitialGuest();
     LSBSurfaceViewController *surface = [LSBSurfaceViewController new];
     surface.startupError = startupError;
@@ -226,7 +228,12 @@ static void showStatus(UIViewController *controller, NSString *text) {
     LSBFishViewController *fish = [LSBFishViewController new];
     fish.startupError = startupError;
     fish.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Fish" image:[UIImage systemImageNamed:@"terminal"] tag:1];
-    self.viewControllers = @[surface, fish];
+    LSBSettingsViewController *settings = [LSBSettingsViewController new];
+    UINavigationController *settingsNavigation = [[UINavigationController alloc] initWithRootViewController:settings];
+    settingsNavigation.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Settings" image:[UIImage systemImageNamed:@"gearshape"] tag:2];
+    self.viewControllers = @[surface, fish, settingsNavigation];
+    // Restoring an explicit opt-in is the only startup path that may activate audio.
+    (void)LSBBackgroundAudio.sharedController;
     self.selectedIndex = 0;
     // Install both consumers before asynchronous check-in/output, without focusing the hidden terminal.
     [surface loadViewIfNeeded];

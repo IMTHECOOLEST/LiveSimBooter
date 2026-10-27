@@ -294,6 +294,9 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/TerminalScreenTests.m -framework Foundation -o "$test_directory/TerminalScreen"
 "$test_directory/TerminalScreen"
+xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 \
+    Tests/BackgroundAudioTests.m Host/BackgroundAudio.m -framework Foundation -o "$test_directory/BackgroundAudio"
+"$test_directory/BackgroundAudio"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/ExtensionLauncherTests.m -framework Foundation -o "$test_directory/ExtensionLauncher"
 "$test_directory/ExtensionLauncher"

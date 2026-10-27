@@ -303,6 +303,9 @@
         _display.font = _font;
         _display.editable = NO;
         _display.selectable = NO;
+        // UIKit tracks the active terminal keyboard with the scroll gesture; the output stays read-only and input stays on this view.
+        _display.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+        _display.alwaysBounceVertical = YES;
         _display.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
         _display.textContainer.lineFragmentPadding = 0;
         _display.textContainer.lineBreakMode = NSLineBreakByClipping;
