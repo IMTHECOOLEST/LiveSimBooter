@@ -164,6 +164,19 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/LaunchdCompatibilityTests.c -o "$test_directory/LaunchdCompatibility"
 "$test_directory/LaunchdCompatibility"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/FileLockCompatibilityTests.c -o "$test_directory/FileLockCompatibility"
+"$test_directory/FileLockCompatibility"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \
+    Guest/FileLockCompatibility.c -o "$test_directory/libFileLockCompatibility.dylib"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_FILE_LOCK_INTERPOSE_TESTING \
+    Tests/FileLockCompatibilityTests.c -o "$test_directory/FileLockCompatibilityInterpose"
+mkdir -p "$test_directory/file-lock-interpose/SimulatorData"
+for file_lock_enabled in 1 0; do
+    LSB_SIMULATE_FILE_LOCK_SUSPENSION="$file_lock_enabled" SIMULATOR_SHARED_RESOURCES_DIRECTORY="$test_directory/file-lock-interpose/SimulatorData" \
+        DYLD_INSERT_LIBRARIES="$test_directory/libFileLockCompatibility.dylib" \
+        "$test_directory/FileLockCompatibilityInterpose" "$test_directory/file-lock-interpose/SimulatorData"
+done
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
     Tests/NotificationSharedMemoryTests.c -o "$test_directory/NotificationSharedMemory"
 "$test_directory/NotificationSharedMemory"
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -dynamiclib \

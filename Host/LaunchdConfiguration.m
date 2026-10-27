@@ -308,6 +308,7 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"SIMULATOR_PRODUCT_CLASS": @"D84", @"SIMULATOR_MODEL_IDENTIFIER": @"iPhone16,2",
             @"SIMULATOR_HID_SYSTEM_MANAGER": [root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"],
             @"LSB_SIMULATE_SESSIONS": @"1",
+            @"LSB_SIMULATE_FILE_LOCK_SUSPENSION": @"1",
             @"SIMULATOR_SHARED_RESOURCES_DIRECTORY": dataPath, @"IPHONE_SHARED_RESOURCES_DIRECTORY": dataPath,
             @"SIMULATOR_LOG_ROOT": [dataPath stringByAppendingPathComponent:@"Library/Logs"],
             @"HOME": dataPath, @"CFFIXED_USER_HOME": dataPath, @"TMPDIR": [dataPath stringByAppendingString:@"/tmp/"],
