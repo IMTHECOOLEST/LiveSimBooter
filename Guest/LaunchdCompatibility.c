@@ -5,12 +5,53 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+static char simulatorBootUUID[37];
+static _Atomic(bool) simulatorBootUUIDReady;
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "Early sysctl forwarding must not acquire a runtime lock");
+
+#ifndef LSB_LAUNCHD_COMPATIBILITY_TESTING
+__attribute__((constructor))
+#endif
+static void initializeSimulatorBootUUID(void) {
+    // libSystem is ready before this constructor; readers never inspect environ during its earlier bootstrap.
+    const char *value = getenv(LSB_SIMULATOR_BOOT_UUID_ENV);
+    if (!value || strnlen(value, sizeof(simulatorBootUUID)) != sizeof(simulatorBootUUID) - 1) return;
+    for (size_t i = 0; i < sizeof(simulatorBootUUID) - 1; ++i) {
+        char character = value[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (character != '-') return;
+        } else if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') ||
+                     (character >= 'A' && character <= 'F'))) return;
+    }
+    memcpy(simulatorBootUUID, value, sizeof(simulatorBootUUID));
+    atomic_store_explicit(&simulatorBootUUIDReady, true, memory_order_release);
+}
+
+static int readSimulatorBootUUID(void *oldValue, size_t *oldSize) {
+    int savedErrno = errno;
+    // Match Darwin's string sysctl: no partial output on ENOMEM; oldSize reports bytes actually copied (zero).
+    if (oldValue && (!oldSize || *oldSize < sizeof(simulatorBootUUID))) {
+        if (oldSize) *oldSize = 0;
+        errno = ENOMEM;
+        return -1;
+    }
+    if (oldValue) memcpy(oldValue, simulatorBootUUID, sizeof(simulatorBootUUID));
+    if (oldSize) *oldSize = sizeof(simulatorBootUUID);
+    errno = savedErrno;
+    return 0;
+}
+
 int LSBLaunchdSysctlByName(const char *name, void *oldValue, size_t *oldSize, void *newValue, size_t newSize) {
+    // 23A343 PosterBoard's pbf_bootInstanceIdentifier keeps a 36-NUL string after native EPERM, producing a nil
+    // transient-info URL. Supply the simulator's own boot identity, never an entitlement grant or a write override.
+    if (name && !strcmp(name, "kern.bootsessionuuid") && !newValue && !newSize &&
+        atomic_load_explicit(&simulatorBootUUIDReady, memory_order_acquire)) return readSimulatorBootUUID(oldValue, oldSize);
     // libSystem itself queries sysctls before environ is initialized. Only launchd's later bootargs read may inspect its marker.
     if (!name || strcmp(name, "kern.bootargs") || newValue || newSize)
         return sysctlbyname(name, oldValue, oldSize, newValue, newSize);

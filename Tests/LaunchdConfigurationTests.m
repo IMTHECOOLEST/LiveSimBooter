@@ -792,6 +792,8 @@ int main(void) {
             "XPC_SIMULATOR_LAUNCHD_NAME=wrong", "XPC_SIMULATOR_HOLDING_TANK_HACK=999", "XPC_SIMULATOR_HOLDING_TANK_FD_HACK=7",
             "XPC_USERSPACE_REBOOT_TO_BOOT_MODE=wrong", "XPC_FLAGS=0x2", "TERM=xterm", "LSB_FAKE_PTY_STATE=/wrong", "LSB_SIMULATOR_LAUNCHD=0",
             "SIMULATOR_BOOT_TIME=stale", "SIMULATOR_BOOT_TIME=0", "SIMULATOR_BOOT_TIME_EXTRA=preserved",
+            "LSB_SIMULATOR_BOOT_UUID=stale", "LSB_SIMULATOR_BOOT_UUID=00000000-0000-0000-0000-000000000000",
+            "LSB_SIMULATOR_BOOT_UUID_EXTRA=preserved",
             "SIMULATOR_CAPABILITIES=/wrong", "SIMULATOR_CAPABILITIES=", "SIMULATOR_CAPABILITIES_EXTRA=preserved", NULL};
         LSBReceivedMessage *message = calloc(1, sizeof(*message));
         assert(message);
@@ -820,6 +822,10 @@ int main(void) {
         assert(!errno && !*end && bootSeconds >= (unsigned long)beforeBoot && bootSeconds <= (unsigned long)time(NULL));
         assert(!strcmp(environmentValue(plan, "SIMULATOR_BOOT_TIME_EXTRA"), "preserved"));
         NSString *bootGeneration = [NSString stringWithUTF8String:bootTime];
+        NSString *bootUUID = [NSString stringWithUTF8String:environmentValue(plan, "LSB_SIMULATOR_BOOT_UUID")];
+        assert(bootUUID.length == 36 && [[NSUUID alloc] initWithUUIDString:bootUUID]);
+        assert(![bootUUID isEqualToString:@"00000000-0000-0000-0000-000000000000"]);
+        assert(!strcmp(environmentValue(plan, "LSB_SIMULATOR_BOOT_UUID_EXTRA"), "preserved"));
         assert(!environmentValue(plan, "SIMULATOR_FRAMEBUFFER_FRAMEWORK"));
         assert(!environmentValue(plan, "LSB_SIMULATE_SYSTEM_POWER"));
         assert(!strcmp(environmentValue(plan, "HOME"), dataPath.fileSystemRepresentation));
@@ -837,6 +843,7 @@ int main(void) {
             isEqualToString:[root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"]]);
         for (NSString *scope in @[@"Self", @"Child"]) {
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_BOOT_TIME"] isEqualToString:bootGeneration]);
+            assert([config[@"Bootstrap"][scope][@"LSB_SIMULATOR_BOOT_UUID"] isEqualToString:bootUUID]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_PRODUCT_CLASS"] isEqualToString:@"D84"]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_MODEL_IDENTIFIER"] isEqualToString:@"iPhone16,2"]);
             assert([config[@"Bootstrap"][scope][@"SIMULATOR_CAPABILITIES"] isEqualToString:capabilitiesPath]);
@@ -859,6 +866,8 @@ int main(void) {
         assert(write(message->fds[1], "stdout\n", 7) == 7 && write(message->fds[2], "stderr\n", 7) == 7);
         dispose(message);
         assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
+        NSString *nextBootUUID = [NSString stringWithUTF8String:environmentValue(&message->plan, "LSB_SIMULATOR_BOOT_UUID")];
+        assert([[NSUUID alloc] initWithUUIDString:nextBootUUID] && ![nextBootUUID isEqualToString:bootUUID]);
         assert(write(message->fds[1], "again\n", 6) == 6);
         dispose(message);
         assert([[NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"stdout\nstderr\nagain\n"]);

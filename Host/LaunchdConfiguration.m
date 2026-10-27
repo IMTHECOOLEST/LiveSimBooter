@@ -354,6 +354,8 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
             @"SIMULATOR_CAPABILITIES": [root stringByAppendingPathComponent:@"Library/Developer/CoreSimulator/DeviceType/capabilities.plist"],
             // CoreSimulator 1171.7 formats this boot's Unix timestamp as %lu. SimulatorHID persists it as its generation key.
             @"SIMULATOR_BOOT_TIME": [NSString stringWithFormat:@"%lu", (unsigned long)NSDate.date.timeIntervalSince1970],
+            // All guests share this simulated boot identity; native kern.bootsessionuuid may be denied inside the app sandbox.
+            @"LSB_SIMULATOR_BOOT_UUID": NSUUID.UUID.UUIDString,
             // Initial iPhone 15 Pro Max profile: CoreSimulator's profile.plist maps iPhone16,2 to productClass D84.
             @"SIMULATOR_PRODUCT_CLASS": @"D84", @"SIMULATOR_MODEL_IDENTIFIER": @"iPhone16,2",
             @"SIMULATOR_HID_SYSTEM_MANAGER": [root stringByAppendingPathComponent:@"Library/Frameworks/SimulatorHID.framework"],

@@ -134,6 +134,99 @@ static void expectPassthrough(const char *name, void *oldValue, size_t *oldSize,
     assert(nativeCalls == before + 1);
 }
 
+static void testBootUUID(void) {
+    static const char value[] = "12345678-9ABC-4DEF-8123-456789ABCDEF";
+    char output[40], original[sizeof(output)], replacement[] = "changed";
+    memset(output, 'x', sizeof(output));
+    memcpy(original, output, sizeof(output));
+    size_t size = sizeof(output);
+    environmentAvailable = false;
+    unsigned beforeEnvironment = environmentCalls;
+    // Even this exact name must forward without accessing environment or TLS-dependent compatibility state before initialization.
+    assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, value, 1));
+    expectPassthrough("kern.bootsessionuuid", output, &size, NULL, 0);
+    assert(environmentCalls == beforeEnvironment);
+
+    environmentAvailable = true;
+    const char *invalid[] = {NULL, "", "12345678-9ABC-4DEF-8123-456789ABCDE", "12345678-9ABC-4DEF-8123-456789ABCDEFF",
+                            "12345678_9ABC-4DEF-8123-456789ABCDEF", "12345678-9ABG-4DEF-8123-456789ABCDEF",
+                            "12345678-9ABC-4DEF-8123-456789ABCDE/", " 12345678-9ABC-4DEF-8123-456789ABCDE"};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        if (invalid[i]) assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, invalid[i], 1));
+        else assert(!unsetenv(LSB_SIMULATOR_BOOT_UUID_ENV));
+        initializeSimulatorBootUUID();
+        assert(!atomic_load_explicit(&simulatorBootUUIDReady, memory_order_acquire));
+        expectPassthrough("kern.bootsessionuuid", output, &size, NULL, 0);
+    }
+    // Every delimiter/digit position is checked; there is no accepted partial prefix or embedded non-hex character.
+    for (size_t i = 0; i < sizeof(value) - 1; ++i) {
+        char malformed[sizeof(value)];
+        memcpy(malformed, value, sizeof(value));
+        malformed[i] = value[i] == '-' ? '0' : '-';
+        assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, malformed, 1));
+        initializeSimulatorBootUUID();
+        assert(!atomic_load_explicit(&simulatorBootUUIDReady, memory_order_acquire));
+    }
+
+    assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, value, 1));
+    initializeSimulatorBootUUID();
+    assert(atomic_load_explicit(&simulatorBootUUIDReady, memory_order_acquire));
+    // The constructor snapshot remains stable if an application changes or removes its own environment later.
+    assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, "87654321-abcd-4def-8123-fedcba987654", 1));
+    environmentAvailable = false;
+    beforeEnvironment = environmentCalls;
+    unsigned beforeNative = nativeCalls;
+    for (unsigned i = 0; i < 3; ++i) {
+        size = i == 0 ? 0 : i == 1 ? 1 : SIZE_MAX;
+        errno = EDOM;
+        assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", NULL, &size, NULL, 0) && size == 37 && errno == EDOM);
+    }
+    errno = EDOM;
+    assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", NULL, NULL, NULL, 0) && errno == EDOM);
+    for (size_t capacity = 0; capacity < sizeof(value); ++capacity) {
+        memcpy(output, original, sizeof(output));
+        size = capacity;
+        errno = EDOM;
+        assert(LSBLaunchdSysctlByName("kern.bootsessionuuid", output, &size, NULL, 0) == -1 && errno == ENOMEM && size == 0);
+        assert(!memcmp(output, original, sizeof(output)));
+    }
+    assert(LSBLaunchdSysctlByName("kern.bootsessionuuid", output, NULL, NULL, 0) == -1 && errno == ENOMEM);
+    assert(!memcmp(output, original, sizeof(output)));
+    for (size_t capacity = sizeof(value); capacity <= sizeof(output); ++capacity) {
+        memcpy(output, original, sizeof(output));
+        size = capacity;
+        errno = ERANGE;
+        assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", output, &size, NULL, 0) && size == sizeof(value) && errno == ERANGE);
+        assert(!memcmp(output, value, sizeof(value)) && !memcmp(output + sizeof(value), original + sizeof(value), sizeof(output) - sizeof(value)));
+    }
+    assert(!unsetenv(LSB_SIMULATOR_BOOT_UUID_ENV));
+    size = sizeof(output);
+    assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", output, &size, NULL, 0) && !strcmp(output, value));
+    assert(nativeCalls == beforeNative && environmentCalls == beforeEnvironment);
+
+    const char *otherNames[] = {NULL, "", "KERN.BOOTSESSIONUUID", "kern.bootsessionuui", "kern.bootsessionuuid.extra", "kern.ostype"};
+    for (unsigned i = 0; i < sizeof(otherNames) / sizeof(otherNames[0]); ++i)
+        expectPassthrough(otherNames[i], output, &size, NULL, 0);
+    expectPassthrough("kern.bootsessionuuid", output, &size, replacement, sizeof(replacement));
+    expectPassthrough("kern.bootsessionuuid", output, &size, replacement, 0);
+    expectPassthrough("kern.bootsessionuuid", output, &size, NULL, 1);
+    expectPassthrough("kern.bootsessionuuid", NULL, NULL, replacement, sizeof(replacement));
+    assert(environmentCalls == beforeEnvironment);
+    size = sizeof(output);
+    assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", output, &size, NULL, 0) && !strcmp(output, value));
+
+    // Lowercase hexadecimal is also a canonical UUID spelling. Reset only in this single-threaded fixture.
+    atomic_store_explicit(&simulatorBootUUIDReady, false, memory_order_release);
+    environmentAvailable = true;
+    const char *lowercase = "87654321-abcd-4def-8123-fedcba987654";
+    assert(!setenv(LSB_SIMULATOR_BOOT_UUID_ENV, lowercase, 1));
+    initializeSimulatorBootUUID();
+    size = sizeof(output);
+    assert(!LSBLaunchdSysctlByName("kern.bootsessionuuid", output, &size, NULL, 0) && !strcmp(output, lowercase));
+    atomic_store_explicit(&simulatorBootUUIDReady, false, memory_order_release);
+    assert(!unsetenv(LSB_SIMULATOR_BOOT_UUID_ENV));
+}
+
 static void checkFilesystemPath(const char *path, const char *expected) {
     expectedPath = expected;
     expectedMode = 0713;
@@ -317,7 +410,8 @@ int main(void) {
     assert(nativeCalls == before);
     assert(!unsetenv(LSB_SIMULATOR_LAUNCHD_ENV));
     expectPassthrough("kern.bootargs", output, &size, NULL, 0);
+    testBootUUID();
     testFilesystem();
-    puts("LaunchdCompatibility: early-init bypass, bootargs semantics, exact state subtree, path limits and file lifecycle passed");
+    puts("LaunchdCompatibility: early-init bypass, bootargs/boot UUID semantics, exact state subtree and file lifecycle passed");
     return 0;
 }

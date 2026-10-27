@@ -6,9 +6,12 @@
 #include <sys/stat.h>
 
 #define LSB_SIMULATOR_LAUNCHD_ENV "LSB_SIMULATOR_LAUNCHD"
+#define LSB_SIMULATOR_BOOT_UUID_ENV "LSB_SIMULATOR_BOOT_UUID"
 
 // The host sets the exact value "1" only for its explicit /sbin/launchd_sim plan and excludes it from the child environment.
 // This is a compatibility opt-in, not an authentication/privilege boundary. No general sysctl or filesystem policy is replaced.
+// A host-generated boot UUID is shared by all guests in one simulator boot. Its constructor snapshot services only
+// read-only kern.bootsessionuuid queries; absent/invalid values and pre-constructor queries retain native behavior.
 int LSBLaunchdSysctlByName(const char *name, void *oldValue, size_t *oldSize, void *newValue, size_t newSize);
 
 // Only the fixed simulator launchd state subtree is redirected, into SIMULATOR_SHARED_RESOURCES_DIRECTORY/tmp/launchd.
