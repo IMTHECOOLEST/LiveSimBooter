@@ -2,14 +2,18 @@
 
 The native host runs UIKit and the process broker. Each guest starts separately in [LiveProcess/main.c](../LiveProcess/main.c),
 receives its launch plan, locates `RuntimeRoot` in the App Group, maps `usr/lib/dyld_sim` and the requested executable, and
-enters the simulator runtime. LiveProcess uses C for its native startup and releases native XPC objects before detachment.
+enters the simulator runtime. LiveProcess uses C for its native startup and releases native XPC objects before handoff.
 The original starter delegates, controller, and storyboards remain in `unused/`; the new host UI lives in `Host/`.
+
+The current default retains the native shared cache and redirects native workqueue entry with a hardware breakpoint.
+Cache detachment is an opt-in diagnostic. The detach experiments below describe that path; see
+[retained-cache workqueue redirection](launchd.md#retained-native-cache-with-hardware-redirection) for the current default.
 
 A normal icon launch waits for **Start** on the IOSurface tab before starting the broker and graphical runtime. Explicit guest
 arguments, including `--launchd-services`, `/bin/df`, and `--terminal`, retain automatic startup for development tests. Startup is
 once-only; the IOSurface, Fish, and Settings tabs persist after it, and changing tabs does not start another guest.
 
-## Before host-cache removal
+## Preparing the handoff
 
 [DyldSimLoader.cpp](../LiveSimBooter/DyldSimLoader.cpp) validates the Mach-O role, registers the embedded signature through
 `F_ADDFILESIGS_RETURN`, reserves the address range, and maps segments and zero-fill. It accepts thin arm64 images or an arm64
@@ -32,17 +36,17 @@ It does not copy host TLS keys, cleanup callbacks, or thread-list pointers. The 
 224-byte prefix and 768 TSD slots, larger than the host object; simulator pthread completes initialization.
 
 [HostPreparation.cpp](../LiveSimBooter/HostPreparation.cpp) snapshots the host AMFI policy for the pinned simulator's flags
-before detachment. The callback returns the saved result only for the same flags and returns `ENOSYS` otherwise.
+before handoff. The callback returns the saved result only for the same flags and returns `ENOSYS` otherwise.
 It fabricates no policy permissions and retains no host function pointer.
 
 ## The one-way transition
 
 [SharedCacheHandoff.cpp](../LiveSimBooter/SharedCacheHandoff.cpp) queries the shared region, prepares the debugger transition,
-switches the thread's TSD base with Darwin's platform syscall, and verifies it. It then performs the
-`__shared_region_check_np(NULL)` detach from app-resident assembly, without returning into an unmapped libSystem syscall stub.
+switches the thread's TSD base with Darwin's platform syscall, and verifies it. In the diagnostic detach mode it performs
+`__shared_region_check_np(NULL)` from app-resident assembly, without returning into an unmapped libSystem syscall stub.
 Before successful detachment, failures restore host TSD and debugger state for host-side error reporting.
 
-After detachment, all 67 helper callbacks execute from the app. [LocalPOSIX.cpp](../LiveSimBooter/LocalPOSIX.cpp) uses BSD
+In either mode, all 67 helper callbacks execute from the app. [LocalPOSIX.cpp](../LiveSimBooter/LocalPOSIX.cpp) uses BSD
 syscalls, [LocalMach.cpp](../LiveSimBooter/LocalMach.cpp) uses Mach traps and local message clients, and
 [LocalRuntime.cpp](../LiveSimBooter/LocalRuntime.cpp) supplies memory/string operations, errno, recursive lock bridging,
 and stderr formatting. These paths are built without builtins, stack protectors, exceptions, or RTTI.
@@ -76,8 +80,8 @@ terminates the suspended thread before returning an error; unrecoverable cleanup
 storage still referenced by a live kernel thread.
 
 This supports explicit pthread creation with the selected simulator libpthread's custom-stack ABI. Kernel workqueue
-registration and dispatch workqueue startup remain native and unsupported. The shim is loaded in the simulator, after
-the native single-thread guard and cache detachment; it does not introduce a native worker during handoff.
+registration remains native; the current default redirects workqueue entry using the retained-cache bridge linked above.
+The shim is loaded in the simulator after the native single-thread guard; it does not introduce a native worker during handoff.
 
 The host tests cover registration validation, state preservation, PC signing, requested suspension, failures, and cleanup,
 including ASan/UBSan runs. An LLDB experiment on the phone redirected a suspended Fish worker and reached another worker
@@ -90,13 +94,14 @@ Ctrl-C, editing, and clean Ctrl-D exit are recorded with the [terminal validatio
 
 [DebuggerBridge.cpp](../LiveSimBooter/DebuggerBridge.cpp) hands LLDB from native dyld notification to an app-resident notifier
 and publishes simulator state through `TASK_DYLD_INFO`. The kernel allows only one metadata-pointer relocation, which native
-startup may already have used. In that case the bridge maps fresh anonymous metadata pages at the registered address after
-detaching the cache. Native cache code remains inaccessible.
+startup may already have used. In the detach path, the bridge maps fresh anonymous metadata pages at the registered address
+after detaching the cache. Native cache code then remains inaccessible. The retained-cache path preserves native mappings;
+see [debugging](debugging.md) for the current publication and attachment behavior.
 
 [CompactImageInfo.cpp](../LiveSimBooter/CompactImageInfo.cpp) publishes AppleArchive image snapshots before notifications,
 including paths, UUIDs, addresses, segments, process state, and CRC. Recent debugserver versions need this compact snapshot
 to name simulator-loaded libraries. Cached images use their actual segment coordinates and permit 4 KiB image-header alignment.
-The app remains in the list for source breakpoints. Publication uses bounded app-owned storage for 1024 images and two buffers.
+The app remains in the list for source breakpoints. Publication uses bounded app-owned storage for 2048 images and two buffers.
 Asynchronous external process monitors, cache Atlas APIs, and the cache image bitmap are not implemented.
 
 ## Local verification
@@ -122,5 +127,5 @@ one final fresh writable pointer token, and independent copies of every input st
 the original strings and churn allocations before entry. This guards the handoff layout but does not reproduce the one
 observed on-device startup failure in which libpthread reported a zero pointer token.
 
-The implementation follows the pinned Apple dyld source described in the [root README](../README.md). Apple-derived files
+The implementation follows the pinned Apple dyld source described in [the architecture references](architecture.md#debugging-and-implementation-references). Apple-derived files
 retain their APSL notices; the project's separate original code uses MIT.

@@ -117,6 +117,15 @@ backboardd, Fish and the control worker running. These launchctl listings expose
 Both issuing control workers were interrupted, and their request/client-lock evidence was archived without replay; a new control
 request worked after each reboot. The three handoff banners occurred zero times with default tracing disabled.
 
+The user subsequently reported that app transitions returned to SpringBoard without opening the app. Closing FLEX did not
+help, and no matching new crash report established a cause. A controlled repeat kept the same artifacts: cold-start native
+host **13450**, verify app launching, then issue two consecutive userspace reboots and verify app launching after each.
+The user confirmed all three app-launch checks passed. Native launchd changed **13454 → 13525 → 13674**; the cold boot UUID
+was `1F59B69C-DFEB-4BB3-8519-4E097B03A31A` and the final UUID was `1CE62762-5CA4-4FC9-9A33-FC052289CDC5`.
+The initial and final process inventories shared only native host **13450**. No debugger was attached. At the user's request,
+the app-launch report is considered resolved for now; the earlier failure was not reproduced and no separate cause or fix
+was established. Evidence is in `tmp/userspace-reboot/app-launch/` and `app-launch-cold-baseline-console.log`.
+
 Local validation includes the integrated suite, focused reboot authentication/drain/callback tests, control-queue preservation
 and lock tests, startup policy, handoff-flag propagation, and iPhoneOS build/signature checks. Evidence and packages are under
 ignored `tmp/userspace-reboot/`; the setup does not depend on these experiment files.

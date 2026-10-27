@@ -1,8 +1,8 @@
 # Simulator launchd
 
 The opt-in `--launchd` host argument starts the matching iOS 26 (23A343) `sbin/launchd_sim` through a C LiveProcess.
-The ordinary app launch still starts interactive Fish. The first bootstrap intentionally has no service search paths;
-booting this empty instance is a separate checkpoint from booting the runtime's full daemon catalog.
+The ordinary icon launch waits for Start, then boots the graphical session with launchd-owned Fish. The minimal `--launchd`
+bootstrap described first below intentionally has no service search paths; it is a separate checkpoint from the graphical boot.
 
 The native host writes `SimulatorData/var/run/LiveSimBooter-launchd-bootstrap.plist` beside the app group's RuntimeRoot.
 It supplies the runtime/data environment, a regular-file stdout/stderr at

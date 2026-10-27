@@ -348,7 +348,7 @@ After the LLDB run, repeat without `--start-stopped` or an attached debugger:
 
 ```sh
 xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --console --timeout 60 \
-  --json-output tmp/device-log/normal-launch.json -- com.kdt.LiveSimBooter > tmp/device-log/normal-console.log 2>&1
+  --json-output tmp/device-log/normal-launch.json -- com.kdt.LiveSimBooter /bin/df > tmp/device-log/normal-console.log 2>&1
 ```
 
 Check the filesystem-table output and `result.terminationResult.exitCode` in both launch JSON files. A successful launch request
@@ -359,8 +359,8 @@ The completed cache-only test exited `0` in both modes. Its LLDB capture contain
 present. The cause of that event was not established. The fresh normal-launch capture contained no TXM errors or AMFI
 rejections. Keep those two observations separate when comparing future runs.
 
-For a host `dlopen` diagnostic only, add `--probe-dlopen-dyld-sim` after the bundle identifier. It prints the handle and
-`dlerror()`, then exits before custom mapping or cache removal. Its result is not a substitute for testing the custom loader.
+Early host `dlopen` experiments used `--probe-dlopen-dyld-sim` to print the handle and `dlerror()` before custom mapping.
+That diagnostic argument is no longer implemented; its historical result is not a substitute for testing the custom loader.
 
 ## SpringBoard attach over Wi-Fi
 

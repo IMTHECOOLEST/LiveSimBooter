@@ -78,6 +78,7 @@
 				Broker.m = "-fobjc-arc";
 				ExtensionLauncher.m = "-fobjc-arc";
 				FramebufferServer.m = "-fobjc-arc";
+				GuestDisplaySettings.m = "-fobjc-arc";
 				GuestEntitlementsConversion.m = "-fobjc-arc";
 				HostApplication.m = "-fobjc-arc";
 				IOSurfaceServer.m = "-fobjc-arc";
@@ -86,7 +87,6 @@
 				MetalDisplayRenderer.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
 				SettingsViewController.m = "-fobjc-arc";
-				GuestDisplaySettings.m = "-fobjc-arc";
 				SimulatorDisplayView.m = "-fobjc-arc";
 				TerminalSession.m = "-fobjc-arc";
 				TerminalView.m = "-fobjc-arc";
@@ -350,19 +350,22 @@
 		A9B7C4100000000000000020 /* Prepare native stack */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
 			inputPaths = (
 				"$(SRCROOT)/Tools/prepare-native-stack.py",
 				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)",
 			);
 			name = "Prepare native stack";
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\ncase \"${LSB_ENABLE_NATIVE_STACK_RESERVATION:-NO}\" in\n    YES) set -- --enable ;;\n    NO) set -- ;;\n    *) echo \"LSB_ENABLE_NATIVE_STACK_RESERVATION must be YES or NO\" >&2; exit 1 ;;\nesac\n/usr/bin/python3 \"${SRCROOT}/Tools/prepare-native-stack.py\" \"${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}\" \"$@\"\n";
+			shellScript = (
+				"set -eu",
+				"case \"${LSB_ENABLE_NATIVE_STACK_RESERVATION:-NO}\" in",
+				"    YES) set -- --enable ;;",
+				"    NO) set -- ;;",
+				"    *) echo \"LSB_ENABLE_NATIVE_STACK_RESERVATION must be YES or NO\" >&2; exit 1 ;;",
+				"esac",
+				"/usr/bin/python3 \"${SRCROOT}/Tools/prepare-native-stack.py\" \"${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}\" \"$@\"",
+				"",
+			);
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -395,13 +398,12 @@
 				CLANG_ENABLE_MODULES = NO;
 				CLANG_ENABLE_OBJC_ARC = NO;
 				CLANG_LINK_OBJC_RUNTIME = NO;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
-				LSB_ENABLE_NATIVE_STACK_RESERVATION = NO;
 				CODE_SIGN_ENTITLEMENTS = LiveProcess/LiveProcess.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = UU7W52U79B;
 				ENABLE_DEBUG_DYLIB = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"OS_OBJECT_USE_OBJC=0",
@@ -415,16 +417,17 @@
 				INFOPLIST_FILE = LiveProcess/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveProcess;
 				LD_ENTRY_POINT = _NSExtensionMain;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-Wl,-segprot,__LSB_STACK,---,---,-stack_size,0x800000",
-				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				LSB_ENABLE_NATIVE_STACK_RESERVATION = NO;
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-segprot,__LSB_STACK,---,---,-stack_size,0x800000",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter.LiveProcess;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -439,13 +442,12 @@
 				CLANG_ENABLE_MODULES = NO;
 				CLANG_ENABLE_OBJC_ARC = NO;
 				CLANG_LINK_OBJC_RUNTIME = NO;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
-				LSB_ENABLE_NATIVE_STACK_RESERVATION = NO;
 				CODE_SIGN_ENTITLEMENTS = LiveProcess/LiveProcess.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = UU7W52U79B;
 				ENABLE_DEBUG_DYLIB = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"OS_OBJECT_USE_OBJC=0",
@@ -459,16 +461,17 @@
 				INFOPLIST_FILE = LiveProcess/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveProcess;
 				LD_ENTRY_POINT = _NSExtensionMain;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-Wl,-segprot,__LSB_STACK,---,---,-stack_size,0x800000",
-				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
+				LSB_ENABLE_NATIVE_STACK_RESERVATION = NO;
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-segprot,__LSB_STACK,---,---,-stack_size,0x800000",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kdt.LiveSimBooter.LiveProcess;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
