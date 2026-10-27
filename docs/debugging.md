@@ -162,6 +162,16 @@ module-loading contention but do not make it safe to issue commands before the s
 hardware-breakpoint requirement as well, including for debugger-created internal breakpoints. Once attachment reports the
 process stopped, ordinary inspection and the Python value API below may be used. For example:
 
+The current Apple LLDB (`lldb-2103.0.34.103`) exposes **`target.parallel-module-load`**. The spelling
+`target.experimental.parallel-module-loading` is silently accepted without changing it; `settings show target.parallel-module-load`
+must report `false`. A later PosterBoard attachment again blocked in ModuleList/language-runtime initialization when `process status`
+was entered before the asynchronous stopped notification. That command is not safe polling during attach. Terminating only that
+known LLDB client detached and resumed the guest; no guest-code crash was established by the debugger stall.
+
+Always detach and verify the target resumed before finishing device work, and confirm your debugserver session ended. Do not leave
+the host or a guest stopped/attached after a diagnostic task. If the client is hung, terminate only your own identified debugger
+and independently check the device state, preserving unrelated debug sessions.
+
 ```text
 breakpoint set -n 'lsb::mmap' -c 'location == (void*)0x120000000'
 breakpoint set -H -a 0x129d4ff78
@@ -399,3 +409,28 @@ both compiler launches. After the separate AutoFillUI executable deployment, hos
 the populated home screen with remaining icon/widget gaps; see the [screenshot](../tmp/autofillui-stage/springboard-wifi.png).
 App-registration totals, checksum-skipped resource publication and the latest rendering limits are recorded in
 [SpringBoard services](springboard-services.md#stock-application-population-and-registration).
+
+## Retained-cache image discovery on iPhone 17 (2026-10-27)
+
+A fresh late attach to guest launchd native PID 11328 on iPhone18,2 / iOS27.0 24A435 discovered 256 modules with
+the native cache retained. The image list included the guest RuntimeRoot `launchd_sim`, `dyld_sim`, `libLiveSimSpawn.dylib`,
+and simulator cached libraries. Guest `libsystem_kernel.dylib` at `0x16a9ee000` resolved `mach_msg2_trap +8`; its UUID
+was `B07862D0-C2DE-3AED-898C-88190E38064E`. Native workqueue entry `0x19fc42908` remained in an `r-x` mapping.
+Retaining the native mapping therefore does not prevent the debugger bridge from publishing simulator images.
+
+The debugger emitted a missing `class_getMethodImplementation` lookup warning and read the guest Objective-C runtime
+from process memory. Module discovery and ordinary named stack symbols were verified; full Objective-C stepping was not.
+Attach also observed the guest-owned native-workqueue hardware breakpoint on one thread. Do not remove it as an unknown
+breakpoint. The inspection used hardware-only breakpoints, serial module loading and ignored `EXC_BAD_ACCESS` configured
+before attachment, waited for the actual stopped notification, and performed no expression evaluation in the target.
+After detach, launchd accepted and completed a new job bootstrap; independent SSH inspection showed it running and no
+debugserver remained. Module UUIDs and bases are recorded in `tmp/lsd-metadata-default/results/lldb-retained-modules.json`.
+
+For current CoreDevice versions, device screenshots are available without attaching a debugger:
+
+```sh
+xcrun devicectl device capture screenshot --device "$DEVICE" --destination tmp/device-log/screen.png --timeout 30
+```
+
+This captured a1320×2868 PNG on the iPhone17; the older `idevicescreenshot` service was unavailable there. The simulator
+FPS HUD was visible in `tmp/lsd-metadata-default/results/hud-fps.png` after the guest render server reported mode7.

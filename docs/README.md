@@ -1,12 +1,17 @@
 # Development notes
 
-These notes describe the runtime experiments and the multiprocess implementation added on 2026-10-25.
-The current implementation includes arm64 runtime handoff, brokered `posix_spawn`, isolated simulator launchd, SpringBoard and
-a visible Contacts window. The native host now provides persistent IOSurface and Fish tabs; launchd owns the new Fish helper
-path, whose device validation is pending. Ordinary app touches are confirmed working; Home and lock-screen behavior remain
-under investigation. Guest offscreen GPU triangle rendering, stock backboardd spinner and touch-marker
-rendering, and native Metal dirty-rectangle presentation are verified. The latest phone run settles near 60 presentations
-per second after fixing drawable-pool stalls. Apple-logo/progress rendering and complete simulator boot remain unverified.
+Start with [agent-assisted setup](agent-setup.md) for a fresh checkout: pinned iOS 26.0/23A343 inputs, tracked staging tools,
+local signing configuration, native packaging, transfer, and device verification. Repository working rules are in [AGENTS.md](../AGENTS.md).
+Use [the device migration runbook](migration.md) for USB transfer, App Group discovery, separate runtime/data roots, and rollback.
+
+These notes record experiments since 2026-10-25. The tested 23A343 guest reaches SpringBoard with app icons and opens
+Contacts on iPhone18,2 / iOS 27.0 build 24A435. Touches, the simulator keyboard, the launchd-owned Fish terminal, native Metal
+presentation, the performance HUD, and live touch-marker settings have device evidence. The host keeps persistent IOSurface,
+Fish and Settings tabs. Native-cache retention with hardware workqueue redirection is the current default.
+
+This remains an experimental partial simulator: generic fork/exec and complete job control are unsupported, PosterBoard's
+blank app screen and black wallpaper are still under investigation, and the observed Spotlight last-character crash is deferred.
+Historical sections below describe earlier cache layouts and failures; use the setup guide for current preparation commands.
 
 - [Runtime handoff](runtime-handoff.md): startup, local callbacks, thread storage, cache detachment, and debugger metadata.
 - [Multiprocess](multiprocess.md): App Group migration, native extension launches, synchronous XPC, FD replay, and current validation limits.
@@ -14,8 +19,13 @@ per second after fixing drawable-pool stalls. Apple-logo/progress rendering and 
 - [Guest launchctl](guest-control.md): restart individual simulator jobs over SSH through the guest bootstrap namespace.
 - [Guest SSH with Fish](sshdog.md): sshdog staging, keys, authenticated device connection, and remaining shell/PTY work.
 - [Backboardd](backboardd.md): the expanded runtime cache, service identity, and boot progress.
+- [Keyboard haptics](keyboard-haptics.md): the pinned system-pattern URL correction and verified iOS 27 host keyboard input.
+- [Display settings](display-settings.md): native shortcuts backed by a fixed launchd-owned helper, with verified HUD and live touch toggles.
 - [Simulator preferences](cfprefsd.md): the stock cfprefsd job and isolated `BKDigitizerVisualizeTouches` preference.
 - [Services toward SpringBoard](springboard-services.md): simslim evidence, selected daemon startup, notification compatibility, and remaining limits.
+- [Guest logging](logging.md): the libtrace self-query override, guest `log` tool limits, and measured service retry CPU costs.
+- [Shared-memory measurements](shared-memory.md): sampled page changes, process write counters, a controlled flush test, and attribution limits.
+- [File locks](file-locks.md): native suspension crashes and descriptor-scoped RunningBoard lock metadata compatibility.
 - [Framebuffer](framebuffer.md): verified first phone frame, frame scheduling, surface fences, and bounded dirty-rectangle composition.
 - [IOSurface](iosurface.md): Apple's native remote server, authenticated guest connections, and allocation tests.
 - [System power](system-power.md): the denied power user-client open and the tested virtual-awake subscription adapter.

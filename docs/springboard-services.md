@@ -94,8 +94,9 @@ simulator cfprefsd and `com.kdt.LiveSimBooter.terminal-fish` jobs, and select th
 | `com.apple.sleepd` | `/System/Library/PrivateFrameworks/SleepDaemon.framework/sleepd` | `com.apple.sleepd.sleepserver` and the stock sleep wake endpoint |
 | `com.apple.SpringBoard` | `/System/Library/CoreServices/SpringBoard.app/SpringBoard` | Stock SpringBoard, keyboard, status bar and Control Center service declarations |
 | `com.apple.iconservices.iconservicesagent` | `/System/Library/CoreServices/iconservicesagent` | `com.apple.iconservices` |
+| `com.apple.TextInput.kbd` | `/System/Library/TextInput/kbd` | Stock 17 TextInput services, including input management, preferences and lexicon |
 
-Explicit native-host command-line labels replace those eleven defaults; the three fixed jobs remain included. For example,
+Explicit native-host command-line labels replace those twelve defaults; the three fixed jobs remain included. For example,
 `--launchd-services com.apple.notifyd` selects only notifyd as the additional job. Labels do not come from guest environment
 variables. The mode writes its generated jobs under the owned `SimulatorData/Library/LiveSimBooter-CoreDaemons-<selection-hash>` directory, with
 per-label output in `SimulatorData/Library/Logs/<label>.log`. Sorted selections have stable directory names; narrowing or
@@ -230,7 +231,7 @@ instance. The initial libnotify lines in the probe log are retained output from 
 
 The earlier checkpoint, committed as `614737c` (`Start simulator core services and verify notification delivery`),
 enforced the 14-selected-job boundary and allowed the 34 physical jobs needed during a
-full set of exec replacements. Current local boundary tests preserve the 14-selected-job limit and cover all 64
+full set of exec replacements. Current local boundary tests permit 16 selected jobs and cover all 64
 replacement overlaps plus the three native Metal helpers. At that checkpoint the phone was left using the production shim
 and the seven surviving additional daemons, with
 LaunchServices omitted to avoid demand-driven abort/restart cycles:
@@ -737,8 +738,9 @@ CFBundleCreate resource adapter. The earlier [Metal compiler registration invest
 identified the same issue with importing physical RuntimeRoot bundles from cache image paths.
 
 `Guest/ExtensionKitRegistration.c` now registers this one physical bundle using the normally declared
-`xpc_add_bundle(path, 2)` API. The host sets `LSB_REGISTER_EXTENSIONKIT=1` only on the selected job with exact label
-`com.apple.SpringBoard` and effective Program `/System/Library/CoreServices/SpringBoard.app/SpringBoard`. The constructor
+`xpc_add_bundle(path, 2)` API. The host sets `LSB_REGISTER_EXTENSIONKIT=1` only on selected jobs matching both their exact label
+and effective Program: `com.apple.SpringBoard` at `/System/Library/CoreServices/SpringBoard.app/SpringBoard`, or
+`com.apple.PosterBoard` at `/Applications/PosterBoard.app/PosterBoard`. The constructor
 also checks the actual canonical executable, canonical RuntimeRoot containment, and nonempty regular readable Info.plist
 and service executable. Inherited variables cannot activate it in xpcproxy, launchd or the service itself. It runs after
 libSystem initialization, not from a dyld image callback. Because the API returns void, its log reports a registration
@@ -1101,7 +1103,7 @@ The attribute snapshots are in [the LLDB request log](../tmp/app-launch-fix/lldb
 The shared ledger is now **ABI 4**, with **64 slots** and a **2,080-byte** structure inside the unchanged **4 KiB** mapping.
 Old ABI/capacity combinations are rejected before slot access. Host, LiveProcess and guest shim must be deployed together;
 changing a header does not expand a running process's already initialized ledger. The initial service-selection limit
-remains **14 selected jobs**, now plus the fixed backboardd, cfprefsd and terminal helper jobs. The broker's physical-job limit is **132**: 64 children with room
+is **16 selected jobs**, plus the fixed backboardd, cfprefsd and terminal helper jobs. The broker's physical-job limit is **132**: 64 children with room
 for simultaneous exec replacements, simulator launchd, and three native Metal helpers. Unreaped statuses and observations
 that pin a slot still consume capacity. This increase supplies headroom; it does not remove resource limits.
 
@@ -1215,3 +1217,190 @@ The [full local suite](../tmp/terminal-launchd-tests/full-suite.log) passed and 
 [icon-launch defaults regression](../tmp/terminal-launchd-tests/broker-icon-default.log) passed as well. The new Fish tab's
 launchd-owned path still needs device verification; earlier direct-terminal Fish results are recorded separately in
 [the fake-terminal notes](fake-pty.md#device-checks-and-diagnostics).
+
+## Guest keyboard service staging
+
+The normal service selection now includes the matching stock `com.apple.TextInput.kbd` job. SpringBoard already declares
+`com.apple.UIKit.KeyboardManagement.hosted`, but the separate `kbd` job was absent. The daemon supplies the stock TextInput
+input-manager, preferences, lexicon and related services. The generator retains its MachServices and `MallocNanoZone=0`
+environment, using the same bounded `RunAtLoad`/no-restart policy as other selected daemons.
+
+The current 1,353-image cache omits six strong dependencies: TextInputCore, InputTranscoder, Transliteration,
+KeyboardServices, InputContext and ProactiveInputPredictions. The isolated matching-23A343 stage contains those frameworks,
+`kbd`, the English input plugin, and their resources plus the cached TextInput framework's resource files. Existing verified
+KeyboardServices code from the all-apps stage is reused byte-for-byte. Every other staged Mach-O uses the established
+signing identity/identifier, no native signature entitlements, and preserved original file type/platform/code. The daemon
+retains `MH_EXECUTE` with `CS_EXECSEG_MAIN_BINARY` cleared by the executable signer.
+
+The [stage manifest](../tmp/keyboard-stage/manifest.json) records 454 files / 10,317,488 bytes, eight Mach-Os and zero missing
+strong dependencies against the current cache. The payload was published missing-only, preserving existing runtime files.
+A sanitized generated job started `kbd` as native PID 11125; its startup log contains a duplicate-class warning but no observed
+startup failure. The cached TextInput binary matches the matching runtime source exactly, so that warning alone does not
+show a version mismatch. No guest software keyboard display or typing success is established yet. A software keyboard should
+consume the existing simulator touch path.
+
+### Hardware keyboard focus
+
+The IOSurface view forwards UIKit `UIPress.key.keyCode` keyboard-page usages through the stock Indigo generic HID packet.
+Only a focused, visible, active simulator view with a frame forwards presses. Selecting IOSurface or touching within its
+displayed image requests focus; Fish retains its own text-input responder. No global event capture or hardware-attachment
+state override is installed. The host releases accepted keys on focus loss, tab changes, inactivity, removal and server
+replacement. The server retries an undelivered release before accepting another key, preventing a hidden view from leaving
+guest modifiers held down.
+
+The host orders modifier downs before ordinary keys and releases ordinary keys first. Known left/right modifiers retain
+their side; aggregate UIKit flags synthesize a left modifier only when the original press occurred before the view gained
+focus. The portable routing tests and real Mach packet tests cover ordering, cancellation and delivery failure. On-device
+hardware typing through this new route still needs verification.
+
+The native Fish responder did become first responder during the keyboard investigation. The host reported an attached
+hardware keyboard, and the user confirmed Keyboard/Mirroring was connected. Hiding the native software keyboard in that
+state is expected UIKit behavior; no text-field replacement or forced software-keyboard policy was needed.
+
+## SystemStatus publisher retry loop
+
+The default graphical service selection includes the matching `com.apple.systemstatusd` job. In 23A343,
+`SystemStatus/EmbeddedDaemon` is `FeatureComplete`; the stock daemon owns `com.apple.systemstatus`,
+`com.apple.systemstatus.publisher` and `com.apple.systemstatus.activityattribution` when that feature is enabled.
+SpringBoard declares those same names only when the feature is disabled. The generator preserves both opposite
+conditions exactly, preventing duplicate unconditional registrations.
+
+Without the daemon, SpringBoard repeatedly recreated its publisher NSXPC connection and serialized its status domains.
+The sampled SystemStatus frames resolved to `_resendDataIfNecessary`, `_internalQueue_setupXPCConnectionIfNecessary`
+and `_internalQueue_reregisterForPublishingDomains`; launchd's log repeatedly reported the missing publisher endpoint.
+Loading the stock daemon into the same running session reduced SpringBoard CPU from **102.16% to 2.72%** and launchd
+from **106.38% to 22.48%** in two approximately 20.09-second windows. Each percentage uses one core as 100%, converts
+native process CPU ticks with the device's 125/3 Mach timebase, and checks PID, executable UUID and process-start time.
+These are sequential observations with different foreground activity, not a controlled benchmark; the remaining launchd
+CPU needs separate investigation. [The comparison](../tmp/cpu-investigation/systemstatus-comparison.md) links the result
+to the [complete per-process counters](../tmp/cpu-investigation/systemstatus-comparison.json).
+
+The [matching stage](../tmp/cpu-investigation/systemstatus-stage/manifest.json) contains the stock signed daemon and its
+resources/plists: 111 files totaling 103,060 bytes. Its seven direct strong dependencies are already in cache110. Signing
+preserves MH_EXECUTE, simulator platform 7 and every original __TEXT section while clearing CS_EXECSEG_MAIN_BINARY,
+using the existing identity/identifier without native signature entitlements. The focused Broker regression verifies the
+new default job, exact executable, both mutually exclusive service conditions and the bounded RunAtLoad/no-KeepAlive policy.
+
+## PosterBoard selected LaunchAngel
+
+PosterBoard is a hidden application whose `LSLaunchDLabel` names the matching stock
+`System/Library/LaunchAngels/com.apple.PosterBoard.plist`. The default graphical selection now includes this exact label.
+For each explicitly selected label, the generator first checks LaunchDaemons, then checks LaunchAngels only when the
+daemon plist is absent. It does not import every Angel or bypass path validation.
+
+Angels retain on-demand startup, their exact MachServices, the non-launching endpoint marker, App process/spawn types and
+the bounded RunningBoard Managed/Reported metadata. PosterBoard's stock `RunAtLoad=false` and `KeepAlive=false` remain
+false. The selected-job limit is 16; with three fixed jobs this leaves 45 slots in the 64-child ledger for demand-launched
+children. The host icon-launch regression includes PosterBoard and checks its non-launching service and RunningBoard flags.
+
+The first normal device open failed with nested `RBSServiceErrorDomain` 4, **"Launchd could not find job."** Registering
+the matching job in the running simulator resolved that boundary. `launchctl print` showed an on-demand App job with
+zero runs before the next request. The next open reached spawning but failed with nested `NSPOSIXErrorDomain` 45,
+**"Launchd job spawn failed."** This is not a verified PosterBoard start or wallpaper fix. The confirmed user symptom is
+black wallpaper; the picker has not been tested. See [the captured error progression](../tmp/posterboard-investigation/after-angel-evidence.txt)
+and [the job before activation](../tmp/posterboard-investigation/job-before-request.log).
+
+Read-only comparisons found the existing stock wallpaper resources complete at 5,189 files / 446,917,590 bytes. The three
+uncached strong code images and bundle resources are also present. Stock PosterBoard has an initial-configuration helper;
+missing per-user PosterBoard directories alone do not justify fabricating those configurations.
+
+Static inspection of the pinned 23A343 launchd (`C3EC5C45-8C85-3D11-B59C-62C4248F5EF9`) identified a narrower spawn
+boundary: its App finalizer assigns role `UI` (2) at `+0x5a2c`, while the shim accepted only `UI_FOCAL` (1). The captured
+PosterBoard job already reports `spawn role = ui (2)`; launchd passes that field directly to the spawn setter. A local
+probe using the native private attribute setters reproduced error45 for `APP_DEFAULT + UI` with otherwise supported
+flags. This establishes an unsupported stock attribute, while a complete live spawn trace is still needed to exclude
+additional failures.
+
+The shim now consumes `UI` alongside `UI_FOCAL` as metadata for `APP_DEFAULT`, and for the existing inherited app-role
+case with type zero plus `SETEXEC`. It does not apply native scheduling policy. The role meanings are defined by
+[XNU's resource_private.h](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/sys/resource_private.h#L134-L142),
+and XNU applies them through its
+[spawn policy handler](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.1.9/bsd/kern/kern_exec.c#L2402-L2476).
+Tests retain rejection of other roles/types, role-only ordinary spawns, suspended starts and session changes. Both accepted
+roles reach exec transport while preserving the input attributes, errno and native process/session grouping. The change
+still requires device validation.
+
+
+The production app-role change was validated on the next boots. PosterBoard logical **12397** / native **12398** started on
+demand, completed SETEXEC, opened the public Metal connections, and remained in `job state = running` with one run and no
+exit. Its `com.apple.posterboardservices.services` endpoint was active. The later app-compiler registration also includes
+PosterBoard. This resolves the earlier missing-job/spawn45 boundaries; wallpaper presentation and picker behavior still
+need separate verification. Evidence: `tmp/posterboard-investigation/job-after-role-fix.log` and `live-role-fixed.log`.
+
+PosterBoard native **12531** then exposed a separate discovery failure: its PID domain rejected the cached virtual path for
+`ExtensionFoundation.framework/XPCServices/extensionkitservice.xpc` with error **147**, followed by two failed lookups for
+`com.apple.extensionkitservice`. The existing ExtensionKit registration adapter now accepts exact PosterBoard too, and the
+sanitized job receives its own opt-in. Canonical-path, symlink-escape, inherited-role and label/program-spoof tests pass;
+device activation and default-poster creation remain unverified. This imports the stock Discovery service and does not
+create poster database rows or guess initial configuration. Evidence: `tmp/posterboard-investigation/discovery-launchd-tail.txt`.
+
+## iPhone 17 metadata and input migration (2026-10-27)
+
+The iOS 26.0/23A343 guest on iPhone18,2 / iOS 27.0 build 24A435 initially aborted lsd with
+`WRITE_METADATA_DICTIONARY`. A clean LiveProcess probe isolated the exact basename
+`.com.apple.mobile_container_manager.metadata.plist`: ordinary/protected creation and atomic rename to that name returned
+`EPERM`, while the same operations using an ordinary name succeeded. The native kernel independently reported
+`com.apple.sandbox.reporting:violation`, `System Policy: LiveProcess(5652) deny(1) file-write-create` for that exact path.
+This was a filename policy restriction inside the otherwise writable App Group, not a missing directory or protection-class failure.
+
+[patch-ios26-container-metadata.py](../Tools/patch-ios26-container-metadata.py) replaces only the five validated cached string
+literals and the matching loose MobileInstallationHelperService literal with the equal-length guest-only basename
+`.com.kdt.LiveSimBooter.container-metadata.v1.plist`. Validation pins image UUIDs, complete original `__TEXT,__cstring`
+section hashes, literal boundaries and mapping protections, while permitting freshly rebuilt cache layouts. The source remains
+immutable and outputs require separate signing. This changes the guest's metadata naming convention; it does not change device
+sandbox policy, entitlement checks or native container metadata. The alternate-name atomic probe produced 464 records with no `EPERM`.
+
+The signed outputs were staged over USB and published with all affected processes stopped, keeping rollback copies and skipping
+post-copy checksums as requested. The cache remains at `0x110000000`, UUID `73ED978A-FD25-3166-A57A-34E21BB7E5B8`, with 1,353 images;
+its new CodeDirectory hash is `308875ea5c35f30ed7143cf92fd8da54dd9b1179`. Host **5669**, launchd **5673**, backboardd **5700** and
+SpringBoard **5698** ran without LLDB using the now-default retained native cache and hardware workqueue redirection. ContainerManager
+created 647 metadata files; lsd's later job inspection showed running, two runs and last exit code 0. The user confirmed a home
+screen with app icons. This verifies the metadata failure is resolved, not that every included extension starts successfully.
+
+Touch initially failed because the migration omitted the external CoreSimulator `SimulatorHID.framework` entirely. Backboardd logged
+`Failed to initialize HID services: Failed to bundle`, while the host's Indigo endpoint registration succeeded. Restoring and signing
+the previously tested CoreSimulator 1171.7 plugin with its `Info.plist` fixed the connection: the next host **8371** boot registered
+backboardd **8400** and queued built-in digitizer target `1073741825`, alias `50`, display `PurpleMain`. The user confirmed touch markers,
+home-page swipes and opening Contacts. The [setup recipe](agent-setup.md) now explicitly stages this external framework alongside
+SimFramebuffer. No guest/host debugger was attached for these checks.
+
+Evidence lives in ignored `tmp/lsd-metadata-default/`: `cache-patch.json`, `cache-sign.json`, `helper-sign.json`, `publish.json`,
+`results/sandbox-policy-kernel.log`, `results/metadata-alternate-rows.json`, `results/patched-lsd-status.log` and
+`results/patched-services-hid-console.log`. A separate wallpaper-extension Swift assertion loop remained and was investigated next;
+it must not be confused with the resolved metadata abort or input-plugin omission.
+
+### Wallpaper extension identity and subsequent failures
+
+The migrated runtime produced up to 119 Swift `SIGTRAP` exits per minute in stock wallpaper extensions. In the pinned
+CoreServices image (`73F411D9-84A9-33FE-84C9-8CD57CA633DC`), two self-audit-token checks compared the native token PID to
+the logical guest PID. The mismatch selected an unadapted native process-path query and identified `LiveProcess.appex`
+instead of the guest extension. The identity adapter now returns the native PID only at the two validated return PCs
+`+0x6f294` and `+0xd0524`. It validates the image UUID, text bounds and surrounding instruction bytes, and removes the
+callsite registration when the image unloads. Other CoreServices callers still receive the logical PID.
+
+With the updated signed shim, host 10710 / launchd 10714 ran for more than six minutes without another Swift trap, versus
+the previous 119/minute baseline. ReportCrash sampled at 0% CPU; later sampling found no ReportCrashService. This does
+not establish that every wallpaper extension works: PosterBoard still aborted separately with a nil transient-info URL,
+and tapping a Contacts text field exposed a CoreHaptics crash. Both remained distinct from the resolved identity loop.
+Evidence: `tmp/lsd-metadata-default/results/identity-fixed-services-console.log`, `identity-fixed-exit-rate.json`,
+`extension-crash-rate-baseline.json`, and `cpu-identity-later.txt`. No debugger was attached during this comparison.
+
+The user then ran guest `launchctl reboot userspace`. Guest launchd sent SIGTERM to its services, eventually killed
+SpringBoard after its shutdown timeout, and exited with status 0. Only native host 10710 remained. The current host
+does not automatically start a replacement simulator launchd after that shutdown; this command is not yet a complete
+simulator restart operation. The next diagnostic boot was explicitly started by relaunching the host.
+
+A subsequent exact coordinator probe isolated PosterBoard's nil URL: native `kern.bootsessionuuid` returned `EPERM`,
+leaving its zero-filled 37-byte buffer untouched. Stock `+[NSString(PBFUtilities) pbf_bootInstanceIdentifier]` nonetheless
+constructed a 36-character string, all NULs. The resulting `TransientInfo-...<boot ID>.plist` filename could not form an NSURL.
+Ordinary `NSTemporaryDirectory`, `PFTemporaryDirectory`, and URL construction had already passed independently.
+
+The native host now generates one UUID per simulated boot and publishes `LSB_SIMULATOR_BOOT_UUID` to launchd and all its
+children. The shim snapshots a validated UUID after libSystem initialization, then answers only read-only
+`kern.bootsessionuuid` requests. Other queries, writes, pre-constructor calls and missing/invalid configuration retain
+native forwarding. Focused tests cover length queries, short buffers, unchanged output/errno, forwarding and distinct
+boot generations. The fixed coordinator probe returned a valid transient URL; the real PosterBoard job then reported
+`state = running`, one run, and `last exit code = (never exited)` on host11508 / launchd11512, logical11558 / native11559.
+This verifies the startup crash boundary, not the wallpaper picker or presentation. Evidence:
+`results/poster-coordinator-probe.log`, `poster-coordinator-fixed.log`, `poster-bootuuid-status.log` under
+`tmp/lsd-metadata-default/`. These tests ran without LLDB.

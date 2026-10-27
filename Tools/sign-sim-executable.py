@@ -136,6 +136,18 @@ def repack(binary, parsed, cd, cms, identifier):
     return result, verified
 
 
+def cms_helper(args, work):
+    supplied = getattr(args, 'cms_helper', None)
+    if supplied is not None:
+        helper = Path(supplied).resolve(strict=True)
+        require(helper.is_file() and os.access(helper, os.X_OK), 'CMS helper must be an executable regular file')
+        return helper
+    helper = work / 'sign-code-directory'
+    helper_source = Path(__file__).resolve().with_name('sign-code-directory.m')
+    run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-framework', 'Foundation', '-framework', 'Security', helper_source, '-o', helper])
+    return helper
+
+
 def sign_executable(args):
     source_bytes = args.source.read_bytes()
     signature_range(source_bytes)
@@ -143,7 +155,7 @@ def sign_executable(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.sim-sign-', dir=args.output.parent) as directory:
         work = Path(directory)
-        executable, helper = work / 'executable', work / 'sign-code-directory'
+        executable = work / 'executable'
         shutil.copy2(args.source, executable)
         run(['/usr/bin/codesign', '--force', '--sign', args.identity, '--identifier', args.identifier,
              '--digest-algorithm=sha256', '--pagesize', '16384', '--timestamp=none', executable])
@@ -157,8 +169,7 @@ def sign_executable(args):
         require(bytes(cd[:80]) == parsed['cd'][:80] and bytes(cd[88:]) == parsed['cd'][88:], 'Unexpected CodeDirectory change')
         cd_path, cms_path = work / 'CodeDirectory.bin', work / 'CMS.der'
         cd_path.write_bytes(cd)
-        helper_source = Path(__file__).resolve().with_name('sign-code-directory.m')
-        run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-framework', 'Foundation', '-framework', 'Security', helper_source, '-o', helper])
+        helper = cms_helper(args, work)
         print('Signing modified CodeDirectory; macOS may request keychain access for sign-code-directory.', file=sys.stderr, flush=True)
         run([helper, args.identity, cd_path, cms_path])
         run(['/usr/bin/openssl', 'cms', '-verify', '-binary', '-inform', 'DER', '-in', cms_path,
@@ -185,6 +196,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--identity', required=True, help='Exact signing certificate SHA-1 (40 hexadecimal characters)')
     parser.add_argument('--identifier', required=True)
+    parser.add_argument('--cms-helper', type=Path, help='Reuse a prebuilt sign-code-directory helper for a batch (avoids repeated keychain prompts)')
     args = parser.parse_args()
     args.source = args.source.resolve(strict=True)
     args.output = args.output.absolute()

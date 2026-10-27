@@ -1,10 +1,17 @@
 # LiveSimBooter
 
+Start with the [agent-assisted setup guide](docs/agent-setup.md) for **iOS Simulator 26.0, build 23A343** and
+[AGENTS.md](AGENTS.md) for project conventions. There is no in-app runtime installer. The tracked tools build the cache and stage/sign
+the runtime; [device migration](docs/migration.md) covers USB transfer, App Group discovery, and rollback.
+
 Experimental arm64 simulator runtime on an iPhone. The native app has a minimal UIKit foreground window and acts as a spawn broker.
 It discovers `LiveProcess.appex` through `NSExtension` and launches separate instances through PlugInKit's pkd launch operation.
 Its C entry receives a launch plan and descriptors through synchronous XPC,
-maps `dyld_sim` and the requested executable, detaches the native cache, then invokes `start_sim`.
-The native window has persistent **IOSurface** and **Fish** tabs. A normal app-icon launch boots the graphical simulator launchd
+maps `dyld_sim` and the requested executable, then invokes `start_sim`. By default the guest retains the native cache and redirects native
+workqueue entry through an inherited hardware breakpoint. Native-cache detachment remains an opt-in diagnostic mode.
+The native window has persistent **IOSurface**, **Fish**, and **Settings** tabs. [Settings](docs/display-settings.md) controls
+the guest performance HUD and touch markers; silent background audio is off by default.
+A normal app-icon launch boots the graphical simulator launchd
 session; its fixed `terminal-fish` job replaces itself with interactive Fish through `POSIX_SPAWN_SETEXEC`. The host attaches
 the socket terminal to that authenticated job's lineage. Switching tabs does not start or stop guests. Explicit `--terminal`
 retains the earlier direct-shell diagnostic mode, and other launch arguments can select a RuntimeRoot executable.

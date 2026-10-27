@@ -10,6 +10,7 @@ with Security.framework. No entitlements or executable-segment privileges are ad
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import struct
@@ -109,15 +110,25 @@ def verify_hashes(path, cd, requirements, args, signature_offset, mappings):
     return page_count
 
 
+def cms_helper(args, work):
+    supplied = getattr(args, 'cms_helper', None)
+    if supplied is not None:
+        helper = Path(supplied).resolve(strict=True)
+        require(helper.is_file() and os.access(helper, os.X_OK), 'CMS helper must be an executable regular file')
+        return helper
+    helper = work / 'sign-code-directory'
+    helper_source = Path(__file__).resolve().with_name('sign-code-directory.m')
+    run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-framework', 'Foundation', '-framework', 'Security', helper_source, '-o', helper])
+    return helper
+
+
 def sign_cache(args):
     signature_offset, _, mappings = cache_info(args.source)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.cache-sign-', dir=args.output.parent) as directory:
         work = Path(directory)
         output = work / 'cache'
-        helper = work / 'sign-code-directory'
-        helper_source = Path(__file__).resolve().with_name('sign-code-directory.m')
-        run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-framework', 'Foundation', '-framework', 'Security', helper_source, '-o', helper])
+        helper = cms_helper(args, work)
         command = ['/usr/bin/codesign', '--force', '--sign', args.identity, '--identifier', args.identifier, '--timestamp=none', output]
         shutil.copy2(args.source, output)
         run(command)
@@ -200,6 +211,7 @@ def main():
     parser.add_argument('--identity', required=True, help='Exact certificate SHA-1 (40 hexadecimal characters)')
     parser.add_argument('--identifier', required=True)
     parser.add_argument('--team', required=True)
+    parser.add_argument('--cms-helper', type=Path, help='Reuse a prebuilt sign-code-directory helper for a batch (avoids repeated keychain prompts)')
     args = parser.parse_args()
     args.source, args.output = args.source.resolve(), args.output.resolve()
     require(re.fullmatch(r'[0-9a-fA-F]{40}', args.identity), 'Identity must be an exact certificate SHA-1')

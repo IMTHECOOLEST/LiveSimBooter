@@ -5,7 +5,7 @@ Unmodified Fish 4.9.3 source, built for iOS Simulator, runs noninteractive exter
 access-check and wait-option compatibility. Two df children and the shell exited 0 in the completed device test.
 This baseline does not establish that all Fish execution paths avoid fork, or provide full job control or a kernel PTY.
 
-The native host now has an **IOSurface** tab and a **Fish** tab. The shell is configured as a simulator-launchd job through
+The native host now has **IOSurface**, **Fish**, and **Settings** tabs. The shell is configured as a simulator-launchd job through
 `/usr/libexec/terminal-fish`; the host UI does not spawn Fish directly. The helper receives its terminal through the broker,
 then replaces itself with pristine Fish using `POSIX_SPAWN_SETEXEC`, retaining the launchd job's logical identity. It disables
 job control and uses the existing [fake terminal](fake-pty.md) and native keyboard. Switching tabs keeps the runtime and
@@ -13,6 +13,19 @@ terminal session alive. The 2026-10-26 device trial reached a Fish prompt throug
 logical job PID 10516 retained across native PIDs 10516, 10517 and 10518. Fish spawned `df` (native PID 10554), printed
 `DF_STATUS=0`, and the broker recorded wait status `0x0`. Evidence:
 [`console-path.log`](../tmp/terminal-launchd-tests/console-path.log). The later cache-base trial is recorded below.
+
+Settings contains one **Silent background audio** switch, off by default, with no separate status row. An explicit opt-in
+is saved and starts native silent playback that mixes with other audio; turning it off stops playback and deactivates the
+audio session. Interruptions or errors appear in the footer. This is a native host option, not simulator audio support or
+a guarantee that every guest remains runnable in the background.
+
+Fish uses the native keyboard independently of the IOSurface tab's [guest hardware-keyboard route](backboardd.md#physical-keyboard-forwarding).
+A connected hardware keyboard or iPhone Mirroring can suppress the native software keyboard; the user confirmed that
+connection during the missing-keyboard report. The terminal's actual text scroll view (`_display`) now sets
+`keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive` and `alwaysBounceVertical = YES`, allowing a downward
+drag to dismiss the software keyboard even when the terminal has little scrollable content. The build passed and was
+installed at 20:08 on 2026-10-26; the physical interactive-dismiss gesture has not been verified. Evidence:
+[build](../tmp/cpu-investigation/interactive-host-build.log) and [installation](../tmp/cpu-investigation/interactive-install.log).
 
 The earlier integrated terminal reached a prompt on iPhone, accepted editing keys, spawned `df` with exit 0 and
 original-platform Bash with exit 37, interrupted a looping child, and exited 0 on Ctrl-D. A builtin command substitution

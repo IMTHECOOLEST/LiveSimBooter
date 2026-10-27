@@ -29,7 +29,14 @@ broker child ledger is empty. The shim returns `-1/ECHILD`, and this version of 
 with the parsed selector without checking success. It proceeds because they match. This is a pinned compatibility sentinel,
 not a real tank PID or evidence that a tank process exited. A launchd update requires rechecking this sequence.
 
-## Workqueues after native cache removal
+## Workqueue handoff
+
+The current default keeps the native shared cache mapped and enables hardware redirection of its registered workqueue entry.
+Both the native app and guest shim must be rebuilt together. Omitted `LSB_RETAIN_HOST_CACHE` and
+`LSB_WORKQUEUE_HARDWARE_BREAKPOINT` settings mean enabled; an explicit `0` disables each option, and launchd preserves those
+settings in descendants. Set both to `0` only to reproduce the legacy cache-removal diagnostic. The retained-cache evidence
+below establishes the workqueue handoff without a debugger. The later metadata-name patch reached a home screen with app
+icons; input validation remains separate.
 
 An earlier libpthread registration survives in the kernel. The existing suspended-pthread adapter can replace each ordinary
 thread's entry PC, but kernel workqueue threads start asynchronously at the registered native `start_wqthread` address.
@@ -46,6 +53,125 @@ this server thread.
 Attach LLDB before the handoff for this experiment. Attaching a debugger later can replace the task exception handler. An
 exception inside the exception-server thread cannot be handled by that same thread; a previously installed debugger handler
 is retained for it when available.
+
+### iOS 27 hardware-breakpoint trial
+
+The first hardware-breakpoint trial explicitly enabled `LSB_WORKQUEUE_HARDWARE_BREAKPOINT=1`. Before opening guest workqueues,
+the bridge reserves one unused task-default `ARM_DEBUG_STATE64` slot for the captured native entry, verifies its readback,
+and handles `EXC_BREAKPOINT` as well as the existing access faults. A redirect requires the exact entry PC, expected workqueue
+arguments, and the thread's inherited owned slot. Unrelated exceptions retain their previous handlers. Native pthread
+registration can precede arming: the breakpoint observes the registered address without changing registration.
+
+Public XNU copies task-default debug state into newly created threads, including workqueue threads. It does not retroactively
+update existing threads; this path relies on the single-threaded native handoff. Reused workers return to the registered entry
+again, so the slot must remain enabled for the process lifetime if this mode is used. Clearing it after the first bootstrap
+would leave subsequent worker entries unhandled.
+
+On 2026-10-27, a separate signed control passed on the iOS 27 phone without LLDB. A new ordinary pthread inherited the slot
+and the Mach handler redirected a mapped function to return 84. Removing only that thread's owned slot restored its original
+return value 42; exact task-state restoration made a subsequent thread return 42 too. Code-signing flags remained `0x22003305`
+with `CS_DEBUGGED` clear before, during, and after the test. This verifies breakpoint inheritance and removal for that control.
+
+The actual detached-cache launchd trial still failed. Its file trace confirms environment value 1, successful task-state
+installation and exact readback, slot 0 at native `start_wqthread` (`0x190116908`), and bridge readiness. No handled breakpoint
+was recorded before launchd exited with wait status 9; its crash report confirms `CODESIGNING / Invalid Page` at that
+same entry. This does not yet distinguish instruction-fetch priority from a device-specific workqueue inheritance difference.
+That trial did not verify hardware mode as a startup fix with the native cache removed; the retained-cache trial below is separate.
+Evidence: `tmp/hardware-workqueue/results/control-01-console.log`,
+`launchd-hardware-03-trace.txt`, and the launchd console/crash reports in that directory.
+
+Launchd redirects all three standard descriptors to `/dev/null` before this setup. Its lack of stderr diagnostics does not
+show that arming was skipped; the trial used a temporary dedicated-file logger. The original signed guest shim was restored
+after that experiment. The subsequent retained-cache trial below led to the current defaults.
+
+### Retained native cache with hardware redirection
+
+The next 2026-10-27 experiment retained native mappings and enabled both `LSB_RETAIN_HOST_CACHE=1` and
+`LSB_WORKQUEUE_HARDWARE_BREAKPOINT=1`; this combination is now the default. If supplied, the first setting value wins and only
+exact `1` enables it; omission also enables it. Launchd receives the same settings in its own environment and `Bootstrap.Child`,
+including an explicit `0` diagnostic opt-out. Retention alone does not redirect workers.
+Before changing debugger state or TLS, the handoff requires a present, nonzero native cache base and a complete guest cache
+reservation ending at or below that base. An absent cache returns `ENOTSUP`; overlap returns `EADDRINUSE`. The single-thread
+guard and switch to app-owned simulator TSD remain active. Native functions are still unsafe to call with that replacement TLS.
+
+On iPhone18,2 running iOS 27 build 24A435, the guest was arm64 iOS 26.0 build 23A343 with 1,353 cache images, UUID
+`73ED978A-FD25-3166-A57A-34E21BB7E5B8`, spanning `[0x110000000, 0x18e194000)`. The native cache base was `0x19f708000`,
+with reported size `0x185800000`; the gap above the guest reservation was `0x11574000`, about 277.45 MiB. These are recorded
+addresses from this boot, not constants. Native `start_wqthread` at `0x19fc42908` had leaf current/maximum protections `5/5`
+(`r-x`); a query stopping at the enclosing submap misleadingly reported `r--`. The guest entry was `0x16aae0a74`.
+
+Probe v1 ran without LLDB and kept native code-signing flags `0x22003305`, with `CS_DEBUGGED` clear. It completed eight
+dispatch tasks and a dispatch timer, then exited 0. The bridge recorded four new-worker traps with flags `0x244005` and four
+reused-worker traps with flags `0x64005`. The owned hardware slot stays enabled for worker reuse and future threads until
+process exit. This run did not observe the `x5 == -1` workqueue cleanup sentinel. Retention keeps the existing shared mapping;
+it does not copy the native cache. The probe's physical footprint changed from 14.03 to 14.22 MiB, which is not a full graphical
+runtime memory measurement.
+
+The first launchd job test also completed `launchd_sim → xpcproxy_sim → df`: the replacement df exited 0 and launchd's
+authenticated health lookup returned `BOOTSTRAP_UNKNOWN_SERVICE` (1102), as expected for the deliberately missing service.
+That run accidentally inherited the pre-handoff debug-stop option; only our stopped guests were resumed with `SIGCONT`,
+without attaching a debugger. The clean repeat explicitly disabled both debug-stop variables: launchd 5063 spawned
+xpcproxy 5064, its replacement df 5065 exited 0, and the health lookup again returned 1102. The frozen v2 probe (5061), with
+an exact RX-protection check and an explicitly unblocked watchdog, also completed eight tasks plus its timer and exited 0.
+Both code-signing queries still had `CS_DEBUGGED` clear, and all four second-wave workers reused first-wave threads.
+
+The broader no-debugger run reached native host 5074, launchd 5078, and backboardd 5105. The framebuffer registered
+`CAWindowServer`, created its 1290 × 2796 swapchain, and presented through native Metal at approximately 60 fps. Guest logs
+also recorded event-bearing workqueue entries and a reused-worker cleanup callback (`x5 == -1`). This establishes those
+redirect paths beyond the small probe. It does not establish a completed SpringBoard UI: lsd repeatedly aborted with
+`Error getting container url (WRITE_METADATA_DICTIONARY)! Cannot continue.` Its captured stack reaches `_LSServerMain`
+through an Objective-C exception and `abort`, rather than the old native workqueue instruction-fetch failure. The full test
+was stopped to end that crash loop; a final launchd-to-df run again exited 0. A guest launchctl inspection was not submitted
+because its separate SSH invocation rejected the host key; no launchctl result is claimed.
+
+No AMFI rejection or TXM fault was found in the bounded native capture. No LLDB/debugserver was attached for these tests.
+Native and guest builds, focused loader/handoff/workqueue/launchd-configuration tests, and the diff check passed. These runs used
+an experimental build with both flags supplied explicitly; the source now enables the pair by default. All test hosts and
+guests were stopped afterward, with no debugger left attached. The previous signed
+shim is preserved outside RuntimeRoot for rollback. No runtime cache was rebuilt or copied for this experiment.
+
+Evidence: `tmp/retain-native-cache-audit/cache-layouts.json`, `tmp/retained-host-cache/results/probe-console.log`,
+`launchd-df-console.log`, `df-first.log`, `probe-v2-console.log`, `launchd-df-clean-console.log`, `services-retained-console.log`,
+`lsd-control-state.log`, `graphical-exit.ips`, `final-df-console.log`, and `security.log` in that results directory. The v2 probe
+uses a frozen source snapshot matched to its unsigned build; its provenance record is
+`tmp/retained-host-cache/provenance-audit/report.json`. Local signing receipts identify the supplied development identity;
+guest code uses the configured host identifier without signature entitlements.
+
+### Container-metadata filename compatibility
+
+A subsequent clean file-API probe isolated the lsd failure to the exact basename
+`.com.apple.mobile_container_manager.metadata.plist`. Ordinary `open` and protected open with class 4 returned `EPERM` for that
+name, while an ordinary basename worked. Creating the `.atomic.*` temporary file, writing, `fchmod`, and `fsync` succeeded;
+renaming it to the stock basename returned `EPERM` with ordinary, exclusive, and secluded rename modes. This establishes the
+filename-specific restriction. A subsequent kernel capture explicitly records `System Policy ... deny(1) file-write-create`
+for the stock basename; the specific sandbox policy definition remains unidentified. This is separate from workqueue startup
+and data-protection-class selection. The probe exited 0; evidence is
+`tmp/lsd-metadata-default/results/metadata-api-clean-rows.json` and `sandbox-policy-kernel.log`.
+
+[patch-ios26-container-metadata.py](../Tools/patch-ios26-container-metadata.py) creates a new cache with the equal-length
+`.com.kdt.LiveSimBooter.container-metadata.v1.plist` literal at five pinned sites: ContainerManagerCommon, DMCUtilities,
+MobileInstallation, SafariCore, and libsystem_containermanager. All five are in `__TEXT,__cstring`. Validation requires the
+matching 23A343 image paths/UUIDs, original whole-section hashes, exact literal boundaries and offsets within those sections,
+and read-only mapping bounds. Cache file offsets and its UUID may differ on a matching rebuild. It rejects extra occurrences
+or an already patched input. No pointers, CFString lengths, or container-authorization checks change.
+
+Its `--mach-o` mode applies the same replacement to the one additional loose consumer, the matching
+`MobileInstallation.framework/XPCServices/com.apple.MobileInstallationHelperService.xpc/com.apple.MobileInstallationHelperService`.
+The staged-code inventory found this one executable among 3,840 loose code files; there is no shared filename getter that
+covers all six copies. Patch the cache before cache signing and supply the patched helper through the runtime stager's
+`--add-binary` override before executable signing, as shown in [agent setup](agent-setup.md#build-and-inspect-the-cache).
+
+The patched cache and loose helper were signed and deployed together. On iPhone18,2 running iOS 27.0 / 24A435, without LLDB,
+lsd started, its launchctl status reported last exit 0 and two runs, and 647 guest metadata files were created under the new
+basename. The user confirmed a home screen with app icons. Cache UUID `73ED978A-FD25-3166-A57A-34E21BB7E5B8`, base `0x110000000`,
+and the 1,353-image layout were preserved; the new cache CodeDirectory hash is `308875ea5c35f30ed7143cf92fd8da54dd9b1179`.
+Evidence is in `tmp/lsd-metadata-default/results/patched-lsd-status.log`, `patched-services-first-console.log`, and `guest-logs-first/`.
+
+This confirms the metadata and graphical-startup path, not every app or input operation. The first full migration omitted
+CoreSimulator's `Library/Frameworks/SimulatorHID.framework`; after restoring its signed executable and `Info.plist`, backboardd
+registered its Indigo endpoint, and the user confirmed touch markers, Home Screen swipes, and opening Contacts. The required external payload now appears in [agent setup](agent-setup.md#stage-resources-apps-and-signed-loose-code).
+Preserve matching cache/helper/data rollbacks, because an existing guest data root using the stock metadata name needs a
+separate migration plan.
 
 ## Initial findings
 

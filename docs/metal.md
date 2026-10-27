@@ -661,3 +661,34 @@ using the same canonical executable checks as backboardd and SpringBoard.
 The five stock CoreImage filter bundles (`CIVisionFilters`, `CIBarcode`, `PortraitFilters`, `CIPassThrough`, `CIInpainting`)
 were separately signed and copied into RuntimeRoot. Their original `MH_BUNDLE` type and simulator platform remain intact;
 all strong dependencies are already present. Device copies use transfer completion and file size, without post-copy checksums.
+
+
+The subsequent scoped identity fix recognizes exactly the 23A343 ExtensionFoundation install path (and its canonical
+RuntimeRoot path) for native `getpid`. Its `_EXHostConfiguration.rbsProcessIdentity` getter feeds this value into an RBS
+host identifier, so it must match the process represented by the kernel audit token. Unrelated callers retain the logical
+guest PID. Boundary and real dylib interposition tests pass. On 2026-10-26, guest `launchctl kill SIGKILL
+user/501/com.apple.SpringBoard` replaced the old SpringBoard with native PID 11156 and a fresh Metal helper 11155; the
+replacement completed its three Metal connections and remained alive for subsequent CPU profiling. This clears the
+previous ExtensionFoundation restart trap. Evidence: `tmp/shm-write-measure/restart-springboard.log`,
+`settings-console.log`, and `tmp/cpu-investigation/springboard-sample.txt`.
+
+
+### App compiler registration
+
+A compiler registered for SpringBoard does not serve every app's PID domain. A non-stopping sample of Contacts **12247**
+found its main thread waiting on RenderBox shader compilation. Launchd logged `ESRCH` for repeated per-PID compiler
+lookups and error147 for the virtual framework bundle path, which did not belong to the physical Contacts.app origin.
+
+The guest handoff now supplies `LSB_REGISTER_METAL_COMPILER=1` after removing conflicting input copies. The constructor
+retains the three existing daemon roles and additionally validates immediate app main executables under `Applications`,
+`System/Applications`, and `System/Library/CoreServices` inside canonical RuntimeRoot. Bounded regular Info.plist metadata
+must declare package type `APPL` and exactly match the executable name. Nested helpers and XPC services do not qualify.
+The imported compiler is still the fixed, contained matching Metal framework XPC bundle. Native Metal routes bypass this
+handoff; the compiler process itself cannot recursively opt in.
+
+Focused tests cover XML/binary metadata, executable-name matching, embedded NULs, path and symlink boundaries, and invalid
+or oversized metadata. The signed arm64 simulator shim and native host were installed on the iOS26.1 phone. Fresh Contacts
+logical **12413** / native **12414** passed repeated first-character entry and final-character deletion, confirmed by the
+user; its Metal-rendered swipe control also worked. The registration API returns void, so the successful interaction is
+the device evidence, not the constructor's return log. Local evidence is `tmp/cpu-investigation/compiler-console.log`,
+`contacts-first-last-transition-sample.txt`, and `launchd-contacts-compiler.log`.

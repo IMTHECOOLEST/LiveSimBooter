@@ -139,6 +139,8 @@ xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 -DLSB_SHARED
 DYLD_INSERT_LIBRARIES="$test_directory/libSharedCachePathCompatibility.dylib" \
     "$test_directory/SharedCachePathCompatibilityInterpose" "$test_directory/cache-path-caller/libCaller.dylib"
 python3 -B Tests/PatchIOSPlatformTests.py
+python3 -B Tests/SetupIOS26CacheTests.py
+python3 -B Tests/SetupIOS26RuntimeTests.py
 python3 -B Tests/LaunchdIdentityPatchTests.py
 python3 -B Tests/ContainerMetadataPatchTests.py
 python3 -B Tests/KeyboardHapticsPatchTests.py

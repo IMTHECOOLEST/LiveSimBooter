@@ -459,3 +459,92 @@ This establishes stock touch-marker rendering and the font correction, not a com
 A separate LLDB run used host **82160** and backboardd **82168** and stalled around debugger image notification. It is not
 the normal-run first-frame evidence, and no debugger continuation is needed to explain the captured frame. Its artifacts
 are `tmp/metal-native/console-stock-framebuffer-lldb.log` and `tmp/framebuffer-server/lldb-stock-framebuffer-notifier.txt`.
+## Physical keyboard forwarding
+
+The native IOSurface view forwards physical keyboard/keypad usages through the authenticated Indigo event port. The host
+does not open or alter the system HID event service. The transport uses the stock SimulatorKit 1171.7
+`IndigoHIDMessageForHIDArbitrary(target, page, usage, operation)` format: payload type 2, generic subtype 10001, keyboard
+target 100, usage page 7, and operation 1 for down / 2 for up. The 148-byte payload includes a Mach-tick timestamp and the
+modern timestamp fields. This path deliberately avoids the keyboard-specific subtype's `_IndigoHIDUpdateKeyboardType`
+call, which changes keyboard-attachment notification state. Existing physical keyboard or Mirroring state is preserved.
+
+Only successfully queued downs are tracked. Modifier usages `0xe0` through `0xe7` follow the same path as letters,
+Backspace, Return, and arrows. Duplicate downs return `EALREADY`; guest keyboard handling owns held-key repeat. Key-up
+queue pressure schedules a nonblocking retry and temporarily rejects new keyboard input. Releasing all keys on focus
+loss includes ordinary keys before modifiers. Authorization changes, reconnection, and close discard the old generation,
+so a delayed release cannot reach a new client.
+
+Focused packet/lifecycle tests and existing touch tests pass, including failed-down state, queued releases, all modifiers,
+and reconnection. A local probe fed actual host-generated packets to the unchanged 1171.7 decoder at offset `0x5d98`,
+verifying page, usage, down/up, and timestamp for letters, Return, Backspace, arrows, Shift, and Command. Its stub for the
+GraphicsServices attachment setter aborts if called; the probe completed without that call. Evidence is in
+`tmp/shm-write-measure/keyboard/stock-decode.log`.
+
+On the phone, a diagnostic probe sent 12 down/up edges through the production IOSurface view routing path to backboardd
+native **11306**. All 12 returned error 0, including letters, Backspace, and a digit; the intended empty-field result was
+`tes1`. This verifies acceptance through the view and Indigo send path, not text insertion into a guest app. Contacts
+aborted during the tests, so actual text delivery and end-to-end physical typing remain unverified. A hardware-only LLDB
+reproduction in Contacts **11553**, triggered by the user's Search tap and one typed letter, caught
+`SystemAUsSoftLink` asserting `lib != nullptr` in `AudioToolboxSoftLink.h:58`. `dlerror()` identified the missing matching
+`AudioToolbox.framework/libEmbeddedSystemAUs.dylib`; the stack was preparing audio units through `AudioConverterPrepare`,
+consistent with keyboard press sound initialization. No assertion was bypassed; LLDB detached after capture.
+
+The stock registration path also dynamically loads `libAudioDSP.dylib` and `AudioCodecs`; the DSP library requires the
+uncached `libAudioDSPCore.dylib`. All four matching binaries were signed and published with their original platform/type/code
+intact, totaling 22,458,464 bytes. Their remaining strong dependencies are cached. Fresh Contacts **11647** no longer stopped
+at the audio assertion, but a later sample established the separate freeze below. End-to-end text insertion remains
+unverified. Evidence: [probe transcript](../tmp/cpu-investigation/final-console.log),
+[LLDB assertion and dlerror](../tmp/cpu-investigation/lldb-contacts-keyboard.txt), and
+[Contacts crash findings](../tmp/cpu-investigation/contacts-keyboard-analysis.md).
+
+## Dictation service dependency
+
+A later Contacts freeze was sampled as native **11647** on iOS 26.1. The three-second sample showed a **2.9 GB** physical
+footprint and a repeating AssistantServices dictation-availability callback → UIKit keyboard-dock update → forced-offline
+dictation query path. This is separate from the earlier audio-plugin assertion. The missing assistantd
+dependency also appears in the [simslim service findings](springboard-services.md#services-simslim-deliberately-preserves).
+See [the process sample](../tmp/cpu-investigation/contacts-11647-spin-sample.txt).
+
+The host's default service selection now includes stock `com.apple.assistantd`, running
+`/System/Library/PrivateFrameworks/AssistantServices.framework/assistantd`. The generated job retains its 27 Mach service
+declarations, including `com.apple.assistant.dictation`, with the existing bounded daemon startup policy: RunAtLoad true,
+KeepAlive false, and transactions disabled. It does not import native user, resource, or event-trigger policy.
+The focused Broker test verifies the generated service and defaults; its
+[test log](../tmp/cpu-investigation/assistant-broker-tests.log) passed.
+
+The live trial signed the matching 23A343 daemon and its missing strong dependency closure: 22 code files, with the other
+strong imports already cached. Publication added 17 absent files and preserved six existing entries. The stock
+`RuntimeRoot/System/Library/LaunchDaemons/com.apple.assistantd.plist` is present and matches the original parsed plist;
+all 968 non-code resources in the staged frameworks are present with matching sizes. Post-copy checksums were skipped.
+See the [stage receipt](../tmp/cpu-investigation/assistantd-stage/README.md) and
+[resource audit](../tmp/cpu-investigation/assistantd-stage/resource-audit.json).
+
+Bootstrap returned 0, and assistantd logical **11826** / native **11827** remained running with
+`com.apple.assistant.dictation` active. Fresh Contacts **11854** did not reproduce the CPU/memory growth after a Search tap
+and 12 keyboard edges: the subsequent three-second sample measured **35.7 MB** physical footprint, while `ps` reported
+**0.0% CPU** for Contacts and assistantd. This did not establish text insertion: the screenshot still showed the Search
+placeholder. Every main-thread sample waited in `AFNetworkAvailability isAvailable`, and its worker waited for the
+`nwi_state_copy` XPC reply. See [the sample](../tmp/cpu-investigation/contacts-11854-after-assistant-sample.txt).
+
+The awaited guest `com.apple.SystemConfiguration.NetworkInformation_sim` endpoint belongs to `configd_sim`. Its job was
+in `spawn scheduled` state after 17 consecutive SIGABRTs; its log reported `store_host != NULL` in
+`load_SimulatorSupport`, `simulator_support.c:283`. The stock plugin creates a dynamic store with
+`kSCDynamicStoreUseHostServer` before mirroring native network state. The native host can look up
+`com.apple.SystemConfiguration.configd` successfully, but that endpoint was absent from the simulator host bridge.
+The host now imports that endpoint while leaving the simulator NWI/DNS services owned by stock `configd_sim`.
+On the next boot, bridge lookup and registration returned 0, and configd_sim **12090** passed the host-store assertion,
+mirrored the native interface/DNS state, and remained running alongside assistantd **12086**. Contacts text entry still
+needs verification after this bridge fix. No dictation availability result or network response has been fabricated. Evidence:
+[configd state](../tmp/cpu-investigation/configd-control/0e21212cdad1492495f7be8afde357d0.log),
+[configd assertion](../tmp/cpu-investigation/configd-current-log.txt),
+[fresh daemon startup](../tmp/cpu-investigation/fresh-daemon-startup.txt), and
+[Apple's SimulatorSupport source](https://github.com/apple-oss-distributions/configd/blob/main/Plugins/SimulatorSupport/simulator_support.c).
+
+
+The next first/last-character delay was a separate shader-discovery failure. Contacts native **12247** waited in RenderBox
+shader specialization and `MTLCompilerScheduler`, while Metal retried the missing `com.apple.MTLCompilerService` endpoint
+once per second. Simulator launchd rejected the cache's virtual XPC bundle path against the physical Contacts.app origin.
+The app-domain registration fix is described in [Metal app compiler registration](metal.md#app-compiler-registration).
+On the updated build, Contacts logical **12413** / native **12414** displayed the keyboard; the user repeatedly typed the
+first character and deleted it, confirming both operations were responsive. The user also confirmed the Metal-rendered
+swipe control worked. This verifies those interactions, without claiming all keyboard or wallpaper paths are complete.
