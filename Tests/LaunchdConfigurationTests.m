@@ -235,7 +235,8 @@ static void testBackboardPreferences(LSBReceivedMessage *message, NSString *root
     NSString *directory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-BackboardDaemons"];
     NSString *jobPath = [directory stringByAppendingPathComponent:@"com.apple.cfprefsd.xpc.daemon.plist"];
     NSSet *expectedJobs = [NSSet setWithArray:
-        @[@"com.apple.backboardd.plist", @"com.apple.cfprefsd.xpc.daemon.plist", @"com.kdt.LiveSimBooter.terminal-fish.plist"]];
+        @[@"com.apple.backboardd.plist", @"com.apple.cfprefsd.xpc.daemon.plist",
+          @"com.kdt.LiveSimBooter.terminal-fish.plist", @"com.kdt.LiveSimBooter.display-settings.plist"]];
     assert([[NSSet setWithArray:[NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL]] isEqual:expectedJobs]);
     NSDictionary *job = readPlist(jobPath);
     assert([job[@"Label"] isEqual:@"com.apple.cfprefsd.xpc.daemon"]);
@@ -261,9 +262,8 @@ static void testBackboardPreferences(LSBReceivedMessage *message, NSString *root
     assert([binary writeToFile:preferencesPath atomically:NO]);
     assert(!LSBPrepareLaunchdBackboardPlan(message, root.fileSystemRepresentation, NULL));
     dispose(message);
-    NSMutableDictionary *expected = existing.mutableCopy;
-    expected[@"BKDigitizerVisualizeTouches"] = @YES;
-    assert([readPlist(preferencesPath) isEqual:expected]);
+    assert([readPlist(preferencesPath) isEqual:existing]);
+    assert(CFGetTypeID((__bridge CFTypeRef)readPlist(preferencesPath)[@"BKDigitizerVisualizeTouches"]) == CFBooleanGetTypeID());
     assert([[NSData dataWithContentsOfFile:logPath] isEqual:logContent]);
     NSData *preferences = [NSData dataWithContentsOfFile:preferencesPath];
     assert(!stat(preferencesPath.fileSystemRepresentation, &status));
@@ -272,7 +272,7 @@ static void testBackboardPreferences(LSBReceivedMessage *message, NSString *root
     dispose(message);
     assert(!stat(preferencesPath.fileSystemRepresentation, &status) && status.st_ino == inode);
     NSData *configuration = [NSData dataWithContentsOfFile:configPath];
-    for (id invalid in @[@[@"not a dictionary"], @"malformed plist"]) {
+    for (id invalid in @[@[@"not a dictionary"], @"malformed plist", @{@"BKDigitizerVisualizeTouches": @1}]) {
         NSData *data = [invalid isKindOfClass:NSString.class] ? [invalid dataUsingEncoding:NSUTF8StringEncoding] :
             [NSPropertyListSerialization dataWithPropertyList:invalid format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
         assert([data writeToFile:preferencesPath atomically:NO]);
@@ -368,7 +368,7 @@ static void testServiceCapacity(LSBReceivedMessage *message, NSString *root, NSS
     selected[capacity] = NULL;
     assert(!LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, selected));
     NSString *directory = [readPlist(configPath)[@"Bootstrap"][@"Paths"] firstObject];
-    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == capacity + 3);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == capacity + 4);
     dispose(message);
     prior = snapshotDirectory(dataPath);
     selected[capacity] = names[capacity];
@@ -519,7 +519,7 @@ static void testLaunchAngelJobs(LSBReceivedMessage *message, NSString *root, NSS
     assert([job[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/com.apple.PosterBoard.log"]);
     assert([job[@"StandardErrorPath"] isEqual:job[@"StandardOutPath"]]);
     assert([job[@"WorkingDirectory"] isEqual:@"/private/var/mobile/"]);
-    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:generated error:NULL].count == 6);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:generated error:NULL].count == 7);
     assert(![NSFileManager.defaultManager fileExistsAtPath:[generated stringByAppendingPathComponent:@"com.kdt.unselected.plist"]]);
     NSDictionary *daemon = readPlist([generated stringByAppendingPathComponent:@"com.apple.notifyd.plist"]);
     assert([daemon[@"RunAtLoad"] boolValue] && ![daemon[@"KeepAlive"] boolValue] && !daemon[@"_AdditionalProperties"]);
@@ -622,14 +622,14 @@ static void testServiceJobs(LSBReceivedMessage *message, NSString *root, NSStrin
     job = readPlist([directory stringByAppendingPathComponent:@"com.apple.runningboardd.plist"]);
     assert([job[@"Program"] isEqual:running[@"Program"]] && !job[@"ProgramArguments"]);
     assert([job[@"PublishesEvents"] isEqual:running[@"PublishesEvents"]]);
-    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == 5);
+    assert([NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL].count == 6);
     dispose(message);
     NSData *priorJob = [NSData dataWithContentsOfFile:jobPath];
     const char *duplicate[] = {"com.apple.notifyd", "com.apple.notifyd", NULL};
     assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, duplicate) == EINVAL);
     assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, NULL) == EINVAL);
     const char *invalid[] = {"", "..", "../com.apple.notifyd", "com.apple.notifyd/plist", "com.apple.backboardd",
-        "com.apple.cfprefsd.xpc.daemon", "com.kdt.LiveSimBooter.terminal-fish"};
+        "com.apple.cfprefsd.xpc.daemon", "com.kdt.LiveSimBooter.terminal-fish", "com.kdt.LiveSimBooter.display-settings"};
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i) {
         const char *labels[] = {invalid[i], NULL};
         assert(LSBPrepareLaunchdServicesPlan(message, root.fileSystemRepresentation, NULL, labels) == EINVAL);
@@ -735,6 +735,14 @@ static void testAdditionalJobs(LSBReceivedMessage *message, NSString *root, NSSt
     NSDictionary *terminal = readPlist([directory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.terminal-fish.plist"]);
     assert(([terminal isEqual:@{@"Label": @"com.kdt.LiveSimBooter.terminal-fish", @"ProgramArguments": @[@"/usr/libexec/terminal-fish"],
         @"WorkingDirectory": @"/private/var/mobile/", @"RunAtLoad": @YES, @"KeepAlive": @NO, @"EnableTransactions": @NO}]));
+    NSDictionary *settings = readPlist([directory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.display-settings.plist"]);
+    assert(([settings[@"ProgramArguments"] isEqual:@[@"/usr/libexec/display-settings", @"--serve"]]));
+    for (NSString *key in @[@"RunAtLoad", @"KeepAlive", @"EnableTransactions"])
+        assert(CFGetTypeID((__bridge CFTypeRef)settings[key]) == CFBooleanGetTypeID());
+    assert([settings[@"RunAtLoad"] boolValue] && ![settings[@"KeepAlive"] boolValue] && ![settings[@"EnableTransactions"] boolValue]);
+    assert(!settings[@"MachServices"] && !settings[@"EnvironmentVariables"]);
+    assert([settings[@"StandardOutPath"] isEqual:@"/private/var/mobile/Library/Logs/display-settings.log"]);
+    assert([settings[@"StandardErrorPath"] isEqual:settings[@"StandardOutPath"]]);
     NSDictionary *job = readPlist([directory stringByAppendingPathComponent:@"com.apple.backboardd.plist"]);
     assert([readPlist(configPath)[@"Bootstrap"][@"Paths"] isEqualToArray:@[directory]]);
     assert([job[@"Label"] isEqualToString:@"com.apple.backboardd"] && [job[@"MachServices"] isEqualToDictionary:services]);

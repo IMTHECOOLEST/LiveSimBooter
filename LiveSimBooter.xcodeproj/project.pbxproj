@@ -86,6 +86,7 @@
 				MetalDisplayRenderer.m = "-fobjc-arc";
 				RunningBoardMonitor.m = "-fobjc-arc";
 				SettingsViewController.m = "-fobjc-arc";
+				GuestDisplaySettings.m = "-fobjc-arc";
 				SimulatorDisplayView.m = "-fobjc-arc";
 				TerminalSession.m = "-fobjc-arc";
 				TerminalView.m = "-fobjc-arc";

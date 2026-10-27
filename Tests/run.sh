@@ -334,6 +334,19 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
 xcrun --sdk macosx clang -fobjc-arc -Wall -Wextra -Werror -arch arm64 \
     Tests/BackgroundAudioTests.m Host/BackgroundAudio.m -framework Foundation -o "$test_directory/BackgroundAudio"
 "$test_directory/BackgroundAudio"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/DisplaySettingsTests.c ProcessSupport/DisplaySettings.c -o "$test_directory/DisplaySettings"
+"$test_directory/DisplaySettings"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/DisplaySettingsRenderServerTests.c -o "$test_directory/DisplaySettingsRenderServer"
+"$test_directory/DisplaySettingsRenderServer"
+xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -arch arm64 \
+    Tests/DisplaySettingsWorkerTests.c ProcessSupport/DisplaySettings.c -o "$test_directory/DisplaySettingsWorker"
+"$test_directory/DisplaySettingsWorker"
+xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
+    Tests/GuestDisplaySettingsTests.m Host/GuestDisplaySettings.m ProcessSupport/DisplaySettings.c \
+    -framework Foundation -o "$test_directory/GuestDisplaySettings"
+"$test_directory/GuestDisplaySettings"
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -arch arm64 \
     Tests/ExtensionLauncherTests.m -framework Foundation -o "$test_directory/ExtensionLauncher"
 "$test_directory/ExtensionLauncher"

@@ -2,6 +2,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include "LaunchdConfiguration.h"
 #include "ChildStatus.h"
+#include "DisplaySettings.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,8 +13,8 @@
 #include <unistd.h>
 
 // Keep the initial service selection bounded independently of slots needed later for apps, helpers and adopted children.
-// Backboardd, cfprefsd and the terminal helper are direct launchd children alongside the selected services.
-enum { BaselineLaunchdChildren = 3, MaximumSelectedServices = 16 };
+// Backboardd, cfprefsd and the terminal/settings helpers are direct launchd children alongside the selected services.
+enum { BaselineLaunchdChildren = 4, MaximumSelectedServices = 16 };
 _Static_assert(BaselineLaunchdChildren + MaximumSelectedServices < LSB_CHILD_STATUS_CAPACITY, "leave child-ledger slots for dynamic jobs");
 
 static int openDirectory(int parent, const char *name) {
@@ -110,7 +111,8 @@ static int prepareTouchPreferences(int directory, NSData **output) {
         id existing = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
         if (![existing isKindOfClass:NSDictionary.class]) return EINVAL;
         preferences = [existing mutableCopy];
-        if ([preferences[@"BKDigitizerVisualizeTouches"] isEqual:@YES]) return 0;
+        id enabled = preferences[@"BKDigitizerVisualizeTouches"];
+        if (enabled) return CFGetTypeID((__bridge CFTypeRef)enabled) == CFBooleanGetTypeID() ? 0 : EINVAL;
     }
     // BKSLocalDefaults uses this domain/key. Only this isolated simulator's file is changed; never use host NSUserDefaults.
     preferences[@"BKDigitizerVisualizeTouches"] = @YES;
@@ -186,7 +188,7 @@ static int addServiceJobs(NSString *root, const char *const labels[], NSMutableD
                          NSMutableArray<NSString *> *logs) {
     if (!labels) return EINVAL;
     NSMutableSet<NSString *> *seen = [NSMutableSet setWithArray:
-        @[@"com.apple.backboardd", @"com.apple.cfprefsd.xpc.daemon", @"com.kdt.LiveSimBooter.terminal-fish"]];
+        @[@"com.apple.backboardd", @"com.apple.cfprefsd.xpc.daemon", @"com.kdt.LiveSimBooter.terminal-fish", @LSB_DISPLAY_SETTINGS_LABEL]];
     for (unsigned index = 0; labels[index]; ++index) {
         if (index == MaximumSelectedServices) return E2BIG;
         const char *labelBytes = labels[index];
@@ -479,6 +481,18 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
                     format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
                 if (!terminalPlist) return EINVAL;
                 jobPlists[@"com.kdt.LiveSimBooter.terminal-fish.plist"] = terminalPlist;
+                // A fixed launchd-owned helper applies only the two allowlisted display settings using guest frameworks.
+                NSDictionary *settingsJob = @{
+                    @"Label": @LSB_DISPLAY_SETTINGS_LABEL, @"ProgramArguments": @[@LSB_DISPLAY_SETTINGS_PROGRAM, @"--serve"],
+                    @"WorkingDirectory": @"/private/var/mobile/", @"RunAtLoad": @YES, @"KeepAlive": @NO, @"EnableTransactions": @NO,
+                    @"StandardOutPath": @"/private/var/mobile/Library/Logs/display-settings.log",
+                    @"StandardErrorPath": @"/private/var/mobile/Library/Logs/display-settings.log"
+                };
+                NSData *settingsPlist = [NSPropertyListSerialization dataWithPropertyList:settingsJob
+                    format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+                if (!settingsPlist) return EINVAL;
+                jobPlists[@LSB_DISPLAY_SETTINGS_LABEL ".plist"] = settingsPlist;
+                [serviceLogs addObject:@"display-settings.log"];
             }
         }
         if (services) {

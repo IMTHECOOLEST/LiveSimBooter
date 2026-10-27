@@ -2181,7 +2181,7 @@ static void testIconLaunchUsesGraphicalLaunchd(void) {
         NSMutableSet *expected = [NSMutableSet new];
         for (NSString *label in selected) [expected addObject:[label stringByAppendingString:@".plist"]];
         [expected addObjectsFromArray:@[@"com.apple.backboardd.plist", @"com.apple.cfprefsd.xpc.daemon.plist",
-            @"com.kdt.LiveSimBooter.terminal-fish.plist"]];
+            @"com.kdt.LiveSimBooter.terminal-fish.plist", @"com.kdt.LiveSimBooter.display-settings.plist"]];
         assert([[NSSet setWithArray:[manager contentsOfDirectoryAtPath:jobDirectory error:NULL]] isEqual:expected]);
         assert(!bootstrap[@"Self"][@"LSB_FAKE_PTY_STATE"] && !bootstrap[@"Child"][@"LSB_FAKE_PTY_STATE"]);
         NSDictionary *terminal = [NSDictionary dictionaryWithContentsOfFile:
