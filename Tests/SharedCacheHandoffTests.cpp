@@ -23,6 +23,7 @@ enum class Event { ReadTSD, Query, DebugBegin, Switch, Detach, Restore, DebugFin
 static std::vector<Event> events;
 static constexpr uintptr_t hostTSD = 0x100020e0, simulatorTSD = 0x140000e0;
 static uintptr_t currentTSD;
+static uint64_t queryAddress;
 static jmp_buf exitJump;
 static int queryError, detachError, queryCalls, detachCalls, switchCalls, restoreCalls, entryCalls, mainCalls, mainStatus, exitStatus;
 static int debugBeginError, debugFinishError, debugBeginCalls, debugFinishCalls, debugCancelCalls;
@@ -85,7 +86,8 @@ int finishDebuggerHandoff(bool cacheDetached) {
     ++debugFinishCalls;
     check(currentTSD == simulatorTSD && switchCalls == 1, "debugger handoff finishes using simulator TLS");
     check(debugBeginCalls == 1 && !debugBeginError && !failSwitch && !detachError, "only successful cache handling finishes debugger handoff");
-    check(cacheDetached == !queryError && detachCalls == (cacheDetached ? 1 : 0), "debugger finish receives the actual cache detachment state");
+    check(cacheDetached == (!queryError && !expected->retainHostCache) && detachCalls == (cacheDetached ? 1 : 0),
+          "debugger finish receives the actual cache detachment state");
     check(restoreCalls == 0 && debugCancelCalls == 0 && entryCalls == 0, "debugger finish precedes simulator entry without rollback");
     return debugFinishError;
 }
@@ -131,7 +133,7 @@ int LSBTestSharedRegionCheck(uint64_t *address) {
         check(currentTSD == hostTSD, "cache query uses original host TLS");
         check(switchCalls == 0 && detachCalls == 0, "query precedes TLS switch and cache removal");
         check(*address == 0, "query address storage is initialized");
-        *address = 0x180000000;
+        *address = queryAddress;
         return queryError;
     }
     events.push_back(Event::Detach);
@@ -170,7 +172,8 @@ static int fakeMain(int argc, const char *const argv[], const char *const envp[]
     ++mainCalls;
     check(entryCalls == 1 && returnMain && returnedStartGlue == 1, "main is invoked once after a valid LC_MAIN prepare result");
     check(currentTSD == simulatorTSD && restoreCalls == 0, "returned main keeps simulator TLS and never restores host TLS");
-    check(queryCalls == 1 && detachCalls == (queryError ? 0 : 1), "returned main runs after completed cache handling");
+    check(queryCalls == 1 && detachCalls == (!queryError && !expected->retainHostCache ? 1 : 0),
+          "returned main runs after completed cache handling");
     check(argc == expected->argc && argv == expected->argv && envp == expected->envp && apple == expected->apple,
           "returned main receives the same argument vectors as prepare");
     return mainStatus;
@@ -182,7 +185,7 @@ static LSBDyldSimLaunch::Main fakeEntry(int argc, const char *const argv[], cons
     events.push_back(Event::Entry);
     ++entryCalls;
     check(currentTSD == simulatorTSD && switchCalls == 1 && restoreCalls == 0, "simulator entry uses fresh TLS without rollback");
-    check(queryCalls == 1 && detachCalls == (queryError ? 0 : 1), "entry follows completed cache handling");
+    check(queryCalls == 1 && detachCalls == (!queryError && !expected->retainHostCache ? 1 : 0), "entry follows completed cache handling");
     check(reservationCalls == (expected->cacheSize ? 1U : 0U), "dyld starts only after its complete cache span is reserved");
     check(!detachError && !failSwitch, "failed detach or TLS switch never enters dyld_sim");
     check(debugBeginCalls == 1 && debugFinishCalls == 1 && !debugFinishError && debugCancelCalls == 0,
@@ -235,6 +238,7 @@ static LSBDyldSimLaunch::Main fakeEntry(int argc, const char *const argv[], cons
 static void reset(int query = 0, int detach = 0, bool hasMain = true) {
     events.clear();
     currentTSD = hostTSD;
+    queryAddress = 0x180000000;
     queryError = query;
     detachError = detach;
     returnMain = hasMain;
@@ -301,10 +305,55 @@ int main() {
     LSBDyldSimLaunch launch = {fakeEntry, 2, argv, envp, apple, reinterpret_cast<const mach_header *>(0x100000000),
                                reinterpret_cast<const mach_header *>(0x120000000), 0x20000000,
                                reinterpret_cast<const SimSyscallHelpers *>(0x130000000), {hostTSD, simulatorTSD}};
+    check(launch.retainHostCache, "aggregate launch descriptors retain the native cache by default");
+    launch.retainHostCache = false; // Exercise the historical detachment and rollback cases explicitly.
     actualStackSwitchTest(launch);
     LSBDyldSimLaunch reserved = launch;
     reserved.cacheAddress = 0x120000000;
     reserved.cacheSize = 0x100000;
+    LSBDyldSimLaunch retained = reserved;
+    retained.retainHostCache = true;
+    for (uint64_t nativeBase : {uint64_t(0x180000000), uint64_t(0x120100000)}) {
+        reset();
+        queryAddress = nativeBase;
+        mainStatus = 42;
+        expectExit(retained, 42);
+        expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::DebugFinish,
+                      Event::Reserve, Event::Entry, Event::Main, Event::Exit});
+        check(!detachCalls && !restoreCalls && reservationCalls == 1,
+              "retention preserves native mappings while switching TLS and reserving the disjoint simulator span");
+    }
+    for (uint64_t nativeBase : {uint64_t(0x1200ff000), uint64_t(0x120000000), uint64_t(0x110000000)}) {
+        reset();
+        queryAddress = nativeBase;
+        expectReturn(&retained, EADDRINUSE);
+        expectEvents({Event::ReadTSD, Event::Query});
+        check(!debugBeginCalls && !switchCalls && !detachCalls && !reservationCalls,
+              "overlap is refused before debugger, TLS or mapping mutations");
+    }
+    for (int absent : {EINVAL, ENOMEM, 0}) {
+        reset(absent);
+        if (!absent) queryAddress = 0;
+        expectReturn(&retained, ENOTSUP);
+        expectEvents({Event::ReadTSD, Event::Query});
+        check(!debugBeginCalls && !switchCalls && !detachCalls && !reservationCalls,
+              "retention requires a successful nonzero native cache query before any mutation");
+    }
+    reset(EIO);
+    expectReturn(&retained, EIO);
+    expectEvents({Event::ReadTSD, Event::Query});
+    reset();
+    debugBeginError = EPERM;
+    expectReturn(&retained, EPERM);
+    expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin});
+    reset();
+    failSwitch = true;
+    expectReturn(&retained, EIO);
+    expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::Restore, Event::DebugCancel});
+    reset();
+    debugFinishError = EIO;
+    expectExit(retained, 126, 0, 0);
+    expectEvents({Event::ReadTSD, Event::Query, Event::DebugBegin, Event::Switch, Event::DebugFinish, Event::Exit});
     for (int query : {0, EINVAL}) {
         reset(query);
         expectExit(reserved, 0);

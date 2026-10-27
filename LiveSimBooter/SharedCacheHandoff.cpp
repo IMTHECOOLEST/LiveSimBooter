@@ -27,6 +27,7 @@
 // Modified 2026-10-24: transfer debugger notifications and preserve registered image metadata across cache removal.
 // Modified 2026-10-26: support a one-way switch to a guarded stack before dyld_sim replaces the native stack mapping.
 // Modified 2026-10-26: reserve the full simulator cache span so loose images cannot occupy gaps within its bounds.
+// Modified 2026-10-27: optionally retain the native cache after validating a disjoint simulator reservation below it.
 // Shared-region removal follows Apple's deallocateExistingSharedCache() at fd8d0c4d52320ebf64db34f3cb280310d905c5ae.
 // https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/SharedCacheRuntime.cpp#L1230-L1243
 #include "SharedCacheHandoff.h"
@@ -122,6 +123,11 @@ __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(con
     int error = sharedRegionCheck(&existingCacheAddress);
     if (error && error != EINVAL && error != ENOMEM) return error;
     bool hasCache = !error;
+    if (launch->retainHostCache) {
+        if (!hasCache || !existingCacheAddress) return ENOTSUP;
+        // The shared-region query gives its lowest cache header; retaining only reservations below it is conservative.
+        if (launch->cacheAddress + launch->cacheSize > existingCacheAddress) return EADDRINUSE;
+    }
 
     error = lsb::beginDebuggerHandoff();
     if (error) return error;
@@ -132,7 +138,8 @@ __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(con
         lsb::cancelDebuggerHandoff();
         return EIO;
     }
-    if (hasCache) {
+    bool detachCache = hasCache && !launch->retainHostCache;
+    if (detachCache) {
         error = sharedRegionCheck(nullptr);
         if (error) {
             if (!lsb::setTSDBase(launch->thread.hostTSD)) exitProcess(127);
@@ -141,7 +148,7 @@ __attribute__((noinline, no_stack_protector)) int LSBDetachHostCacheAndEnter(con
         }
     }
 
-    if (lsb::finishDebuggerHandoff(hasCache)) exitProcess(126);
+    if (lsb::finishDebuggerHandoff(detachCache)) exitProcess(126);
 
     // The descriptor and all pointed-to startup storage must live outside the stack that cache mappings may replace.
     if (launch->stackTop) LSBSwitchToSimulatorStack(launch, launch->stackTop);

@@ -1010,6 +1010,7 @@ int LSBDetachHostCacheAndEnter(const LSBDyldSimLaunch *launch) {
           "launch descriptor survives replacement of the native stack");
     check(!launch->stackTop, "absent cache keeps the existing handoff stack");
     check(!launch->cacheAddress && !launch->cacheSize, "absent cache does not reserve an address range");
+    check(launch->retainHostCache, "normal loader handoff retains the native cache without an explicit override");
     uintptr_t base = reinterpret_cast<uintptr_t>(startupStorage.words);
     auto inStorage = [&](const void *pointer, size_t length) {
         uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
@@ -1213,6 +1214,19 @@ static void oversizedEntryTest() {
 }
 
 int main() {
+    check(retainHostCacheRequested(nullptr), "native cache retention is enabled by default");
+    const char *retain[] = {"LSB_RETAIN_HOST_CACHE_EXTRA=1", "LSB_RETAIN_HOST_CACHE=1", "LSB_RETAIN_HOST_CACHE=0", nullptr};
+    const char *disabled[] = {"LSB_RETAIN_HOST_CACHE=0", "LSB_RETAIN_HOST_CACHE=1", nullptr};
+    const char *malformed[] = {"LSB_RETAIN_HOST_CACHE=01", nullptr};
+    const char *unrelated[] = {"LSB_RETAIN_HOST_CACHE_EXTRA=0", "LSB_RETAIN_HOST_CACHE", nullptr};
+    check(retainHostCacheRequested(unrelated), "unrelated and missing-value entries do not disable the default");
+    check(retainHostCacheRequested(retain) && !retainHostCacheRequested(disabled) && !retainHostCacheRequested(malformed),
+          "cache retention requires the first exact environment key to equal one");
+    for (const char *value : {"", "true", "1=extra", "-1"}) {
+        std::string entry = std::string("LSB_RETAIN_HOST_CACHE=") + value;
+        const char *environment[] = {entry.c_str(), "LSB_RETAIN_HOST_CACHE=1", nullptr};
+        check(!retainHostCacheRequested(environment), "invalid explicit first values disable retention without consulting later duplicates");
+    }
     parserTests();
     executableParserTests();
     auto bad = thin(); put<uint32_t>(bad, 0, 0);

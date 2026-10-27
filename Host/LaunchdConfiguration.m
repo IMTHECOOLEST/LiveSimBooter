@@ -131,7 +131,8 @@ static BOOL controlledEnvironment(const char *entry, NSDictionary<NSString *, NS
     NSString *key = [[NSString alloc] initWithBytes:entry length:(NSUInteger)(equals - entry) encoding:NSUTF8StringEncoding];
     if (!key) return NO;
     return environment[key] != nil || [key hasPrefix:@"XPC_SIMULATOR_"] || [key isEqualToString:@"XPC_USERSPACE_REBOOT_TO_BOOT_MODE"] ||
-           [key isEqualToString:@"LSB_FAKE_PTY_STATE"] || [key isEqualToString:@"TERM"];
+           [key isEqualToString:@"LSB_FAKE_PTY_STATE"] || [key isEqualToString:@"TERM"] ||
+           [key isEqualToString:@"LSB_WORKQUEUE_HARDWARE_BREAKPOINT"] || [key isEqualToString:@"LSB_RETAIN_HOST_CACHE"];
 }
 
 static BOOL serviceEnvironmentKey(NSString *key) {
@@ -388,6 +389,17 @@ static int prepareLaunchdPlan(LSBReceivedMessage *message, const char *runtimeRo
                 if (!value.length) return EINVAL;
                 runtimeEnvironment[key] = value;
                 break; // Match getenv's first occurrence; controlledEnvironment removes all inherited duplicates.
+            }
+        }
+        for (NSString *key in @[@"LSB_WORKQUEUE_HARDWARE_BREAKPOINT", @"LSB_RETAIN_HOST_CACHE"]) {
+            const char *name = key.UTF8String;
+            size_t length = strlen(name);
+            runtimeEnvironment[key] = @"1";
+            for (const char *const *entry = inheritedEnv; entry && *entry; ++entry) {
+                if (strncmp(*entry, name, length) || (*entry)[length] != '=') continue;
+                // Preserve an explicit opt-out in descendants: omission would re-enable their default. First value wins.
+                runtimeEnvironment[key] = !strcmp(*entry + length + 1, "1") ? @"1" : @"0";
+                break;
             }
         }
         const char *stopChildren = getenv("LSB_DEBUG_STOP_CHILDREN");

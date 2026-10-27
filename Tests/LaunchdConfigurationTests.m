@@ -74,6 +74,67 @@ static void testDeviceProfile(LSBReceivedMessage *message, NSString *root, NSStr
     }
 }
 
+static void testWorkqueueHardwareBreakpoint(LSBReceivedMessage *message, NSString *root, NSString *configPath, const char *name) {
+    const struct { const char *first, *second; BOOL enabled; } cases[] = {
+        {NULL, NULL, YES}, {"0", NULL, NO}, {"1", NULL, YES}, {"", NULL, NO}, {"01", NULL, NO}, {"true", NULL, NO},
+        {"1=extra", NULL, NO}, {"1", "0", YES}, {"0", "1", NO}, {"", "1", NO}, {"01", "1", NO}, {"1", "1", YES}
+    };
+    int (*prepare[])(LSBReceivedMessage *, const char *, const char *const[]) = {LSBPrepareLaunchdPlan, LSBPrepareLaunchdDFPlan};
+    for (unsigned mode = 0; mode < sizeof(prepare) / sizeof(prepare[0]); ++mode) {
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            char first[96], second[96];
+            char unrelated[96];
+            snprintf(unrelated, sizeof(unrelated), "%s_EXTRA=preserved", name);
+            const char *inherited[4] = {unrelated, NULL};
+            unsigned count = 1;
+            if (cases[i].first) {
+                snprintf(first, sizeof(first), "%s=%s", name, cases[i].first);
+                inherited[count++] = first;
+            }
+            if (cases[i].second) {
+                snprintf(second, sizeof(second), "%s=%s", name, cases[i].second);
+                inherited[count++] = second;
+            }
+            inherited[count] = NULL;
+            assert(!prepare[mode](message, root.fileSystemRepresentation, inherited));
+            assert(!LSBValidateSpawnPlan(&message->plan));
+            const char *value = environmentValue(&message->plan, name);
+            assert(value && !strcmp(value, cases[i].enabled ? "1" : "0"));
+            unsigned occurrences = 0;
+            for (unsigned j = 0; j < message->plan.envc; ++j) {
+                const char *entry = message->plan.strings + message->plan.envp[j];
+                if (!strncmp(entry, name, strlen(name)) && entry[strlen(name)] == '=') ++occurrences;
+            }
+            assert(occurrences == 1);
+            *strchr(unrelated, '=') = 0;
+            assert(!strcmp(environmentValue(&message->plan, unrelated), "preserved"));
+            NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+            for (NSString *scope in @[@"Self", @"Child"]) {
+                assert([bootstrap[scope][@(name)] isEqualToString:cases[i].enabled ? @"1" : @"0"]);
+            }
+            dispose(message);
+        }
+    }
+    // Regeneration without an inherited environment restores enabled defaults in both bootstrap scopes.
+    assert(!LSBPrepareLaunchdPlan(message, root.fileSystemRepresentation, NULL));
+    assert(!strcmp(environmentValue(&message->plan, name), "1"));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    for (NSString *scope in @[@"Self", @"Child"]) assert([bootstrap[scope][@(name)] isEqualToString:@"1"]);
+    dispose(message);
+}
+
+static void testLegacyDetachmentMode(LSBReceivedMessage *message, NSString *root, NSString *configPath) {
+    const char *inherited[] = {"LSB_RETAIN_HOST_CACHE=0", "LSB_WORKQUEUE_HARDWARE_BREAKPOINT=0",
+                              "LSB_RETAIN_HOST_CACHE=1", "LSB_WORKQUEUE_HARDWARE_BREAKPOINT=1", NULL};
+    assert(!LSBPrepareLaunchdDFPlan(message, root.fileSystemRepresentation, inherited));
+    NSDictionary *bootstrap = readPlist(configPath)[@"Bootstrap"];
+    for (NSString *key in @[@"LSB_RETAIN_HOST_CACHE", @"LSB_WORKQUEUE_HARDWARE_BREAKPOINT"]) {
+        assert(!strcmp(environmentValue(&message->plan, key.UTF8String), "0"));
+        for (NSString *scope in @[@"Self", @"Child"]) assert([bootstrap[scope][key] isEqualToString:@"0"]);
+    }
+    dispose(message);
+}
+
 static void testDFMode(LSBReceivedMessage *message, NSString *root, NSString *dataPath, NSString *configPath, const char *const inherited[]) {
     NSString *jobDirectory = [dataPath stringByAppendingPathComponent:@"Library/LiveSimBooter-LaunchDaemons"];
     NSString *jobPath = [jobDirectory stringByAppendingPathComponent:@"com.kdt.LiveSimBooter.df.plist"];
@@ -803,6 +864,9 @@ int main(void) {
         assert([[NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:NULL] isEqualToString:@"stdout\nstderr\nagain\n"]);
         testDeviceProfile(message, root, configPath);
         testDFMode(message, root, dataPath, configPath, inherited);
+        testWorkqueueHardwareBreakpoint(message, root, configPath, "LSB_WORKQUEUE_HARDWARE_BREAKPOINT");
+        testWorkqueueHardwareBreakpoint(message, root, configPath, "LSB_RETAIN_HOST_CACHE");
+        testLegacyDetachmentMode(message, root, configPath);
         testAdditionalJobs(message, root, dataPath, configPath);
 
         // Invalid/oversized plans never publish partial strings or descriptors and do not replace the existing configuration.

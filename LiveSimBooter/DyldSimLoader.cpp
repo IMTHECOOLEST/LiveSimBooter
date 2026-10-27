@@ -107,6 +107,14 @@ bool systemFailure(std::string &error, const char *operation) {
     return false;
 }
 
+bool retainHostCacheRequested(const char *const environment[]) {
+    static constexpr char prefix[] = "LSB_RETAIN_HOST_CACHE=";
+    for (auto entry = environment; entry && *entry; ++entry) {
+        if (!strncmp(*entry, prefix, sizeof(prefix) - 1)) return !strcmp(*entry + sizeof(prefix) - 1, "1");
+    }
+    return true;
+}
+
 bool mainStackContains(uintptr_t top, size_t size, uintptr_t address) {
     return size && size < top && address >= top - size && address < top;
 }
@@ -887,9 +895,10 @@ int LSBEnterDyldSim(const LSBMappedImage *image, const mach_header *executable, 
         return 1;
     }
     launch = {entry, argc, startup.argv, startup.envp, startup.apple, executable, image->header, image->slide, helpers, thread,
-              relocatedStack.top, cache.address, cache.size};
+              relocatedStack.top, cache.address, cache.size, retainHostCacheRequested(startup.envp)};
     entered = true;
-    fprintf(stderr, "Detaching host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n", reinterpret_cast<void *>(image->entry), image->header,
+    fprintf(stderr, "%s host cache, then entering dyld_sim at %p (header %p, slide 0x%llx)\n",
+            launch.retainHostCache ? "Retaining" : "Detaching", reinterpret_cast<void *>(image->entry), image->header,
             static_cast<unsigned long long>(image->slide));
     fflush(stderr);
     int workerError = LSBValidateHostThreadCount();
