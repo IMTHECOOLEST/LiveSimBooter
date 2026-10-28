@@ -1,8 +1,8 @@
 # Building without a Mac
 
-[`.github/workflows/build.yml`](../.github/workflows/build.yml) compiles the project on GitHub-hosted `macos-26`
-arm64 runners (Apple Silicon, Xcode 26 with the iOS 26 SDK). It runs on pushes to `main`, on pull requests, and on
-demand from **Actions → Build → Run workflow**.
+[`.github/workflows/build.yml`](../.github/workflows/build.yml) compiles the project on GitHub-hosted Apple Silicon runners.
+The native host uses `xcode-27` because the Xcode project format requires Xcode 27; guest tools and the informational
+local suite use `macos-26`. It runs on pushes to `main`, on pull requests, and on demand from **Actions → Build → Run workflow**.
 
 This is a compile and packaging check with downloadable binaries. It is not a replacement for the full
 [setup guide](agent-setup.md) on an Apple Silicon Mac, and it does not produce a runnable phone app.

@@ -24,28 +24,28 @@ concurrency:
 jobs:
   native:
     name: Native host (iPhoneOS arm64)
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 26 toolchain
+      - name: Select Xcode 27 toolchain
         run: |
           set -euo pipefail
           selected=
-          for candidate in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r); do
+          for candidate in $(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V -r); do
             selected="$candidate/Contents/Developer"
             break
           done
           if [ -z "$selected" ]; then
-            echo "::notice::No Xcode 26 bundle found; using the image default."
+            echo "::notice::No Xcode 27 bundle found; using the image default."
           else
             echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
             export DEVELOPER_DIR="$selected"
           fi
           xcodebuild -version
           major=$(xcodebuild -version | sed -n '1s/^Xcode \([0-9][0-9]*\).*/\1/p')
-          if [ -z "$major" ] || [ "$major" -lt 26 ]; then
-            echo "::error::An Xcode with the iOS 26 SDK is required (IPHONEOS_DEPLOYMENT_TARGET is 26.0)."
+          if [ -z "$major" ] || [ "$major" -lt 27 ]; then
+            echo "::error::Xcode 27 is required to read project format 110."
             exit 1
           fi
           xcrun --sdk iphoneos --show-sdk-path
