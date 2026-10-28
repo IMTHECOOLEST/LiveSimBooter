@@ -63,6 +63,9 @@ python3 Tests/audit-local-runtime.py
 Build the native host and guest shim separately using [the setup guide](docs/agent-setup.md).
 Local tests do not establish device signature acceptance, working mappings, or a successful UI operation.
 
+Without a Mac, [the GitHub Actions build](docs/ci-build.md) compiles the unsigned host app and the guest tools on a
+macOS arm64 runner and uploads them as artifacts. It cannot stage the Apple runtime, sign, or install anything.
+
 ## License
 
 Original project code is available under the [MIT License](LICENSE), copyright 2026 Duy Tran.
